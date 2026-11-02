@@ -1,0 +1,14 @@
+[package]
+name = "exynos_4412_rs"
+version = "0.1.0"
+edition = "2024"
+description = "Bare-metal runtime and drivers for the Samsung Exynos 4412, started from U-Boot"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = ["panic-handler"]
+# Print file:line and the message on the console, then halt.
+panic-handler = []
+
+[dependencies]
+tock-registers = { version = "0.10.1", default-features = false, features = ["register_types"] }

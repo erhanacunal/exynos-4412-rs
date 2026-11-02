@@ -1,0 +1,9 @@
+[package]
+name = "hello_world"
+version = "0.1.0"
+edition = "2024"
+description = "Console test for exynos_4412_rs"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }

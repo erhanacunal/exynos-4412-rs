@@ -1,0 +1,7 @@
+# The workspace is cross-only, so every cargo invocation from here targets the SoC.
+[build]
+target = "armv7a-none-eabihf"
+
+# link.x comes from exynos_4412_rs, memory.x from the application.
+[target.armv7a-none-eabihf]
+rustflags = ["-Clink-arg=-Tlink.x"]
