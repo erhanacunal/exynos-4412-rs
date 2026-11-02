@@ -24,6 +24,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "i2c_test"
+version = "0.1.0"
+dependencies = [
+ "exynos_4412_rs",
+]
+
+[[package]]
 name = "irq_timer"
 version = "0.1.0"
 dependencies = [
@@ -39,6 +46,13 @@ dependencies = [
 
 [[package]]
 name = "mmu_test"
+version = "0.1.0"
+dependencies = [
+ "exynos_4412_rs",
+]
+
+[[package]]
+name = "pmic_test"
 version = "0.1.0"
 dependencies = [
  "exynos_4412_rs",

@@ -113,7 +113,7 @@ extern "C" fn handle_irq(_frame: &mut ExceptionFrame) {
         smp::WAKE_SGI => {
             STRAY_SGI[me].fetch_add(1, Ordering::Relaxed);
         }
-        other => println!("CPU{} beklenmeyen kesme: {}", me, other),
+        other => println!("CPU{} unexpected interrupt: {}", me, other),
     }
     gic.end_of_interrupt(irq);
 }
@@ -169,7 +169,7 @@ fn work_handoff(me: usize) {
         }
         HANDOFF_TURN.store(turn + 1, Ordering::Release);
     }
-    assert!(failures == 0, "CPU{} devir hatasi: {} kelime", me, failures);
+    assert!(failures == 0, "CPU{} handoff failure: {} words", me, failures);
 }
 
 fn secondary(me: usize) -> ! {
@@ -178,7 +178,7 @@ fn secondary(me: usize) -> ! {
     gic.enable(RING_SGI);
 
     println!(
-        "CPU{} acik: MPIDR {:#010x} SCTLR {:#010x} ACTLR {:#010x} CPSR {:#010x} SP {:#010x}",
+        "CPU{} up: MPIDR {:#010x} SCTLR {:#010x} ACTLR {:#010x} CPSR {:#010x} SP {:#010x}",
         me,
         cpu::read_mpidr(),
         cpu::read_sctlr(),
@@ -256,7 +256,7 @@ fn report_phases() -> ! {
         let (pending, active) = gic.state(soc::MCT_G0_IRQ);
         let _ = writeln!(
             uart,
-            "[faz {} sn {}] is/sn: {} {} {} {}  tik: {} {} {} {}  G0 bekleyen {} aktif {} hedef {:#x}  kilit {:?}",
+            "[phase {} s {}] work/s: {} {} {} {}  ticks: {} {} {} {}  G0 pending {} active {} target {:#x}  lock {:?}",
             phase,
             seconds,
             now[0].wrapping_sub(last[0]),
@@ -353,7 +353,7 @@ fn ring_test(mct: Mct, gic: Gic) {
         while !expected(0, lap) {
             if mct.count() - lap_start > u64::from(soc::MCT_CLOCK_HZ) {
                 println!(
-                    "SGI halkasi tur {}'de durdu, varislar: {} {} {} {}",
+                    "SGI ring stopped at lap {}, arrivals: {} {} {} {}",
                     lap,
                     RING_ARRIVALS[0].load(Ordering::Relaxed),
                     RING_ARRIVALS[1].load(Ordering::Relaxed),
@@ -366,7 +366,7 @@ fn ring_test(mct: Mct, gic: Gic) {
     }
     let counts = mct.count() - start;
     println!(
-        "SGI halkasi: {} tur, tur basina {} ns, varislar {} {} {} {}",
+        "SGI ring: {} laps, {} ns per lap, arrivals {} {} {} {}",
         RING_ROUNDS,
         counts * 1000 / u64::from(soc::MCT_CLOCK_HZ / 1_000_000) / u64::from(RING_ROUNDS),
         RING_ARRIVALS[0].load(Ordering::Relaxed),
@@ -377,10 +377,10 @@ fn ring_test(mct: Mct, gic: Gic) {
 }
 
 fn main(_args: BootArgs) -> ! {
-    println!("\nSMP testi, MIDR {:#010x}", cpu::read_midr());
+    println!("\nSMP test, MIDR {:#010x}", cpu::read_midr());
     let scu = Scu::new();
     println!(
-        "Once: SCU CTRL {:#x} CONFIG {:#010x}, ACTLR {:#010x}, guc durumu {:#x} {:#x} {:#x} {:#x}",
+        "Before: SCU CTRL {:#x} CONFIG {:#010x}, ACTLR {:#010x}, power state {:#x} {:#x} {:#x} {:#x}",
         scu.ctrl(),
         scu.config(),
         cpu::read_actlr(),
@@ -394,45 +394,45 @@ fn main(_args: BootArgs) -> ! {
     mct.start();
     mmu::enable();
     println!(
-        "MMU acik: SCU CTRL {:#x} ({} cekirdek), SCTLR {:#010x}, ACTLR {:#010x}",
+        "MMU on: SCU CTRL {:#x} ({} cores), SCTLR {:#010x}, ACTLR {:#010x}",
         scu.ctrl(),
         scu.core_count(),
         cpu::read_sctlr(),
         cpu::read_actlr(),
     );
 
-    report_latency(mct, "Gecikme L2 kapali");
+    report_latency(mct, "Latency L2 off");
     let l2c = L2c::new();
     console::uart().flush();
     l2c.enable();
     println!("L2 CTRL {:#x}", l2c.ctrl());
-    report_latency(mct, "Gecikme L2 acik  ");
+    report_latency(mct, "Latency L2 on ");
 
     let gic = Gic::new();
     gic.init();
     gic.enable(RING_SGI);
 
     for target in 1..CPUS {
-        println!("CPU{} baslatiliyor, onceki giris adresi {:#010x}", target, smp::boot_address(target));
+        println!("CPU{} starting, previous entry address {:#010x}", target, smp::boot_address(target));
         let start = mct.count();
         let result = smp::start_cpu(target, secondary);
         let us = (mct.count() - start) / u64::from(soc::MCT_CLOCK_HZ / 1_000_000);
         println!();
         match result {
             Ok(()) => {
-                println!("CPU{} rapor verdi, {} us", target, us);
+                println!("CPU{} reported, {} us", target, us);
                 // Keeps the log in order: its first line comes before the next core's.
                 let wait_start = mct.count();
                 while READY.load(Ordering::Acquire) != target as u32 {
                     if mct.count() - wait_start > u64::from(soc::MCT_CLOCK_HZ) {
-                        println!("CPU{} hazir olmadi", target);
+                        println!("CPU{} did not become ready", target);
                         cpu::halt();
                     }
                 }
             }
             Err(error) => {
                 println!(
-                    "CPU{} HATA {:?}, guc durumu {:#x}, giris adresi {:#010x}",
+                    "CPU{} ERROR {:?}, power state {:#x}, entry address {:#010x}",
                     target,
                     error,
                     smp::power_status(target),
@@ -446,21 +446,21 @@ fn main(_args: BootArgs) -> ! {
 
     let ms = run_stage(mct, STAGE_ATOMIC, work_atomic);
     let total = SHARED_ATOMIC.load(Ordering::Acquire);
-    println!("Atomik sayac: {} beklenen {}, {} ms", total, ATOMIC_ROUNDS * CPUS as u32, ms);
+    println!("Atomic counter: {} expected {}, {} ms", total, ATOMIC_ROUNDS * CPUS as u32, ms);
     assert!(total == ATOMIC_ROUNDS * CPUS as u32);
 
     let ms = run_stage(mct, STAGE_LOCK, work_lock);
     let total = *SHARED_LOCKED.lock();
-    println!("Kilitli sayac: {} beklenen {}, {} ms", total, LOCK_ROUNDS * CPUS as u32, ms);
+    println!("Locked counter: {} expected {}, {} ms", total, LOCK_ROUNDS * CPUS as u32, ms);
     assert!(total == LOCK_ROUNDS * CPUS as u32);
 
     let ms = run_stage(mct, STAGE_HANDOFF, || work_handoff(0));
-    println!("Veri devri: {} tur, hata yok, {} ms", HANDOFF_ROUNDS * CPUS as u32, ms);
+    println!("Data handoff: {} rounds, no errors, {} ms", HANDOFF_ROUNDS * CPUS as u32, ms);
 
     ring_test(mct, gic);
 
     println!(
-        "Kalan uyandirma SGI: {} {} {} {}",
+        "Leftover wake SGIs: {} {} {} {}",
         STRAY_SGI[0].load(Ordering::Relaxed),
         STRAY_SGI[1].load(Ordering::Relaxed),
         STRAY_SGI[2].load(Ordering::Relaxed),
@@ -471,7 +471,7 @@ fn main(_args: BootArgs) -> ! {
     gic.enable(soc::MCT_G0_IRQ);
     gic.set_target(soc::MCT_G0_IRQ, 1);
     mct.start_periodic(soc::MCT_CLOCK_HZ);
-    println!("Fazlar basliyor. Tuslara basmaya devam edin: yanki CPU0'dan gelir.");
+    println!("Phases starting. Keep pressing keys: the echo comes from CPU0.");
 
     while READY.load(Ordering::Acquire) != CPUS as u32 - 1 {
         core::hint::spin_loop();

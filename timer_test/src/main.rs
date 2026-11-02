@@ -96,7 +96,7 @@ fn secondary(me: usize) -> ! {
     let gic = Gic::new();
     gic.init_this_cpu();
     gic.enable(soc::MCT_LOCAL_IRQ);
-    println!("CPU{} acik", me);
+    println!("CPU{} up", me);
     cpu::enable_irq();
     READY.fetch_add(1, Ordering::Release);
     loop {
@@ -148,11 +148,11 @@ fn measure(mct: Mct) {
         // In thousandths of a count, to see one count of systematic error over the run.
         let mean = u64::from(span) * 1000 / u64::from(count.max(2) - 1);
         println!(
-            "CPU{}: tik {} beklenen {} ({}), ort {}.{:03} beklenen {}, en az {} en cok {}",
+            "CPU{}: ticks {} expected {} ({}), mean {}.{:03} expected {}, min {} max {}",
             cpu,
             count,
             expected,
-            if count.abs_diff(expected) <= 1 { "TAMAM" } else { "FARK" },
+            if count.abs_diff(expected) <= 1 { "OK" } else { "MISMATCH" },
             mean / 1000,
             mean % 1000,
             period,
@@ -170,11 +170,11 @@ fn stop_one(mct: Mct) {
     let before = all_ticks();
     wait_seconds(mct, 2);
     let after = all_ticks();
-    print!("CPU{} durduruldu, 2 sn'deki tikler:", STOPPED_CPU);
+    print!("CPU{} stopped, ticks in 2 s:", STOPPED_CPU);
     for cpu in 0..CPUS {
         print!(" {}", after[cpu] - before[cpu]);
     }
-    println!(" ({})", if after[STOPPED_CPU] == before[STOPPED_CPU] { "TAMAM" } else { "FARK" });
+    println!(" ({})", if after[STOPPED_CPU] == before[STOPPED_CPU] { "OK" } else { "MISMATCH" });
     stop_all();
 }
 
@@ -187,18 +187,18 @@ fn oneshot(mct: Mct) {
         wait_seconds(mct, 1);
         let fired = ticks(ONESHOT_CPU) - before;
         println!(
-            "Tek atis {}, CPU{}: {} tik ({})",
+            "One-shot {}, CPU{}: {} ticks ({})",
             round,
             ONESHOT_CPU,
             fired,
-            if fired == 1 { "TAMAM" } else { "FARK" },
+            if fired == 1 { "OK" } else { "MISMATCH" },
         );
     }
     ONESHOT[ONESHOT_CPU].store(false, Ordering::Relaxed);
 }
 
 fn main(_args: BootArgs) -> ! {
-    println!("\nMCT yerel zamanlayici testi");
+    println!("\nMCT local timer test");
 
     let mct = Mct::new();
     mct.start();
@@ -211,7 +211,7 @@ fn main(_args: BootArgs) -> ! {
 
     for target in 1..CPUS {
         if let Err(error) = smp::start_cpu(target, secondary) {
-            println!("CPU{} HATA {:?}", target, error);
+            println!("CPU{} ERROR {:?}", target, error);
             cpu::halt();
         }
     }
@@ -220,14 +220,14 @@ fn main(_args: BootArgs) -> ! {
     }
     cpu::enable_irq();
 
-    println!("{} sn olcum, CPU'lar: 100 Hz, 1 kHz, 500 Hz, 250 Hz. Sure sayac biriminde (24 MHz).", MEASURE_SECONDS);
+    println!("{} s measurement, CPUs: 100 Hz, 1 kHz, 500 Hz, 250 Hz. Times in counter units (24 MHz).", MEASURE_SECONDS);
     measure(mct);
     stop_one(mct);
     oneshot(mct);
-    println!("Beklenmeyen kesme: {}", WRONG_IRQS.load(Ordering::Relaxed));
+    println!("Unexpected interrupts: {}", WRONG_IRQS.load(Ordering::Relaxed));
 
     start_all();
-    println!("Serbest calisma. Tuslar <x> olarak yanki yapar.");
+    println!("Free running. Keys echo as <x>.");
     let uart = console::uart();
     let mut next = mct.count() + COUNTS_PER_SECOND;
     let mut last = all_ticks();
@@ -236,7 +236,7 @@ fn main(_args: BootArgs) -> ! {
             next += COUNTS_PER_SECOND;
             let now = all_ticks();
             println!(
-                "tik/sn: {} {} {} {}",
+                "ticks/s: {} {} {} {}",
                 now[0] - last[0],
                 now[1] - last[1],
                 now[2] - last[2],

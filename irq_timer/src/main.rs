@@ -36,27 +36,27 @@ extern "C" fn handle_irq(_frame: &mut ExceptionFrame) {
         LAST_COUNT.store(count, Ordering::Relaxed);
         TICKS.store(TICKS.load(Ordering::Relaxed) + 1, Ordering::Release);
     } else {
-        println!("beklenmeyen kesme: {}", irq.id());
+        println!("unexpected interrupt: {}", irq.id());
     }
 
     gic.end_of_interrupt(irq);
 }
 
 fn main(_args: BootArgs) -> ! {
-    println!("\nGIC + MCT testi");
+    println!("\nGIC + MCT test");
 
     let mct = Mct::new();
     mct.start();
     let before = mct.count();
     let after = (0..1000).fold(before, |_, _| mct.count());
     if after == before {
-        panic!("MCT sayaci ilerlemiyor: {:#x}", before);
+        panic!("MCT counter not advancing: {:#x}", before);
     }
-    println!("MCT sayaci ilerliyor: {:#x} -> {:#x}", before, after);
+    println!("MCT counter advancing: {:#x} -> {:#x}", before, after);
 
     let gic = Gic::new();
     gic.init();
-    println!("GIC hazir");
+    println!("GIC ready");
 
     LAST_COUNT.store(mct.count() as u32, Ordering::Relaxed);
     gic.enable(soc::MCT_G0_IRQ);
@@ -69,7 +69,7 @@ fn main(_args: BootArgs) -> ! {
         let ticks = TICKS.load(Ordering::Acquire);
         if ticks != printed {
             printed = ticks;
-            println!("tick {}  sayac farki {}", ticks, LAST_DELTA.load(Ordering::Relaxed));
+            println!("tick {}  counter delta {}", ticks, LAST_DELTA.load(Ordering::Relaxed));
         }
         match uart.try_read_byte() {
             Some(b'\r') => println!(),

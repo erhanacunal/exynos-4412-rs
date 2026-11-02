@@ -12,18 +12,18 @@ use exynos_4412_rs::{BootArgs, console, print, println};
 exynos_4412_rs::entry!(main);
 
 fn main(args: BootArgs) -> ! {
-    println!("\nMerhaba Exynos 4412");
+    println!("\nHello Exynos 4412");
     println!("r0={:#010x} r1={:#010x} r2={:#010x}", args.r0, args.r1, args.r2);
-    println!("Baslatma adresi: {:#010x}", args.load_addr);
+    println!("Start address: {:#010x}", args.load_addr);
     println!("MPIDR: {:#010x}", cpu::read_mpidr());
     let cpsr = cpu::read_cpsr();
     println!("CPSR:  {:#010x} ({:?})", cpsr, Mode::from_psr(cpsr));
-    println!("p: panic, a: data abort, digerleri: echo");
+    println!("p: panic, a: data abort, others: echo");
 
     let uart = console::uart();
     loop {
         match uart.read_byte() {
-            b'p' => panic!("kasitli panic ('p' tusu)"),
+            b'p' => panic!("deliberate panic ('p' key)"),
             b'a' => data_abort(),
             b'\r' => println!(),
             byte => print!("{}", byte as char),

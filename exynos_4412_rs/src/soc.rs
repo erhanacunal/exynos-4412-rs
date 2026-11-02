@@ -89,6 +89,21 @@ pub const EINT_GPX1_IRQ: u16 = 32 + 24;
 /// of `exynos4412-pinctrl.dtsi:599-613` have no interrupts of their own.
 pub const EINT_GPX23_IRQ: u16 = 32 + 32;
 
+/// I2C controllers 0 to 7. Verified: `exynos4.dtsi:493-584`, nodes `i2c_0`..`i2c_7`, `reg`.
+pub const I2C_BASES: [usize; 8] = [
+    0x1386_0000,
+    0x1387_0000,
+    0x1388_0000,
+    0x1389_0000,
+    0x138A_0000,
+    0x138B_0000,
+    0x138C_0000,
+    0x138D_0000,
+];
+/// Input of the PLLs. `clk-exynos4.c:1044` takes `fin_pll` from `xusbxti` or `xxti`, and
+/// `exynos4412-mehmet.dts:48,53` gives them 0 Hz and 24 MHz.
+pub const FIN_PLL_HZ: u32 = 24_000_000;
+
 /// Number of cores. Verified: `exynos4412.dtsi`, nodes `cpu@a00`..`cpu@a03`. `link.x`
 /// reserves this many stack blocks.
 pub const CPU_COUNT: usize = 4;

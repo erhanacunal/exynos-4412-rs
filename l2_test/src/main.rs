@@ -42,7 +42,7 @@ extern "C" fn handle_irq(_frame: &mut ExceptionFrame) {
         Mct::new().clear_interrupt();
         TICKS.fetch_add(1, Ordering::Relaxed);
     } else {
-        println!("beklenmeyen kesme: {}", irq.id());
+        println!("unexpected interrupt: {}", irq.id());
     }
     gic.end_of_interrupt(irq);
 }
@@ -75,7 +75,7 @@ fn verify(words: usize, seed: u32) {
         let expected = seed ^ (index as u32).wrapping_mul(0x9E37_79B1);
         let actual = word.load(Ordering::Relaxed);
         if actual != expected {
-            panic!("bellek hatasi: indis {} beklenen {:#x} okunan {:#x}", index, expected, actual);
+            panic!("memory error: index {} expected {:#x} read {:#x}", index, expected, actual);
         }
     }
 }
@@ -117,7 +117,7 @@ fn report_l2(l2c: L2c) {
 }
 
 fn main(_args: BootArgs) -> ! {
-    println!("\nL2 testi");
+    println!("\nL2 test");
 
     // SAFETY: the chip ID block is always readable, and reading it has no side effects.
     let chip_id = unsafe { core::ptr::read_volatile(soc::CHIPID_BASE as *const u32) };
@@ -132,23 +132,23 @@ fn main(_args: BootArgs) -> ! {
     report_l2(l2c);
 
     let rate = measure_mct_against_uart(mct, uart);
-    println!("MCT hizi (UART ile olculen): {} Hz, beklenen {}", rate, soc::MCT_CLOCK_HZ);
+    println!("MCT rate (measured against UART): {} Hz, expected {}", rate, soc::MCT_CLOCK_HZ);
 
-    report_speed(mct, "L2 kapali");
+    report_speed(mct, "L2 off");
 
     // Dirty in L1 and DRAM at the moment of the switch; must read back unchanged after it.
     fill(WORDS_L2, 0xA5A5_5A5A);
 
-    println!("L2 aciliyor...");
+    println!("L2 enabling...");
     uart.flush();
     l2c.enable();
-    println!("L2 acildi");
+    println!("L2 enabled");
     report_l2(l2c);
 
     verify(WORDS_L2, 0xA5A5_5A5A);
-    println!("L2 acilmadan yazilan veri dogru");
+    println!("Data written before L2 enable is correct");
 
-    report_speed(mct, "L2 acik  ");
+    report_speed(mct, "L2 on ");
 
     let gic = Gic::new();
     gic.init();
@@ -166,7 +166,7 @@ fn main(_args: BootArgs) -> ! {
         let ticks = TICKS.load(Ordering::Relaxed);
         if ticks != printed {
             printed = ticks;
-            println!("tick {}  2 MiB dogrulama gecisi: {}, hata yok", ticks, seed);
+            println!("tick {}  2 MiB verify passes: {}, no errors", ticks, seed);
         }
         match uart.try_read_byte() {
             Some(b'\r') => println!(),

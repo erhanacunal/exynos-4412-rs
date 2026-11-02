@@ -36,7 +36,7 @@ static COUNTER_64: AtomicU64 = AtomicU64::new(0);
 #[unsafe(no_mangle)]
 extern "C" fn handle_undef(frame: &mut ExceptionFrame) {
     if !PROBING.load(Ordering::Relaxed) {
-        panic!("beklenmeyen undefined instruction, donus {:#x}", frame.return_addr);
+        panic!("unexpected undefined instruction, return {:#x}", frame.return_addr);
     }
     PROBE_TRAPPED.store(true, Ordering::Relaxed);
 }
@@ -63,7 +63,7 @@ extern "C" fn handle_irq(_frame: &mut ExceptionFrame) {
         }
         TICKS.fetch_add(1, Ordering::Relaxed);
     } else {
-        println!("beklenmeyen kesme: {}", irq.id());
+        println!("unexpected interrupt: {}", irq.id());
     }
 
     gic.end_of_interrupt(irq);
@@ -108,7 +108,7 @@ fn memory_benchmark(mct: Mct) -> u64 {
         }
         for word in &BUFFER {
             if word.load(Ordering::Relaxed) != pass {
-                panic!("bellek dogrulamasi basarisiz");
+                panic!("memory verification failed");
             }
         }
     }
@@ -142,10 +142,10 @@ fn fp_registers_survive() -> bool {
 }
 
 fn main(_args: BootArgs) -> ! {
-    println!("\nMMU testi");
+    println!("\nMMU test");
 
     let non_secure = runs_non_secure();
-    println!("Guvenlik durumu: {}", if non_secure { "Non-secure" } else { "Secure" });
+    println!("Security state: {}", if non_secure { "Non-secure" } else { "Secure" });
     println!("ACTLR {:#010x}  NSACR {:#010x}", read_actlr(), read_nsacr());
 
     let l2c = L2c::new();
@@ -154,21 +154,21 @@ fn main(_args: BootArgs) -> ! {
         l2c.cache_id(),
         l2c.ctrl(),
         l2c.aux_ctrl(),
-        if l2c.is_enabled() { "acik" } else { "kapali" },
+        if l2c.is_enabled() { "on" } else { "off" },
     );
 
     let mct = Mct::new();
     mct.start();
 
-    println!("SCTLR once:  {:#010x}", cpu::read_sctlr());
+    println!("SCTLR before: {:#010x}", cpu::read_sctlr());
     let uncached = memory_benchmark(mct);
-    println!("Onbelleksiz: {} us", uncached);
+    println!("Uncached: {} us", uncached);
 
     mmu::enable();
 
-    println!("SCTLR sonra: {:#010x}", cpu::read_sctlr());
+    println!("SCTLR after:  {:#010x}", cpu::read_sctlr());
     let cached = memory_benchmark(mct);
-    println!("Onbellekli:  {} us  ({} kat)", cached, uncached / cached.max(1));
+    println!("Cached:   {} us  ({}x)", cached, uncached / cached.max(1));
 
     COUNTER_32.fetch_add(5, Ordering::Relaxed);
     COUNTER_64.fetch_add(7, Ordering::Relaxed);
@@ -183,7 +183,7 @@ fn main(_args: BootArgs) -> ! {
     gic.enable(soc::MCT_G0_IRQ);
     mct.start_periodic(soc::MCT_CLOCK_HZ);
     cpu::enable_irq();
-    println!("t: ceviri hatasi, x: prefetch abort, digerleri: echo");
+    println!("t: translation fault, x: prefetch abort, others: echo");
 
     let uart = console::uart();
     let mut printed = 0;
@@ -191,7 +191,7 @@ fn main(_args: BootArgs) -> ! {
     loop {
         let before = TICKS.load(Ordering::Relaxed);
         if !fp_registers_survive() {
-            panic!("kesme FP registerlarini bozdu");
+            panic!("interrupt corrupted FP registers");
         }
         let ticks = TICKS.load(Ordering::Relaxed);
         if ticks != before {
@@ -199,14 +199,14 @@ fn main(_args: BootArgs) -> ! {
         }
         if ticks != printed {
             printed = ticks;
-            println!("tick {}  kesilen FP kontrolu: {}, hata yok", ticks, interrupted_checks);
+            println!("tick {}  interrupted FP checks: {}, no errors", ticks, interrupted_checks);
         }
 
         match uart.try_read_byte() {
             Some(b't') => {
                 // SAFETY: the address is unmapped; the load is meant to fault.
                 let value = unsafe { core::ptr::read_volatile(UNMAPPED as *const u32) };
-                println!("hata olusmadi: {:#x}", value);
+                println!("no fault occurred: {:#x}", value);
             }
             Some(b'x') => {
                 // SAFETY: the target is execute-never Device memory; the branch is meant

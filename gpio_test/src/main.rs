@@ -31,7 +31,7 @@ const VOLUME_DOWN: Pin = gpio::GPX3.pin(3);
 /// `exynos4412-mehmet.dts:57-59`.
 const BACKLIGHT_PWM: Pin = gpio::GPD0.pin(1);
 
-const KEY_NAMES: [&str; 3] = ["guc", "ses+", "ses-"];
+const KEY_NAMES: [&str; 3] = ["power", "vol+", "vol-"];
 const KEYS: [Pin; 3] = [POWER, VOLUME_UP, VOLUME_DOWN];
 const VOLUME_UP_INDEX: usize = 1;
 
@@ -78,7 +78,7 @@ fn wait_ms(mct: Mct, ms: u64) {
 }
 
 fn verdict(ok: bool) -> &'static str {
-    if ok { "TAMAM" } else { "FARK" }
+    if ok { "OK" } else { "MISMATCH" }
 }
 
 /// U-Boot uses both of these, so their function must be the one the DTS gives. Covers the
@@ -93,8 +93,8 @@ fn read_only() {
         let found = pin.function();
         println!("{}: {:?} ({})", name, found, verdict(found == function));
     }
-    for (name, pin) in [("gpd0-1 PWM1", BACKLIGHT_PWM), ("guc", POWER), ("ses+", VOLUME_UP), ("ses-", VOLUME_DOWN)] {
-        println!("{}: U-Boot'tan {:?}, {:?}, seviye {}", name, pin.function(), pin.pull(), u8::from(pin.read()));
+    for (name, pin) in [("gpd0-1 PWM1", BACKLIGHT_PWM), ("power", POWER), ("vol+", VOLUME_UP), ("vol-", VOLUME_DOWN)] {
+        println!("{}: from U-Boot {:?}, {:?}, level {}", name, pin.function(), pin.pull(), u8::from(pin.read()));
     }
 }
 
@@ -104,7 +104,7 @@ fn output(mct: Mct) {
     let pin = BACKLIGHT_PWM;
     let (function, pull, level) = (pin.function(), pin.pull(), pin.read());
 
-    println!("Cikis: gpd0-1 3 kez 1 sn dusuk, 1 sn yuksek. Ekran aciksa ekrana bakin.");
+    println!("Output: gpd0-1 low for 1 s, high for 1 s, 3 times. If the screen is on, watch it.");
     let mut good = 0;
     pin.set_output(false);
     for _ in 0..3 {
@@ -118,7 +118,7 @@ fn output(mct: Mct) {
     pin.write(level);
     pin.set_pull(pull);
     pin.set_function(function);
-    println!("Geri okuma {}/6 ({}), pin geri kondu: {:?}", good, verdict(good == 6), pin.function());
+    println!("Readback {}/6 ({}), pin restored: {:?}", good, verdict(good == 6), pin.function());
 }
 
 /// The pull of a key that nobody is pressing. The pulled-down level shows whether the board
@@ -132,7 +132,7 @@ fn pull(mct: Mct) {
     wait_ms(mct, 5);
     let up = (pin.pull(), pin.read());
     println!(
-        "Pull ses+ (basmayin): {:?} seviye {}, {:?} seviye {} ({})",
+        "Pull vol+ (do not press): {:?} level {}, {:?} level {} ({})",
         down.0,
         u8::from(down.1),
         up.0,
@@ -144,7 +144,7 @@ fn pull(mct: Mct) {
 /// Sampled every 5 ms, which also hides contact bounce. Ends when every key has been
 /// pressed and released, or on any byte from the UART.
 fn polling(mct: Mct) {
-    println!("Yoklama: 3 tusa da kisa basip birakin (guc tusunu uzun basmayin). Atlamak icin UART'tan tus.");
+    println!("Polling: briefly press and release all 3 keys (do not long-press the power key). Press a UART key to skip.");
     for key in KEYS {
         key.set_input(Pull::Up);
     }
@@ -155,20 +155,20 @@ fn polling(mct: Mct) {
     let mut released = [false; 3];
     while released != [true; 3] {
         if uart.try_read_byte().is_some() {
-            println!("Yoklama atlandi");
+            println!("Polling skipped");
             return;
         }
         for (index, key) in KEYS.iter().enumerate() {
             let now = !key.read();
             if now != pressed[index] {
                 pressed[index] = now;
-                println!("{} {}", KEY_NAMES[index], if now { "basildi" } else { "birakildi" });
+                println!("{} {}", KEY_NAMES[index], if now { "pressed" } else { "released" });
                 released[index] |= !now;
             }
         }
         wait_ms(mct, 5);
     }
-    println!("Yoklama TAMAM");
+    println!("Polling OK");
 }
 
 fn interrupts() -> ! {
@@ -179,8 +179,8 @@ fn interrupts() -> ! {
         source.listen(Trigger::BothEdges);
         gic.enable(source.irq());
     }
-    println!("Kesme: GIC {} guc, {} ses+/ses-. Her basma + birakma 2 kenar yapar, fazlasi kontak sekmesidir.", eint(0).irq(), eint(1).irq());
-    println!("m: ses+ maskesini degistirir. Diger tuslar <x> olarak yanki yapar.");
+    println!("Interrupts: GIC {} power, {} vol+/vol-. Each press + release makes 2 edges, any more are contact bounce.", eint(0).irq(), eint(1).irq());
+    println!("m: toggles the vol+ mask. Other keys echo as <x>.");
     cpu::enable_irq();
 
     let uart = console::uart();
@@ -192,7 +192,7 @@ fn interrupts() -> ! {
             if now != seen[key] {
                 seen[key] = now;
                 println!(
-                    "{}: {} kenar, seviye {}, bos {} yanlis {}",
+                    "{}: {} edges, level {}, empty {} wrong {}",
                     KEY_NAMES[key],
                     now,
                     u8::from(KEYS[key].read()),
@@ -212,7 +212,7 @@ fn interrupts() -> ! {
                     eint(VOLUME_UP_INDEX).clear();
                     eint(VOLUME_UP_INDEX).unmask();
                 }
-                println!("ses+ maskesi: {}", if masked { "acik (kenar sayilmamali)" } else { "kapali" });
+                println!("vol+ mask: {}", if masked { "on (edges must not be counted)" } else { "off" });
             }
             Some(b'\r') => println!(),
             Some(byte) => print!("<{}>", byte as char),
@@ -222,7 +222,7 @@ fn interrupts() -> ! {
 }
 
 fn main(_args: BootArgs) -> ! {
-    println!("\nGPIO testi");
+    println!("\nGPIO test");
 
     let mct = Mct::new();
     mct.start();

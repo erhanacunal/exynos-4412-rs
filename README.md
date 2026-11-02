@@ -1,161 +1,165 @@
-# Exynos 4412 için bare-metal Rust
+# Bare-metal Rust for the Exynos 4412
 
-Samsung Exynos 4412 (4 × Cortex-A9) üzerinde, kartın kendi U-Boot'undan `bootm` ile
-başlatılan bare-metal Rust. `exynos_4412_rs` çalışma ortamını ve sürücüleri sağlar.
-Uygulama bu crate'e bağımlı olur, bir `memory.x` verir ve `main` yazar.
+Bare-metal Rust on the Samsung Exynos 4412 (4 × Cortex-A9), started with `bootm` from the
+board's own U-Boot. `exynos_4412_rs` provides the runtime and the drivers. An application
+depends on this crate, supplies a `memory.x` and writes `main`.
 
-- `exynos_4412_rs/`: startup, exception'lar, UART, konsol, panic, `link.x`
-- `hello_world/`: konsol testi
-- `irq_timer/`: GIC ve MCT testi
-- `mmu_test/`: MMU ve önbellek testi
-- `l2_test/`: L2 önbellek testi ve MCT hız ölçümü
-- `smp_test/`: CPU1-3 açılışı, çekirdekler arası bellek ve SGI testi, L2 gecikme ölçümü
-- `timer_test/`: Çekirdek başına MCT yerel zamanlayıcı testi
-- `gpio_test/`: GPIO pinleri ve tuş kesmeleri testi
+- `exynos_4412_rs/`: startup, exceptions, drivers, console, panic, `link.x`
+- `hello_world/`: console test
+- `irq_timer/`: GIC and MCT test
+- `mmu_test/`: MMU and cache test
+- `l2_test/`: L2 cache test and MCT rate measurement
+- `smp_test/`: CPU1-3 bring-up, inter-core memory and SGI tests, L2 latency measurement
+- `timer_test/`: per-core MCT local timer test
+- `gpio_test/`: GPIO pins and key interrupts test
+- `i2c_test/`: I2C bus test, performs only reads on the devices
+- `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
 
-## Derleme
+## Build
 
 ```sh
 export PATH=$HOME/.cargo/bin:$PATH
 cargo build --release   # ELF
-make bin                # hello_world.bin ve boyutu
-make img                # boot.img (~/mkbootimg/mkbootimg ile)
-make disasm             # giriş kodu ve vektör tablosu
-make img APP=irq_timer  # başka bir uygulama için aynı hedefler
+make bin                # hello_world.bin and its size
+make img                # boot.img (with ~/mkbootimg/mkbootimg)
+make disasm             # entry code and vector table
+make img APP=irq_timer  # same targets for another application
 ```
 
-Çıktılar `target/armv7a-none-eabihf/release/` altındadır. Hedef `.cargo/config.toml`
-dosyasında, araç zinciri `rust-toolchain.toml` dosyasındadır.
+Outputs are under `target/armv7a-none-eabihf/release/`. The target is set in
+`.cargo/config.toml`, the toolchain in `rust-toolchain.toml`.
 
-Farklı bir yükleme adresi için `hello_world/memory.x` içindeki `ORIGIN` değiştirilir;
-U-Boot'un `bootcmd`'i `0x40008000` kullandığı için kart tarafı da buna uymalıdır.
+For a different load address, change `ORIGIN` in `hello_world/memory.x`; since U-Boot's
+`bootcmd` uses `0x40008000`, the board side must match it too.
 
-## Karta yükleme
+## Flashing the board
 
-`bootcmd` değişmez, akış Linux ile aynıdır:
+`bootcmd` does not change, the flow is the same as for Linux:
 
 ```
 movi init; mmc read 0 40008000 10040 4FC0; bootm 40008000 41000000
 ```
 
 1. `make img`
-2. Kart fastboot modundayken, Linux'ta kullandığın bölüm adıyla:
+2. With the board in fastboot mode, using the partition name you use for Linux:
    ```sh
-   fastboot flash <bölüm> target/armv7a-none-eabihf/release/boot.img
+   fastboot flash <partition> target/armv7a-none-eabihf/release/boot.img
    ```
-3. U-Boot'ta `boot`.
+3. `boot` in U-Boot.
 
-Konsol: UART2, 115200n8. `bootm` yolunda `dcache off` gerekmez, `bootm` önbellekleri
-kernel için zaten kapatır. Bu işlem bölümdeki Linux imajının yerine yazar. Geri dönmek
-için aynı komutla `~/boot.img` yazılır; U-Boot'a dokunulmaz.
+Console: UART2, 115200n8. `dcache off` is not needed on the `bootm` path, as `bootm` already
+turns the caches off for the kernel. This overwrites the Linux image in the partition. To go
+back, write `~/boot.img` with the same command; U-Boot is not touched.
 
-`go` ile başlatmak da desteklenir (`dcache off`, yükleme, `go 0x40008000`), ancak bu
-yol test edilmedi.
+Starting with `go` is also supported (`dcache off`, load, `go 0x40008000`), but this path has
+not been tested.
 
-## İmaj biçimi
+## Image format
 
-Bu U-Boot imzalıdır ve kaynağı yoktur, `bootm`'un imajı nasıl tanıdığı bilinmiyor. Bilinen
-tek çalışan örnek Linux `zImage`'dir, bu yüzden imaj onun başlığıyla başlar:
+This U-Boot is signed and has no source, so how `bootm` recognises an image is unknown. The
+only known working example is a Linux `zImage`, so the image starts with its header:
 
-| Offset | İçerik |
+| Offset | Content |
 |---|---|
-| `0x00-0x1F` | 8 adet `mov r0, r0` |
+| `0x00-0x1F` | 8 × `mov r0, r0` |
 | `0x20` | `b __exynos_boot` |
 | `0x24` | magic `0x016f2818` |
-| `0x28` | başlangıç: `0` |
-| `0x2C` | imaj boyutu |
+| `0x28` | start: `0` |
+| `0x2C` | image size |
 | `0x30` | `0x04030201` |
 
-Kartta doğrulandı: `boot.img` bölüme Android başlığıyla yazılıyor ve `bootm` imajı bir
-sayfa sonrasından, `0x40009000`'den başlatıyor. `zImage` konumdan bağımsız olduğu için Linux
-bundan etkilenmez, ama bizim kodumuz `0x40008000`'e link edilir. Bu yüzden startup'taki
-kendini taşıma adımı **gereklidir**, silinmemelidir.
+Verified on the board: `boot.img` is written to the partition with its Android header, and
+`bootm` starts the image one page later, from `0x40009000`. Linux is unaffected because `zImage`
+is position-independent, but our code is linked at `0x40008000`. The self-relocation step in
+startup is therefore **required** and must not be removed.
 
-## Kart test sonucu (`hello_world`)
+## Board test results (`hello_world`)
 
-U-Boot (`Willow #`) ile `boot` komutundan alınan sonuçlar. `Unknown command 'movi'` uyarısı
-`bootcmd`'den gelir, açılışı etkilemez.
+Results from the `boot` command in U-Boot (`Willow #`). The `Unknown command 'movi'` warning
+comes from `bootcmd` and does not affect booting.
 
-| Eylem | Gözlenen |
+| Action | Observed |
 |---|---|
 | `bootm` | `Boot with Android zImage`, `Boot with zImage`, `Boot with Android Ramdisk Image`, `Starting kernel ...` |
-| Açılış | `Merhaba Exynos 4412` |
-| Başlatma adresi | `0x40009000` |
+| Boot | `Hello Exynos 4412` |
+| Start address | `0x40009000` |
 | `r0`-`r2` | `0x43e00898`, `0x000010b4`, `0x40000100` |
-| `MPIDR` | `0x80000a00` (CPU0, DTS'teki `cpu@a00` ile uyumlu) |
+| `MPIDR` | `0x80000a00` (CPU0, matches `cpu@a00` in the DTS) |
 | `CPSR` | `0x600001d3`, Supervisor |
-| Karakter yazma | Echo çalışıyor |
-| `p` | `*** Panic at hello_world/src/main.rs:26` ve mesaj, sonra durur |
-| `a` | `DataAbort`, `DFSR=0x00000001` (hizalama), `DFAR=0x4000e175`, register dökümü, sonra durur |
+| Typing characters | Echo works |
+| `p` | `*** Panic at hello_world/src/main.rs:26` and the message, then halts (since SMP the line starts `*** CPU0 panic at`) |
+| `a` | `DataAbort`, `DFSR=0x00000001` (alignment), `DFAR=0x4000e175`, register dump, then halts |
 
-Kartta henüz sınanmayanlar: FIQ, varsayılan undefined ve SVC raporları,
-`_start`'a yanlışlıkla gelen ikincil çekirdeğin bekleme döngüsü.
+Not yet tested on the board: FIQ, the default undefined and SVC reports, and the wait loop of
+a secondary core that reaches `_start` by accident.
 
-## Bağımlılık
+## Dependency
 
-MMIO için `tock-registers` seçildi: bağımlılığı yoktur, register haritasını ve bit
-alanlarını tipli olarak tanımlar, ayrıca byte genişlikli `UTXH`/`URXH` erişimini ifade edebilir.
+`tock-registers` was chosen for MMIO: it has no dependencies, defines the register map and bit
+fields with types, and can also express byte-wide `UTXH`/`URXH` access.
 
-## DTS'ten çıkarılan bilgiler
+## Information taken from the DTS
 
-Kaynak: `exynos4412-mehmet.dts`. Linux ağacındaki kopyasıyla aynı dosyadır.
-5.15'te `exynos4x12.dtsi` ve `exynos4x12-pinctrl.dtsi` yoktur; bunların yerine
-`exynos4412.dtsi` (`exynos4.dtsi`'yi içerir) ve `exynos4412-pinctrl.dtsi` kullanıldı.
+Source: `exynos4412-mehmet.dts`. It is the same file as the copy in the Linux tree.
+5.15 has no `exynos4x12.dtsi` or `exynos4x12-pinctrl.dtsi`; `exynos4412.dtsi` (which includes
+`exynos4.dtsi`) and `exynos4412-pinctrl.dtsi` were used instead.
 
-| Bilgi | Değer | Kaynak |
+| Item | Value | Source |
 |---|---|---|
-| Konsol | UART2, `0x1382_0000`, 115200n8, pinler `gpa1-0`/`gpa1-1` | `chosen/stdout-path = "serial2:115200n8"`, `aliases/serial2`, `serial_2`, `uart2_data` |
-| DRAM | `0x4000_0000`, boyut `0x7EA0_0000` (2026 MiB), son adres `0xBEA0_0000` hariç | `memory@40000000` |
-| Güvenli firmware | `0x0204_F000` | `firmware@204f000` |
+| Console | UART2, `0x1382_0000`, 115200n8, pins `gpa1-0`/`gpa1-1` | `chosen/stdout-path = "serial2:115200n8"`, `aliases/serial2`, `serial_2`, `uart2_data` |
+| DRAM | `0x4000_0000`, size `0x7EA0_0000` (2026 MiB), end address `0xBEA0_0000` exclusive | `memory@40000000` |
+| Secure firmware | `0x0204_F000` | `firmware@204f000` |
 
-`status = "okay"` olan çevre birimleri:
+Peripherals with `status = "okay"`:
 
-- **UART:** `serial_0` (Bluetooth), `serial_2` (konsol)
+- **UART:** `serial_0` (Bluetooth), `serial_2` (console)
 - **I2C:** `i2c_0`, `i2c_1`, `i2c_3`, `i2c_5`, `i2c_6`, `i2c_7`, `i2c_8`
-- **Depolama:** `sdhci_2`, `sdhci_3` (WiFi), `mshc_0` (eMMC)
-- **Görüntü:** `fimd`, `gpu`, `mfc`, `pwm` (arka ışık)
-- **Kamera:** `camera`, `csis_1`, `fimc_0`, `fimc_1`, `fimc_3`
-- **Ses:** `i2s0`
+- **Storage:** `sdhci_2`, `sdhci_3` (WiFi), `mshc_0` (eMMC)
+- **Display:** `fimd`, `gpu`, `mfc`, `pwm` (backlight)
+- **Camera:** `camera`, `csis_1`, `fimc_0`, `fimc_1`, `fimc_3`
+- **Audio:** `i2s0`
 - **USB:** `ehci`, `exynos_usbphy`
-- **Sistem:** `adc`, `rtc`, `tmu`, `watchdog`
-- **Veri yolu frekansı:** `bus_acp`, `bus_c2c`, `bus_display`, `bus_dmc`, `bus_fsys`,
+- **System:** `adc`, `rtc`, `tmu`, `watchdog`
+- **Bus frequency:** `bus_acp`, `bus_c2c`, `bus_display`, `bus_dmc`, `bus_fsys`,
   `bus_leftbus`, `bus_mfc`, `bus_peri`, `bus_rightbus`
 
-## Varsayımlar
+## Assumptions
 
-- **Önbellek:** Startup MMU ve önbellekleri kapatır ama kirli satırları temizlemez; bunu
-  `bootm` (veya `go` öncesi `dcache off`) yapmış olmalıdır. L2 bu noktada kapalıdır.
-- **Saat ve pinler:** Konsol UART'ının saatini, pinlerini ve baud hızını U-Boot ayarlar.
-- **Bellek:** `bootcmd` bölümden yaklaşık 10 MiB okuyup `0x40008000`'den yazar; imajın
-  arkasına çöp gelmesi sorun değildir, `.bss` sıfırlanır. `make bin` sınırı aşan imajı reddeder.
-- **Tek çekirdek:** Yalnızca CPU0 çalışır, diğerleri `wfe` döngüsünde bekler. Konsolda
-  kilit yoktur.
-- **Güvenlik durumu:** Kart Non-secure çalışır (`mmu_test` ile ölçüldü). VFP erişimine
-  `NSACR` izin veriyor. Başka bir kartta izin yoksa startup, Rust'a girmeden `wfi` döngüsünde
-  durur ve konsola bir şey basmaz.
-- **Hizalama:** MMU kapalıyken bellek Strongly-ordered'dır, hizasız erişimin sonucu
-  tanımsızdır. Bu yüzden startup `SCTLR.A`'yı açar ve hizasız erişim kesin bir data abort
-  üretir. Hedefin `strict-align` kod üretimi derleyicinin böyle erişim üretmesini önler.
-- **Atomikler:** `LDREX`/`STREX` Strongly-ordered bellekte güvenilir olmadığı için
-  kütüphane yalnızca 32 bit ve daha küçük atomiklerde `load`/`store` kullanır. Uygulama da MMU
-  açılana kadar `compare_exchange`, `fetch_add`, `swap` ve `AtomicU64` kullanmamalıdır.
-- **Asenkron abort:** `CPSR.A` U-Boot'tan geldiği gibi bırakılır. Maskeliyse asenkron dış
-  abort'lar görünmez.
+- **Cache:** Startup turns off the MMU and caches but does not clean dirty lines; `bootm` (or
+  `dcache off` before `go`) must have done that. L2 is off at this point.
+- **Clocks and pins:** U-Boot configures the clock, pins and baud rate of the console UART.
+- **Memory:** `bootcmd` reads about 10 MiB from the partition and writes it from `0x40008000`;
+  garbage following the image is not a problem, since `.bss` is zeroed. `make bin` rejects an
+  image that exceeds the limit.
+- **Single core:** Only CPU0 runs, the others wait in a `wfe` loop. The console has no lock.
+- **Security state:** The board runs Non-secure (measured with `mmu_test`). `NSACR` allows VFP
+  access. On another board without that permission, startup stops in a `wfi` loop before entering
+  Rust and prints nothing to the console.
+- **Alignment:** With the MMU off, memory is Strongly-ordered and the result of an unaligned
+  access is undefined. Startup therefore sets `SCTLR.A`, so an unaligned access produces a
+  precise data abort. The target's `strict-align` code generation keeps the compiler from
+  emitting such accesses.
+- **Atomics:** Because `LDREX`/`STREX` are not reliable on Strongly-ordered memory, the library
+  uses only `load`/`store` on atomics of 32 bits and smaller. Applications must also avoid
+  `compare_exchange`, `fetch_add`, `swap` and `AtomicU64` until the MMU is on.
+- **Asynchronous abort:** `CPSR.A` is left as it came from U-Boot. If masked, asynchronous
+  external aborts are not visible.
 
-## Tasarım notları
+## Design notes
 
-- **FIQ yığını:** İstenen SVC/IRQ/ABT/UND yığınlarına FIQ da eklendi (`__fiq_stack_size`),
-  çünkü FIQ handler'ının da yığına ihtiyacı var.
-- **VFP kaydı:** Exception stub'ları `d0-d7`, `d16-d31` ve `FPSCR`'ı da kaydeder, çünkü
-  hedefin kod üretimi `d16-d31`'i kullanır.
-- **SVC:** Uygulama SVC modunda çalıştığı için kendi `svc` çağrısı `LR`'sini ezer. Satır içi
-  `svc` kullanan kod `lr`'yi clobber olarak bildirmelidir.
-- **`BootArgs.load_addr`:** İstenen `r0`-`r2`'ye ek olarak, imajın başlatıldığı adres.
+- **FIQ stack:** FIQ was added to the requested SVC/IRQ/ABT/UND stacks (`__fiq_stack_size`),
+  because the FIQ handler needs a stack too.
+- **VFP save:** The exception stubs also save `d0-d7`, `d16-d31` and `FPSCR`, because the
+  target's code generation uses `d16-d31`.
+- **SVC:** Because the application runs in SVC mode, its own `svc` call overwrites its `LR`. Code
+  using inline `svc` must declare `lr` as a clobber.
+- **`BootArgs.load_addr`:** In addition to the requested `r0`-`r2`, the address the image was
+  started from.
 
 ## Handler override
 
-Her handler bir linker sembolüdür, varsayılanı `link.x` içindeki `PROVIDE` satırlarıyla
-bağlanır: `handle_undef`, `handle_svc`, `handle_prefetch_abort`, `handle_data_abort`,
+Each handler is a linker symbol, whose default is bound by the `PROVIDE` lines in `link.x`:
+`handle_undef`, `handle_svc`, `handle_prefetch_abort`, `handle_data_abort`,
 `handle_irq`, `handle_fiq`.
 
 ```rust
@@ -163,204 +167,291 @@ bağlanır: `handle_undef`, `handle_svc`, `handle_prefetch_abort`, `handle_data_
 extern "C" fn handle_irq(frame: &mut exynos_4412_rs::exceptions::ExceptionFrame) { /* ... */ }
 ```
 
-## Kesme ve zamanlayıcı
+## Interrupts and timer
 
-`drivers::gic::Gic` kesmeleri açar, alır ve bitirir; `drivers::timer::Mct` 64 bit sayacı ve
-periyodik kesmeyi sağlar. Uygulama `handle_irq` sembolünü tanımlar. Örnek: `irq_timer/src/main.rs`.
+`drivers::gic::Gic` enables, acknowledges and ends interrupts; `drivers::timer::Mct` provides the
+64-bit counter and the periodic interrupt. The application defines the `handle_irq` symbol.
+Example: `irq_timer/src/main.rs`.
 
-- **Sayaç:** MCT global sayacı, comparator 0, `GIC_SPI 57` (GIC ID 89), 24 MHz.
-- **Sıra:** Handler önce kaynağı temizler (`Mct::clear_interrupt`), sonra EOI yazar.
-- **Atomikler:** MMU kapalıyken `fetch_add` ve `AtomicU64` yasak; `AtomicU64`'ün `load` ve
-  `store` işlemleri bile `LDREXD`/`STREXD` üretir. Bir değişkene yalnızca handler yazıyorsa
-  32 bit ve daha küçük atomiklerde `load` + `store` yeterlidir.
-- **FIQ:** `handle_fiq` var ama GIC FIQ üretecek şekilde ayarlanmıyor.
+- **Counter:** MCT global counter, comparator 0, `GIC_SPI 57` (GIC ID 89), 24 MHz.
+- **Order:** The handler first clears the source (`Mct::clear_interrupt`), then writes EOI.
+- **Atomics:** `fetch_add` and `AtomicU64` are forbidden with the MMU off; even the `load` and
+  `store` of `AtomicU64` produce `LDREXD`/`STREXD`. If only the handler writes a variable,
+  `load` + `store` on atomics of 32 bits and smaller is enough.
+- **FIQ:** `handle_fiq` exists, but the GIC is not configured to generate FIQs.
 
-Kartta `irq_timer` testi: `make img APP=irq_timer`, yazma adımı aynı. Gözlenen:
+`irq_timer` test on the board: `make img APP=irq_timer`, same flashing step. Observed:
 
-| Eylem | Gözlenen |
+| Action | Observed |
 |---|---|
-| Açılış | `MCT sayaci ilerliyor: 0x19 -> 0x428d`, `GIC hazir`. Sayaç U-Boot'tan durmuş geliyor, `Mct::start` başlatıyor |
-| Her saniye | 11 tick; ilki `24000213`, sonrakiler `24000000` ± 12 ve sapma birikmiyor |
-| Karakter yazma | Tick'ler arasında echo çalışıyor, IRQ dönüşü ana döngüyü bozmuyor |
+| Boot | `MCT counter advancing: 0x19 -> 0x428d`, `GIC ready`. The counter comes stopped from U-Boot, `Mct::start` starts it |
+| Every second | 11 ticks; the first `24000213`, the rest `24000000` ± 12 with no accumulating drift |
+| Typing characters | Echo works between ticks, the IRQ return does not disturb the main loop |
 
-Sayaç farkı periyodun kendisidir, gerçek zamanı doğrulamaz: 24 MHz için 60 saniyede 60 tick
-kronometreyle ölçülmelidir.
+The counter delta is the period itself and does not validate real time: for 24 MHz, 60 ticks in
+60 seconds should be measured with a stopwatch.
 
-## MMU ve önbellekler
+## MMU and caches
 
-`mmu::enable()` kimlik eşlemeli MMU'yu, L1 önbellekleri ve dal tahminini açar. Ayrıntılar
-`exynos_4412_rs/src/mmu.rs` başındadır.
+`mmu::enable()` turns on the identity-mapped MMU, the L1 caches and branch prediction. Details
+are at the top of `exynos_4412_rs/src/mmu.rs`.
 
-| Aralık | Eşleme | Neden |
+| Range | Mapping | Reason |
 |---|---|---|
-| `0x0000_0000..0x0010_0000` | fault | null işaretçiler yakalanır |
-| `0x0010_0000..0x4000_0000` | Device, execute-never | SYSRAM ve çevre birimleri, spekülasyon yok |
-| `0x4000_0000..0xBEA0_0000` | Normal WBWA, Shareable | DTS'teki DRAM |
-| `0xBEA0_0000` ve üstü | fault | DTS dışı bellek, spekülasyon ulaşmamalı |
+| `0x0000_0000..0x0010_0000` | fault | catches null pointers |
+| `0x0010_0000..0x4000_0000` | Device, execute-never | SYSRAM and peripherals, no speculation |
+| `0x4000_0000..0xBEA0_0000` | Normal WBWA, Shareable | DRAM from the DTS |
+| `0xBEA0_0000` and above | fault | memory outside the DTS, speculation must not reach it |
 
-- **Tablo:** Derleme zamanında üretilir ve `.rodata`'dadır, yazılmadığı için önbellek bakımı
-  gerektirmez. İmaj bu yüzden 16 KiB hizalı bir bölüm kadar büyür.
-- **`SCTLR.A` açık kalır:** Kod zaten `strict-align`, gerçek bir hizasız erişim hata verir.
-- **Atomikler:** `enable` sonrası `fetch_add` ve `AtomicU64` kullanılabilir ve açılmış tüm
-  çekirdekler arasında geçerlidir (Shareable eşleme, `ACTLR.SMP`, SCU).
-- **L2:** Bu kartta U-Boot'tan kapalı gelir. `mmu::enable()` sonrası `L2c::enable()` çağrılır;
-  kart Non-secure çalıştığı için bu güvenli firmware'e SMC ile yapılır (`firmware.rs`). Çağrı
-  sırası ve değerler Linux 5.15 ile kartın vendor kernel'inden doğrulandı.
-- **DMA:** DRAM'i doğrudan kullanan donanım için L1 ve L2 önbellek bakımı henüz yok.
+- **Table:** Generated at compile time and placed in `.rodata`; since it is never written, it
+  needs no cache maintenance. The image grows by a 16 KiB-aligned section because of this.
+- **`SCTLR.A` stays on:** The code is `strict-align` anyway, a real unaligned access faults.
+- **Atomics:** After `enable`, `fetch_add` and `AtomicU64` may be used and are valid across all
+  started cores (Shareable mapping, `ACTLR.SMP`, SCU).
+- **L2:** Comes off from U-Boot on this board. `L2c::enable()` is called after `mmu::enable()`;
+  since the board runs Non-secure, this is done via SMC to the secure firmware (`firmware.rs`). The
+  call order and values were verified against Linux 5.15 and the board's vendor kernel.
+- **DMA:** L1 and L2 cache maintenance for hardware that uses DRAM directly does not exist yet.
 
-Kartta test: `make img APP=mmu_test`, yazma adımı aynı. Gözlenen:
+Test on the board: `make img APP=mmu_test`, same flashing step. Observed:
 
-| Çıktı | Gözlenen |
+| Output | Observed |
 |---|---|
-| `Guvenlik durumu` | `Non-secure` (`SCR` okuması UNDEF oldu, handler'dan dönüş de çalıştı) |
-| `ACTLR` | `0x00000047`: `SMP` biti U-Boot'tan açık geliyor |
-| `NSACR` | `0x00060c00`: cp10/cp11 (VFP) izinli |
-| `L2:` | `CTRL 0x0`, kapalı. `AUX 0x02070000`: 16 yol |
-| `SCTLR` | `0x00c5007a` → `0x00c5187f` (`M`, `C`, `Z`, `I` açıldı) |
-| Hız | 124540 µs → 1350 µs, 92 kat (16 KiB, yalnızca L1) |
-| `LDREX/STREX` | `5 7`, takılma yok |
-| `tick N  kesilen FP kontrolu` | Her tick bir FP kontrolünü kesti, `d0` ve `d17` korundu |
+| `Security state` | `Non-secure` (reading `SCR` was UNDEF, and returning from the handler also worked) |
+| `ACTLR` | `0x00000047`: the `SMP` bit comes set from U-Boot |
+| `NSACR` | `0x00060c00`: cp10/cp11 (VFP) allowed |
+| `L2:` | `CTRL 0x0`, off. `AUX 0x02070000`: 16 ways |
+| `SCTLR` | `0x00c5007a` → `0x00c5187f` (`M`, `C`, `Z`, `I` turned on) |
+| Speed | 124540 µs → 1350 µs, 92 times (16 KiB, L1 only) |
+| `LDREX/STREX` | `5 7`, no hang |
+| `tick N  interrupted FP checks` | Every tick interrupted an FP check, `d0` and `d17` were preserved |
 | `t` | `DataAbort`, `DFSR=0x00000005`, `DFAR=0xbea00000` |
 | `x` | `PrefetchAbort`, `IFSR=0x0000000d`, `IFAR=0x10050000` |
 
-### L2 testi
+### L2 test
 
-`make img APP=l2_test`, yazma adımı aynı. Gözlenen:
+`make img APP=l2_test`, same flashing step. Observed:
 
-| Çıktı | Gözlenen |
+| Output | Observed |
 |---|---|
-| `Chip ID` | `0xe4412211`, revizyon `0x11`: prefetch değeri `0x71000007` uygun |
-| `MCT hizi` | `23998400` Hz, 24 MHz ile 67 ppm fark |
-| `L2:` (önce) | `CTRL 0x0 AUX 0x02070000 TAG 0x777 DATA 0x777 PREFETCH 0x0 POWER 0x0` |
-| `L2:` (sonra) | `CTRL 0x1 AUX 0x7e470000 TAG 0x110 DATA 0x120 PREFETCH 0x71000007 POWER 0x3` |
-| `L2 acilmadan yazilan veri dogru` | Geçişte veri kaybı yok |
-| Hız, L2 kapalı | 16 KiB 4 ns, 256 KiB 7 ns, 2 MiB 7 ns |
-| Hız, L2 açık | 16 KiB 4 ns, 256 KiB 4 ns, 2 MiB 4 ns |
-| `tick N ... hata yok` | 11 saniye, yaklaşık 2100 geçiş 2 MiB doğrulama, hata yok |
+| `Chip ID` | `0xe4412211`, revision `0x11`: prefetch value `0x71000007` is suitable |
+| `MCT rate` | `23998400` Hz, 67 ppm off from 24 MHz |
+| `L2:` (before) | `CTRL 0x0 AUX 0x02070000 TAG 0x777 DATA 0x777 PREFETCH 0x0 POWER 0x0` |
+| `L2:` (after) | `CTRL 0x1 AUX 0x7e470000 TAG 0x110 DATA 0x120 PREFETCH 0x71000007 POWER 0x3` |
+| `Data written before L2 enable is correct` | No data loss across the switch |
+| Speed, L2 off | 16 KiB 4 ns, 256 KiB 7 ns, 2 MiB 7 ns |
+| Speed, L2 on | 16 KiB 4 ns, 256 KiB 4 ns, 2 MiB 4 ns |
+| `tick N ... no errors` | 11 seconds, about 2100 passes of 2 MiB verification, no errors |
 
-Bu ölçüm sıralı erişimdir ve çözünürlüğü 1 ns'dir. 4 ns, döngünün kendi süresidir. 2 MiB'ın da
-hızlanması L2 kapasitesinden değil, büyük olasılıkla prefetch'ten gelir; L2'nin isabet gecikmesi
-bu testle ölçülmüş sayılmaz. Bunun için rastgele erişimli bir test gerekir.
+This measurement is sequential access with a resolution of 1 ns. 4 ns is the duration of the loop
+itself. That 2 MiB also speeds up comes not from L2 capacity but most likely from prefetch; L2's hit
+latency cannot be considered measured by this test. That requires a random-access test.
 
 ## SMP
 
-`exynos_4412_rs::smp`, CPU1-3'ü başlatır. Sıra CPU0'da: `mmu::enable()` (SCU'yu da açar),
-isteğe bağlı `L2c::enable()`, `Gic::init()`, sonra her çekirdek için `smp::start_cpu(n, giris)`.
-Başlayan çekirdek SVC modunda, kesmeler kapalı, kendi yığınlarıyla, VFP ve MMU + L1 açık olarak
-`giris(n)`'e gelir; kesme alacaksa önce `Gic::init_this_cpu()` çağırır.
+`exynos_4412_rs::smp` starts CPU1-3. The order on CPU0: `mmu::enable()` (also turns on the SCU),
+optional `L2c::enable()`, `Gic::init()`, then `smp::start_cpu(n, entry)` for each core. A started
+core arrives at `entry(n)` in SVC mode, with interrupts off, on its own stacks, with VFP and MMU + L1
+on; if it will take interrupts, it first calls `Gic::init_this_cpu()`.
 
-- **Açılış yolu:** Çekirdek gücü (PMU), SYSRAM'de giriş adresi (`0x0204F01C + 4n`),
-  `SMC_CMD_CPU1BOOT` ve bir SGI; çekirdek rapor verene kadar tekrarlanır. Arayüz Linux 5.15
-  (`platsmp.c`, `firmware.c`) ile vendor kernel'inden alındı. Linux bu kartta 4 çekirdekte
-  çalışıyordu; DTS'teki `maxcpus=1` geçersizdi (`CONFIG_CMDLINE_FORCE`).
-- **Eşleşme:** İkincil çekirdek MMU'su açılana kadar normal belleğe dokunmaz: CPU0'ın önbelleğinde
-  bayat satır olabilir. Yığınları bu yüzden yalnızca yazmaçlara yüklenir, ilk kullanım MMU'dan sonradır.
-- **Yığınlar:** `link.x` her çekirdek için bir blok ayırır (varsayılan 5 × 16 KiB). Bu boşluk
-  dosyada yer kaplamaz, ama `memory.x` içindeki `RAM`'den düşer.
-- **GIC:** Dağıtıcı ve CPU arayüzünün çekirdek başına ayrı penceresi var (`0x4000` aralıklı). `Gic`
-  her erişimde çağıran çekirdeğin penceresini seçer. SPI yapılandırması aynı anda tek çekirdekten yapılmalı.
-- **Konsol:** İlk `start_cpu` ile kilit devreye girer; her `print!` çekirdekler arası atomiktir.
-  Yazarken hata alan çekirdek raporunu bitirir, ama kilidi tutarak durur ve çıktıyı keser.
-- **`smp::SpinLock<T>`:** Tutan çekirdekte IRQ kapalıdır. MMU kapalıyken panic verir.
-- **Hata izi:** Başlayan çekirdek durmak zorunda kalırsa UART2'ye kilitsiz olarak `<n>V` (VFP
-  izni yok) veya `<n>S` (`ACTLR.SMP` ayarlanamadı) yazar.
-- **Uyandırma SGI'ı:** Kartta her ikincil çekirdek, `init_this_cpu` temizlemeye çalışsa da bir
-  `smp::WAKE_SGI` aldı. Kesme işleyicisi bunu görmezden gelmelidir.
-- **Henüz yok:** Çekirdek kapatma (hotplug), FIQ.
+- **Bring-up path:** Core power (PMU), the entry address in SYSRAM (`0x0204F01C + 4n`),
+  `SMC_CMD_CPU1BOOT` and an SGI; repeated until the core reports. The interface was taken from Linux 5.15
+  (`platsmp.c`, `firmware.c`) and the vendor kernel. Linux was running on 4 cores on this board;
+  `maxcpus=1` in the DTS had no effect (`CONFIG_CMDLINE_FORCE`).
+- **Memory before the MMU:** A secondary core does not touch normal memory until its MMU is on: CPU0's cache may hold
+  stale lines. Its stacks are therefore only loaded into registers, first use comes after the MMU.
+- **Stacks:** `link.x` reserves one block per core (default 5 × 16 KiB). This space takes no room in
+  the file, but is deducted from `RAM` in `memory.x`.
+- **GIC:** The distributor and CPU interface have a separate per-core window (`0x4000` apart). `Gic`
+  selects the calling core's window on every access. SPI configuration must be done from one core at a time.
+- **Console:** The lock takes effect with the first `start_cpu`; every `print!` is atomic across cores.
+  A core that faults while writing finishes its report, but halts holding the lock and cuts off the output.
+- **`smp::SpinLock<T>`:** IRQs are off on the holding core. Panics with the MMU off.
+- **Error trace:** If a started core has to halt, it writes `<n>V` (no VFP permission) or `<n>S`
+  (`ACTLR.SMP` could not be set) to UART2 without the lock.
+- **Wake SGI:** On the board every secondary core received one `smp::WAKE_SGI`, even though
+  `init_this_cpu` tries to clear it. The interrupt handler must ignore it.
+- **Not yet present:** Core shutdown (hotplug), FIQ.
 
-Kartta test: `make img APP=smp_test`, yazma adımı aynı. Gözlenen (Cortex-A9 r3p0, `MIDR 0x413fc090`):
+Test on the board: `make img APP=smp_test`, same flashing step. Observed (Cortex-A9 r3p0, `MIDR 0x413fc090`):
 
-| Test | Gözlenen |
+| Test | Observed |
 |---|---|
-| CPU1-3 açılışı | Her biri yaklaşık 1,7 ms; `ACTLR` `0x47`, MPIDR `0x80000a01..03` |
-| SCU | Firmware kapalı bırakıyor, Non-secure yazmayla açılıyor; güç durumu baştan `0x30003` |
-| Atomik sayaç | 4.000.000 / 4.000.000, yaklaşık 190 ms |
-| Kilitli sayaç | 800.000 / 800.000, yaklaşık 95 ms |
-| Veri devri (256 KiB, 64 tur) | Hata yok |
-| SGI halkası | 1000 tur, tur başına yaklaşık 3 µs |
-| MCT tik (CPU1'e yönlendirilmiş SPI) | Saniyede 1, 60 sn boyunca kayıpsız; diğer çekirdeklere gitmedi |
-| CPU0 yankısı | Kilitli konsolla, diğer çekirdekler yazarken çalışıyor |
+| CPU1-3 bring-up | Each about 1.7 ms; `ACTLR` `0x47`, MPIDR `0x80000a01..03` |
+| SCU | Firmware leaves it off, turned on by a Non-secure write; power state `0x30003` from the start |
+| Atomic counter | 4,000,000 / 4,000,000, about 190 ms |
+| Locked counter | 800,000 / 800,000, about 95 ms |
+| Data handoff (256 KiB, 64 rounds) | No errors |
+| SGI ring | 1000 laps, about 3 µs per lap |
+| MCT tick (SPI routed to CPU1) | 1 per second, none lost over 60 s; did not go to other cores |
+| CPU0 echo | Works with the locked console, while the other cores are writing |
 
-Rastgele erişim gecikmesi (işaretçi kovalama, 32 bayt adım):
+Random access latency (pointer chasing, 32-byte stride):
 
-| Çalışma alanı | L2 kapalı | L2 açık |
+| Working set | L2 off | L2 on |
 |---|---|---|
 | 16 KiB | 6 ns | 6 ns |
 | 128 KiB - 768 KiB | 134-140 ns | 28 ns |
 | 2 MiB | 138-140 ns | 97-109 ns |
 | 8 MiB | 138-140 ns | 135-156 ns |
 
-**Bilinen sınır:** Çekirdekleri, başka çekirdeklerin de yazdığı önbellek satırında sonsuz, yalnızca
-yazan bir döngüde (`str; add; b`) bırakmayın. Kartta üç denemenin üçünde o satıra yazan diğer
-çekirdekler hata vermeden durdu. Aynı döngü kimsenin dokunmadığı satırda 40 sn boyunca sorun
-çıkarmadı ve kesme almaya devam etti. Paylaşılan satırda 1 milyon yazmada bir duran döngü de sorun
-çıkarmadı. Sebep bilinmiyor, yayımlanmış bir erratumla eşleştirilmedi.
+**Known limitation:** Do not leave cores in an endless, write-only loop (`str; add; b`) on a cache line
+that other cores also write. On the board, in three attempts out of three, the other cores writing to
+that line stopped without reporting an error. The same loop on a line nobody else touches caused no
+problem for 40 s and kept taking interrupts. A loop that pauses once every 1 million writes on the shared
+line also caused no problem. The cause is unknown and has not been matched to a published erratum.
 
-## MCT yerel zamanlayıcı
+## MCT local timer
 
-`drivers::timer::LocalTimer`, her çekirdeğin kendi aralık zamanlayıcısıdır. Hepsi tek bir banked PPI
-üzerinden, yalnızca kendi çekirdeğine kesme verir (`soc::MCT_LOCAL_IRQ`, ID 28).
+`drivers::timer::LocalTimer` is each core's own interval timer. All of them interrupt only their own
+core, through a single banked PPI (`soc::MCT_LOCAL_IRQ`, ID 28).
 
 ```rust
-Gic::new().enable(soc::MCT_LOCAL_IRQ);                   // kesmeyi alacak çekirdekte
-LocalTimer::this_cpu().start_periodic(24_000);           // 24 MHz'de sayaç: 1 kHz
-LocalTimer::this_cpu().clear_interrupt();                // kesme işleyicisinde
+Gic::new().enable(soc::MCT_LOCAL_IRQ);                   // on the core that takes the interrupt
+LocalTimer::this_cpu().start_periodic(24_000);           // counts at 24 MHz: 1 kHz
+LocalTimer::this_cpu().clear_interrupt();                // in the interrupt handler
 ```
 
-- **Periyot:** Global sayacın birimiyle (24 MHz) verilir, çift ve en az 32 olmalıdır: zamanlayıcı
-  saati önce 2'ye böler. Kartta `ICNTB = n` ile periyot `2n + 2` ölçüldü; sürücü bunu hesaba katar.
-- **Tek atış:** İşleyicide `clear_interrupt`'tan önce `stop` çağrılır.
-- **Erişim:** Her çekirdek her zamanlayıcıyı programlayabilir (`LocalTimer::new(n)`), ama aynı anda
-  aynı zamanlayıcıyı iki çekirdek programlamamalıdır.
+- **Period:** Given in global counter units (24 MHz), must be even and at least 32: the timer first
+  divides the clock by 2. On the board, `ICNTB = n` measured a period of `2n + 2`; the driver accounts for this.
+- **One-shot:** Call `stop` in the handler before `clear_interrupt`.
+- **Access:** Every core can program every timer (`LocalTimer::new(n)`), but two cores must not program
+  the same timer at the same time.
 
-Kartta test: `make img APP=timer_test`, yazma adımı aynı. Gözlenen (5 sn ölçüm; periyot sayaç birimiyle):
+Test on the board: `make img APP=timer_test`, same flashing step. Observed (5 s measurement; period in counter units):
 
-| Çekirdek | Hız | Tik | Ortalama periyot | En az - en çok |
+| Core | Rate | Ticks | Mean period | Min - max |
 |---|---|---|---|---|
-| CPU0 | 100 Hz | 500 | 239999,975 | 239984 - 240005 |
-| CPU1 | 1 kHz | 5000 | 23999,998 | 23991 - 24005 |
-| CPU2 | 500 Hz | 2500 | 48000,000 | 47995 - 48005 |
-| CPU3 | 250 Hz | 1250 | 95999,996 | 95996 - 96004 |
+| CPU0 | 100 Hz | 500 | 239999.975 | 239984 - 240005 |
+| CPU1 | 1 kHz | 5000 | 23999.998 | 23991 - 24005 |
+| CPU2 | 500 Hz | 2500 | 48000.000 | 47995 - 48005 |
+| CPU3 | 250 Hz | 1250 | 95999.996 | 95996 - 96004 |
 
-Serbest çalışmada 40 sn boyunca her saniye tam olarak `100 1000 500 250` tik görüldü.
-Durdurulan çekirdeğin zamanlayıcısı diğerlerini etkilemedi, tek atış iki denemede de tek tik verdi,
-beklenmeyen kesme olmadı. CPU1-3 `wfi` içinden uyandı. Yanlış çekirdeğe giden tik görülmedi.
+In free running, exactly `100 1000 500 250` ticks were seen every second for 40 s.
+The stopped core's timer did not affect the others, the one-shot gave a single tick in both attempts,
+and there were no unexpected interrupts. CPU1-3 woke from `wfi`. No tick going to the wrong core was seen.
 
 ## GPIO
 
-`drivers::gpio`, pinleri `gpio::GPX1.pin(3)` biçiminde verir: işlev, seviye, pull ve sürüş gücü.
-GPX0-GPX3 pinlerinde `Pin::eint()` uyandırma kesmesini verir. Diğer bankaların grup kesmeleri
-yoktur. Banka tablosu Linux `pinctrl-exynos-arm.c:355-414` ile aynıdır.
+`drivers::gpio` gives pins in the form `gpio::GPX1.pin(3)`: function, level, pull and drive strength.
+On GPX0-GPX3 pins, `Pin::eint()` gives the wakeup interrupt. Group interrupts of the other banks are
+not present. The bank table is the same as Linux `pinctrl-exynos-arm.c:355-414`.
 
-- **Çekirdekler:** Aynı bankanın pinlerini aynı anda tek çekirdek değiştirmelidir. Aynı
-  çekirdekteki kesme handler'ı pin değiştirebilir.
-- **Koruma yok:** Sürücü, kartın ihtiyaç duyduğu bir pinin değiştirilmesini engellemez.
-- **Denenmemiş denetleyiciler:** `GPZ` ve `GPV*` bankalarına kartta hiç erişilmedi; saatleri veya
-  güç alanları kapalı olabilir.
+- **Cores:** Only one core at a time should change pins of the same bank. An interrupt handler on the
+  same core may change pins.
+- **No protection:** The driver does not prevent changing a pin the board needs.
+- **Untried controllers:** The `GPZ` and `GPV*` banks were never accessed on the board; their clocks or
+  power domains may be off.
 
-Kartta `gpio_test`: `make img APP=gpio_test`, yazma adımı aynı. Gözlenen:
+`gpio_test` on the board: `make img APP=gpio_test`, same flashing step. Observed:
 
-| Adım | Gözlenen |
+| Step | Observed |
 |---|---|
-| Okuma | `gpa1-0`, `gpa1-1` `Alt(2)`, `gpk0-0` `Alt(3)`; DTS ile aynı, iki denetleyicinin banka adresleri doğrulandı |
-| Çıkış | `gpd0-1` geri okuma 6/6, ekran ışığı 3 kez yanıp söndü, pin eski işlevine döndü |
-| Pull | `ses+` alanı `Down` ve `Up` olarak geri okundu; iki durumda da seviye 1, yani hatta kart üzerinde pull-up var |
-| Yoklama | Üç tuş da `basildi` / `birakildi` verdi |
-| Kesme | GIC 59 (güç) ve paylaşılan GIC 64 (`ses+`, `ses-`) çalıştı; boş ve yanlış kesme 0 |
-| Maske | `ses+` maskeliyken kenar sayılmadı, maske kalkınca sayım sürdü |
+| Read | `gpa1-0`, `gpa1-1` `Alt(2)`, `gpk0-0` `Alt(3)`; same as the DTS, the bank addresses of two controllers verified |
+| Output | `gpd0-1` readback 6/6, the backlight blinked 3 times, the pin returned to its previous function |
+| Pull | `vol+` field read back as `Down` and `Up`; level 1 in both states, so the line has a pull-up on the board |
+| Polling | All three keys gave `pressed` / `released` |
+| Interrupt | GIC 59 (power) and shared GIC 64 (`vol+`, `vol-`) worked; empty and wrong interrupts 0 |
+| Mask | With `vol+` masked, edges were not counted; after unmasking, counting continued |
 
-- **Kontak sekmesi:** Ses tuşları tek basışta 2'den çok kenar üretiyor (bir aralıkta 10 kenar görüldü).
-  Güç tuşu 4 basışta tam 8 kenar verdi. Sürücüde filtre yok; kenarla çalışan kod kendi süzmesini yapmalıdır.
-  5 ms yoklama bu testte sekme göstermedi.
-- **U-Boot'tan gelen durum:** `gpd0-1` PWM işlevinde değil, `Output` ve yüksek geliyor. Ekran ışığı bu
-  yüzden doğrudan bu pinle yanıp sönüyor.
+- **Contact bounce:** The volume keys produce more than 2 edges per press (10 edges seen in one interval).
+  The power key gave exactly 8 edges in 4 presses. The driver has no filter; edge-driven code must do its
+  own filtering. 5 ms polling showed no bounce in this test.
+- **State from U-Boot:** `gpd0-1` comes as `Output` and high, not in its PWM function. That is why the
+  backlight blinks directly with this pin.
+
+## I2C
+
+`drivers::i2c` is a polling master driver for controllers 0-7:
+`I2c::new(Bus::I2c3).init(100_000, 100)`, then `probe`, `read`, `write`, `write_read`.
+`init` opens the clock gate and configures the pins. It selects the rate based on `aclk100`, read from `drivers::cmu`.
+
+- **Missing:** Interrupt operation and bus recovery are not implemented. A stuck line returns an error.
+- **HDMI bus:** `i2c_8` is out of scope because it behaves differently.
+- **Clock:** `drivers::cmu` does not change PLLs, muxes or dividers; it only reads them and opens the I2C gates.
+
+`i2c_test` on the board: `make img APP=i2c_test`, same flashing step. It sends only addresses and
+register numbers, so multi-byte writes are first exercised by `pmic_test`. Observed:
+
+| Item | Observed |
+|---|---|
+| Clocks | MPLL 800 MHz, `aclk100` 100 MHz |
+| Fuel gauge, `i2c_3` | Absent `0x37` gives `AddressNack`, then `0x36` answers; 3853 mV; 1000 reads, 0 errors |
+| PMIC, `i2c_0` | Device ID `0x02`; 1000 reads, 0 errors |
+| Time per read | 497 us at 97656 Hz, 107 us at 390625 Hz |
+| LDO6, 24, 25, 26 | All mode 0, off, as U-Boot leaves them |
+| `i2c_6`, `i2c_1`, `i2c_7` | Lines `1 1`, devices give `AddressNack` |
+| `i2c_5` | Lines `0 0`, `Timeout`: both lines are held low with the touch controller unpowered |
+
+- **Bus rate:** The times fit about 3 extra bus clocks and 7.5 us of software per read. That is a fit of
+  two unknowns to two measurements, not a measurement of SCL.
+- **State of charge:** The gauge's raw value is 162. The vendor kernel halves it
+  (`max17040_battery.c:178`), giving 81 %. This board's DTS lacks `maxim,double-soc`, without which the
+  Linux 5.15 driver does not halve it. The 81 % has not been compared with another reading.
+
+## MAX77686
+
+`drivers::max77686` reads LDO states and turns LDOs on and off. U-Boot leaves the peripheral rails off,
+so their devices do not answer on I2C until `Max77686::enable_ldo` turns them on, despite
+`regulator-boot-on` in the DTS.
+
+- **Voltages:** The driver only checks that the LDO can produce a voltage. Take it from the DTS: a wrong
+  value can damage what the rail feeds. Turning off the wrong LDO can stop the board.
+- **Not covered:** BUCK1-4, and the GPIO control of BUCK8, BUCK9 and LDO20-22.
+
+| Rail | Feeds | From U-Boot | Set by `pmic_test` |
+|---|---|---|---|
+| LDO6 `vdd_tsp_1v8` | Touch controller | Off, 1800 mV | 1800 mV |
+| LDO26 `vdd_tsp` | Touch controller | Off, 2700 mV | 3000 mV |
+| LDO24 `vdd_sensor` | Gyroscope | Off, 3000 mV | 3000 mV |
+| LDO25 `vdd_audio` | Codec | Off, 3000 mV | 3300 mV |
+
+`pmic_test` on the board: `make img APP=pmic_test`, same flashing step. It writes only these four
+registers, then restores them. Observed:
+
+| Item | Observed |
+|---|---|
+| Rails | All four read back mode 3 at the voltages above; all restored and read back |
+| Light sensor `0x44` | `AddressNack` with LDO24 off, answers with it on |
+| Codec `0x1a` | `AddressNack` with LDO25 off, answers with it on |
+| `i2c_5` lines | `(0, 0)` with LDO6 and LDO26 off, `(1, 1)` with them on, `(0, 0)` again after restoring |
+| Other rails from U-Boot | Of the DTS `always-on` LDOs only 22, 24, 25 and 26 are off. BUCK5, 6 and 7 are on |
+
+The touch controller needs more than its own rails. This power-up works from a power-on, in one reset:
+
+1. Set BUCK7 to 3300 mV and BUCK6 to 2000 mV, the values Linux uses. U-Boot leaves 2000 and 1350 mV.
+2. Hold reset (`gpb-4`) low and wake (`gpm3-3`) high.
+3. Turn on LDO26 at 3000 mV, then LDO6 at 1800 mV.
+4. After 70 ms release reset, and after 300 ms read the controller at `0x4a`.
+
+Observed: family `0xa2`, version `0x20`, build `0xab`, matrix 32 x 52, 33 objects, 100 reads with 0 errors.
+That build matches the vendor firmware `mXT1664S__APP_V2-0-AB`. No touch input is read yet: there is no
+driver for the controller.
+
+| Touch power-up | Result |
+|---|---|
+| Own rails only | Nothing on `i2c_5`, CHG high |
+| BUCK7 raised first | Nothing on `i2c_5`, CHG high |
+| BUCK7 and BUCK6 raised first | `0x4a`, CHG low |
+| BUCK6 and BUCK7 raised while it is already powered, one reset | `0x26`, the bootloader address (`atmel_mxt_ts.c:480-484`) |
+| The same, one more reset | `0x4a` |
+
+BUCK6 is needed with BUCK7 raised. BUCK6 alone has not been tried, so BUCK7 may not be needed. Why BUCK6 matters
+is not known: nothing read here says what it feeds.
+
+Other findings:
+
+- **Gyroscope:** Nothing answers on `i2c_6`, and `i2cdetect -y 6` under Linux finds nothing either, with
+  `vdd_sensor` on. It is not fitted on this unit, although the DTS has a node for it.
+- **BUCK8 and BUCK9:** Their mode bits read 0. BUCK8 feeds the eMMC, which works, so 0 does not mean off
+  for these two: Linux has GPIO control for them (`max77686-regulator.c:103-107`).
 
 ## QEMU
 
-`qemu` hedefi proje kararıyla eklenmedi; testler gerçek kartta yapılır.
+A `qemu` target was not added, by project decision; testing is done on the real board.
 
 ## TODO(verify)
 
 
-UART4 adresi Linux 5.15 DTS'inde yoktur. Kaynağı vendor kernel'dir (`/home/developer/willow`,
-3.0.101, ayrıntı `soc.rs` içinde). Kart kullanım kılavuzuyla karşılaştırılması iyi olur.
+The UART4 address is not in the Linux 5.15 DTS. Its source is the vendor kernel (`/home/developer/willow`,
+3.0.101, details in `soc.rs`). Comparing it against the board's user manual would be good.
