@@ -3,7 +3,7 @@ name = "exynos_4412_rs"
 version = "0.1.0"
 edition = "2024"
 description = "Bare-metal runtime and drivers for the Samsung Exynos 4412, started from U-Boot"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [features]
 default = ["panic-handler"]

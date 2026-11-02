@@ -3,7 +3,7 @@ name = "power_test"
 version = "0.1.0"
 edition = "2024"
 description = "Restart and power-off test for exynos_4412_rs"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [dependencies]
 exynos_4412_rs = { path = "../exynos_4412_rs" }
