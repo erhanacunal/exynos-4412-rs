@@ -29,6 +29,14 @@ const SRC_MASK_LCD0: usize = 0xC334;
 const DIV_LCD0: usize = 0xC534;
 /// clk-exynos4.c:93.
 const GATE_IP_LCD0: usize = 0xC934;
+/// clk-exynos4.c:51.
+const SRC_FSYS: usize = 0xC240;
+/// clk-exynos4.c:62.
+const SRC_MASK_FSYS: usize = 0xC340;
+/// clk-exynos4.c:78.
+const DIV_FSYS3: usize = 0xC54C;
+/// clk-exynos4.c:97.
+const GATE_IP_FSYS: usize = 0xC940;
 /// clk-exynos4.c:65.
 const DIV_TOP: usize = 0xC510;
 /// clk-exynos4.c:99.
@@ -62,6 +70,8 @@ const GATE_LCD0_FIMD0: u32 = 1 << 0;
 /// clk-exynos4.c:832: `CLK_SMMU_FIMD0`. The System MMU stays off, but it sits on the path of
 /// the FIMD's reads. TODO(verify): whether a closed gate here blocks them.
 const GATE_LCD0_SMMU_FIMD0: u32 = 1 << 4;
+/// clk-exynos4.c:751: `CLK_SDMMC4`, the register clock of the eMMC controller.
+const GATE_FSYS_SDMMC4: u32 = 1 << 9;
 /// Number of gates from [`GATE_I2C0_BIT`] that this module opens, leaving out `CLK_I2C_HDMI`.
 const I2C_GATES: usize = 8;
 
@@ -83,6 +93,19 @@ impl FimdClocks {
     pub const fn bus_clock_on(&self) -> bool {
         self.gate & GATE_LCD0_FIMD0 != 0
     }
+}
+
+/// Raw clock registers of the eMMC controller, for reports.
+#[derive(Clone, Copy, Debug)]
+pub struct Mmc4Clocks {
+    /// `SRC_FSYS`.
+    pub src: u32,
+    /// `SRC_MASK_FSYS`.
+    pub src_mask: u32,
+    /// `DIV_FSYS3`.
+    pub div: u32,
+    /// `GATE_IP_FSYS`.
+    pub gate: u32,
 }
 
 /// Handle to the clock management unit. Holds no state.
@@ -131,6 +154,21 @@ impl Cmu {
         } else {
             soc::FIN_PLL_HZ
         }
+    }
+
+    /// The clock registers of the eMMC controller as they are now.
+    pub fn mmc4_clocks(&self) -> Mmc4Clocks {
+        Mmc4Clocks {
+            src: self.read(SRC_FSYS),
+            src_mask: self.read(SRC_MASK_FSYS),
+            div: self.read(DIV_FSYS3),
+            gate: self.read(GATE_IP_FSYS),
+        }
+    }
+
+    /// Whether the register clock of the eMMC controller runs, without which it does not answer.
+    pub fn mmc4_bus_clock_on(&self) -> bool {
+        self.read(GATE_IP_FSYS) & GATE_FSYS_SDMMC4 != 0
     }
 
     /// The clock registers of the FIMD as they are now.

@@ -15,6 +15,8 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `gpio_test/`: GPIO pins and key interrupts test
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
+- `mmc_test/`: eMMC read test, partition table, no writes
+- `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 
 ## Build
 
@@ -495,6 +497,55 @@ U-Boot leaves the display running, so the panel works from the moment the applic
 So the timing derived from the DTS matches U-Boot's, and the panel also runs without the two VCLK
 settings taken from the vendor kernel. `GATE_IP_LCD0` reads `0xffffffff` before this code touches
 it, so the System MMU gate this code opens was already open on this boot.
+
+## Restart and power off
+
+`drivers::power` restarts the chip with `SWRESET` and powers off by dropping `PS_HOLD`, so the long
+hardware press of the power key is not needed. `power_test` tries each.
+
+- **Boot mode:** `restart` takes a `BootMode`, written to `INFORM5` for U-Boot. `Fastboot` goes
+  straight to flashing. These values come from the vendor kernel.
+- **Charger:** With a charger connected, `power_off` does what the vendor kernel does: it restarts
+  with `INFORM6` = 2 instead of cutting the power. On the board, dropping `PS_HOLD` with the charger
+  connected left it running, and the application started again after this restart.
+- **Keys:** `PowerKeys::service`, called from a main loop. Hold for 2 s, then release: power = off,
+  power + volume up = restart, power + volume down = fastboot. It acts after release, so that a held
+  power key cannot turn the board back on and U-Boot does not read a held volume key.
+- **Limit:** Keys work only while the application calls `service`: `display_test` and `power_test`
+  do. An application that has halted, panicked or hung still needs the long hardware press.
+- **PMIC:** `restart` leaves the PMIC rails as they were. Only a real power off clears them.
+
+Tested on the board with the charger connected (`Charger: DC yes, USB no`). `PS_HOLD_CONTROL` reads
+`0x00005300` while running. Powering off with no charger was not checked from a log.
+
+## eMMC (read-only)
+
+`drivers::mmc` reads the board's eMMC through the DW MMC controller `mshc_0`. `partition::scan` parses
+its MBR and the chain of extended boot records.
+
+- **Read-only by construction:** The driver can send only `CMD8`, `CMD13`, `CMD17` and `CMD18`, with
+  the controller's automatic `CMD12` as the stop. It has no write, erase or switch command.
+- **U-Boot's setup is kept:** The card is not reset or initialized. U-Boot read this image from it, so
+  it is ready, and bus width and clock stay as they are. `CMD6` would be needed to change them, and it
+  writes to the card's `EXT_CSD`.
+- **Limit:** A failed read may leave the card unusable until a restart, as there is no recovery.
+- **Transfer:** Polled through the FIFO, with no DMA and no interrupts.
+
+Test on the board: `make img APP=mmc_test`, same flashing step. Observed:
+
+| Check | Result |
+|---|---|
+| Card | 30777344 blocks (15028 MiB), `EXT_CSD` revision 6, address 1, in transfer state |
+| Hardware partition | User area; `PARTITION_CONFIG` `0x48` |
+| Bus | Controller `CTYPE` 8-bit; `HS_TIMING` 1; FIFO 32 bits |
+| Partition table | MBR at block 0 with an extended chain; 10 partitions |
+| `bootcmd` block `0x10040` | Start of p5, begins with `ANDROID!` |
+| Ext superblock magic | p3, p9, p10: yes. p8: no, it reads `0x3ba0` |
+| Single against multiple block reads | Same data |
+| 16 MiB from SYSTEM, read twice | Same data, about 15800 KiB/s |
+
+`EXT_CSD` `BUS_WIDTH` reads 0 although the controller is in 8-bit mode, and data arrives without CRC
+errors. p10 is 28295104 blocks on the card, which ends it exactly where the extended partition ends.
 
 ## QEMU
 

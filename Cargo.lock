@@ -52,6 +52,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmc_test"
+version = "0.1.0"
+dependencies = [
+ "exynos_4412_rs",
+]
+
+[[package]]
 name = "mmu_test"
 version = "0.1.0"
 dependencies = [
@@ -60,6 +67,13 @@ dependencies = [
 
 [[package]]
 name = "pmic_test"
+version = "0.1.0"
+dependencies = [
+ "exynos_4412_rs",
+]
+
+[[package]]
+name = "power_test"
 version = "0.1.0"
 dependencies = [
  "exynos_4412_rs",

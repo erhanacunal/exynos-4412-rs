@@ -113,6 +113,10 @@ pub const SYSREG_BASE: usize = 0x1001_0000;
 /// `pd_lcd0: power-domain@10023c80`, `reg`.
 pub const PD_LCD0_BASE: usize = 0x1002_3C80;
 
+/// eMMC controller, `mshc_0`. Verified: `exynos4412.dtsi:307-309`, node `mshc_0: mmc@12550000`,
+/// and `exynos4412-mehmet.dts:1399-1414` has the eMMC on it.
+pub const MSHC_BASE: usize = 0x1255_0000;
+
 /// Number of cores. Verified: `exynos4412.dtsi`, nodes `cpu@a00`..`cpu@a03`. `link.x`
 /// reserves this many stack blocks.
 pub const CPU_COUNT: usize = 4;

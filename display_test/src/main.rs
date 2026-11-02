@@ -17,6 +17,7 @@ use exynos_4412_rs::drivers::display::{
 use exynos_4412_rs::drivers::i2c::{Bus, I2c};
 use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::drivers::max77686::Max77686;
+use exynos_4412_rs::drivers::power::PowerKeys;
 use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::{BootArgs, console, cpu, mmu, print, println, soc};
 
@@ -241,7 +242,7 @@ fn show(mct: Mct, buffer: &mut Framebuffer, draw: fn(&mut Framebuffer)) {
 
 /// A vertical bar crossing the screen, one step per frame, until a key arrives. Reports the
 /// rate it keeps, which falls below the refresh if a frame takes too long.
-fn animate(mct: Mct, fimd: Fimd, buffer: &mut Framebuffer) -> u8 {
+fn animate(mct: Mct, fimd: Fimd, buffer: &mut Framebuffer, keys: &mut PowerKeys) -> u8 {
     let (width, height) = (buffer.width(), buffer.height());
     buffer.fill_rect(0, 0, width, height, DARK_GRAY);
     buffer.flush();
@@ -270,6 +271,7 @@ fn animate(mct: Mct, fimd: Fimd, buffer: &mut Framebuffer) -> u8 {
             frames = 0;
             slowest = 0;
         }
+        keys.service(mct);
         if let Some(key) = uart.try_read_byte() {
             return key;
         }
@@ -277,7 +279,7 @@ fn animate(mct: Mct, fimd: Fimd, buffer: &mut Framebuffer) -> u8 {
 }
 
 /// Runs one pattern. Returns the key that ended it, if it is one that runs until a key.
-fn run_pattern(key: u8, mct: Mct, fimd: Fimd, buffer: &mut Framebuffer) -> Option<u8> {
+fn run_pattern(key: u8, mct: Mct, fimd: Fimd, buffer: &mut Framebuffer, keys: &mut PowerKeys) -> Option<u8> {
     fimd.set_solid_color(None);
     match key {
         b'1' => {
@@ -299,7 +301,7 @@ fn run_pattern(key: u8, mct: Mct, fimd: Fimd, buffer: &mut Framebuffer) -> Optio
         }
         b'5' => {
             println!("5: white bar moving to the right. Any key ends it");
-            return Some(animate(mct, fimd, buffer));
+            return Some(animate(mct, fimd, buffer, keys));
         }
         _ => println!("Keys: 1 solid, 2 bars, 3 geometry, 4 gradient, 5 animation, l LVDS, b backlight"),
     }
@@ -348,7 +350,9 @@ fn main(_args: BootArgs) -> ! {
     let mut lvds = true;
     let mut backlight = true;
     let mut pending = None;
+    let mut keys = PowerKeys::new();
     loop {
+        keys.service(mct);
         let Some(key) = pending.take().or_else(|| uart.try_read_byte()) else {
             continue;
         };
@@ -364,7 +368,7 @@ fn main(_args: BootArgs) -> ! {
                 println!("Backlight {}", if backlight { "on" } else { "off" });
             }
             b'\r' | b'\n' => print!("\r\n"),
-            key => pending = run_pattern(key, mct, fimd, &mut buffer),
+            key => pending = run_pattern(key, mct, fimd, &mut buffer, &mut keys),
         }
     }
 }
