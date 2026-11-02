@@ -104,6 +104,15 @@ pub const I2C_BASES: [usize; 8] = [
 /// `exynos4412-mehmet.dts:48,53` gives them 0 Hz and 24 MHz.
 pub const FIN_PLL_HZ: u32 = 24_000_000;
 
+/// FIMD display controller. Verified: `exynos4.dtsi:705`, node `fimd: fimd@11c00000`, `reg`.
+pub const FIMD_BASE: usize = 0x11C0_0000;
+/// System registers, among them the LCD block configuration. Verified: `exynos4.dtsi:178`,
+/// node `sys_reg: syscon@10010000`.
+pub const SYSREG_BASE: usize = 0x1001_0000;
+/// Power domain of the FIMD. Verified: `exynos4.dtsi:128-130`, node
+/// `pd_lcd0: power-domain@10023c80`, `reg`.
+pub const PD_LCD0_BASE: usize = 0x1002_3C80;
+
 /// Number of cores. Verified: `exynos4412.dtsi`, nodes `cpu@a00`..`cpu@a03`. `link.x`
 /// reserves this many stack blocks.
 pub const CPU_COUNT: usize = 4;

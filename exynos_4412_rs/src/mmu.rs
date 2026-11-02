@@ -21,12 +21,15 @@
 //!   coherency covers only cores that have themselves reached this state: see [`crate::smp`].
 //! - `SCTLR.A` stays set. Generated code is `strict-align`, so nothing needs unaligned
 //!   access, and a real one still faults.
-//! - Anything else using DRAM directly, such as DMA, needs cache maintenance.
-//!   TODO: range clean and invalidate operations.
+//! - Anything else using DRAM directly, such as DMA, needs cache maintenance. A device that
+//!   reads needs [`clean_dcache_range`]. TODO: range invalidate, for a device that writes.
 //! - This does not enable the L2 cache: call
 //!   [`L2c::enable`](crate::drivers::l2c::L2c::enable) afterwards.
 
 use core::arch::{asm, global_asm};
+
+/// L1 line of the Cortex-A9. The L2 cache has the same: `arch/arm/mm/cache-l2x0.c:37`.
+const L1_LINE_SIZE: usize = 32;
 
 use crate::cpu;
 use crate::drivers::l2c::L2c;
@@ -93,6 +96,33 @@ global_asm!(
     ".popsection",
     table = sym TABLE,
 );
+
+/// Writes a range of memory out to DRAM, from the L1 cache of this core and then from the L2
+/// cache, so that a device reading DRAM sees what the CPU wrote. The lines stay valid.
+///
+/// Addresses are the identity mapping's, so also physical. Works with the MMU or either
+/// cache off. Dirty lines in the L1 cache of another core are not covered.
+pub fn clean_dcache_range(start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut line = start & !(L1_LINE_SIZE - 1);
+    while line < start + len {
+        // SAFETY: cleaning changes no data in the view of any observer. `DCCMVAC`, the same
+        // operation as `arch/arm/mm/cache-v7.S:405`. An address without a mapping would fault,
+        // and the caller passes memory it has been using.
+        unsafe {
+            asm!("mcr p15, 0, {}, c7, c10, 1", in(reg) line, options(nostack, preserves_flags));
+        }
+        line += L1_LINE_SIZE;
+    }
+    // SAFETY: a barrier has no effect other than ordering: the L1 lines must have left before
+    // the L2 operation below.
+    unsafe {
+        asm!("dsb", options(nostack, preserves_flags));
+    }
+    L2c::new().clean_range(start, len);
+}
 
 /// Turns on the MMU, the L1 data and instruction caches and branch prediction on this
 /// core, CPU0 only: [`smp::start_cpu`](crate::smp::start_cpu) does this for the others.

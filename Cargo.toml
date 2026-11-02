@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["exynos_4412_rs", "gpio_test", "hello_world", "i2c_test", "irq_timer", "l2_test", "mmu_test", "pmic_test", "smp_test", "timer_test"]
+members = ["display_test", "exynos_4412_rs", "gpio_test", "hello_world", "i2c_test", "irq_timer", "l2_test", "mmu_test", "pmic_test", "smp_test", "timer_test"]
 
 [profile.release]
 panic = "abort"

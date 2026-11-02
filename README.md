@@ -11,6 +11,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `l2_test/`: L2 cache test and MCT rate measurement
 - `smp_test/`: CPU1-3 bring-up, inter-core memory and SGI tests, L2 latency measurement
 - `timer_test/`: per-core MCT local timer test
+- `display_test/`: panel bring-up with FIMD: state report, scan checks, test patterns
 - `gpio_test/`: GPIO pins and key interrupts test
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
@@ -446,11 +447,63 @@ Other findings:
 - **BUCK8 and BUCK9:** Their mode bits read 0. BUCK8 feeds the eMMC, which works, so 0 does not mean off
   for these two: Linux has GPIO control for them (`max77686-regulator.c:103-107`).
 
+## Display
+
+`drivers::display` drives the FIMD on the board's panel, `samsung,ltn101al03`, 1280x800 over LVDS:
+one full-screen window in XRGB format, from a `Framebuffer` that the application owns. Vsync is
+polled. `display_test` shows it working.
+
+- **Order:** `Fimd::power_on` (domain, clocks, stops whatever U-Boot left running),
+  `configure_pins`, draw and `flush`, `Fimd::start`, `set_lvds(true)`, wait `LVDS_SETTLE_MS`,
+  `set_backlight(true)`.
+- **Caches:** The FIMD reads DRAM and does not see the caches, so drawing appears only after
+  `flush` or `flush_rect`. They use `mmu::clean_dcache_range`, which cleans L1 and then L2.
+- **Clock:** `sclk_fimd0` runs from `mout_mpll_user_t`, undivided, as in the vendor kernel, and the
+  FIMD divides it to the pixel clock: 800 MHz / 12 = 66.67 MHz, about 58 frames per second.
+- **Not present:** Other windows, System MMU, display interrupts (they come through the interrupt
+  combiner), brightness control (the backlight pin needs the PWM; here it is fully on or off).
+
+`Fimd::set_solid_color` shows one color from a register, without reading DRAM. It tells a panel
+problem from a framebuffer problem.
+
+The framebuffer takes 4 MiB of `.bss`, so `display_test` has a `memory.x` of 12 MiB. Nothing of it
+goes into the image.
+
+Test on the board: `make img APP=display_test`, same flashing step. Observed:
+
+| Check | Result |
+|---|---|
+| Buffer address in use after start | `0x40019000`, as programmed |
+| Refresh over 120 frames | 58.188 Hz, computed 58.025 Hz |
+| Full-screen flush (4 MiB) | about 5.4 ms |
+| Moving bar | 58 frames/s, slowest frame 475 us |
+
+The measured refresh is 0.28% above the computed one, more than the error of the MCT rate. The
+cause is not known.
+
+U-Boot leaves the display running, so the panel works from the moment the application starts:
+
+| Register | Left by U-Boot | Set by `Fimd::start` |
+|---|---|---|
+| `sclk_fimd0` | 400 MHz (`DIV_LCD0` field 1) | 800 MHz |
+| `VIDCON0` | `0x00000143`, divider 6 | `0x000002f3`, divider 12, free-running VCLK |
+| `VIDCON1` (low 12 bits) | `0x060` | `0x660`, VCLK runs in blanking |
+| `VIDTCON0`, `VIDTCON1`, `VIDTCON2` | `0x000b0002`, `0x003f0f2f`, `0x0018fcff` | the same |
+| `WINCON0`, `SHADOWCON` | `0x0000802d`, `0x00000001` | the same |
+| Buffer | `0x5f800000` | the application's |
+
+So the timing derived from the DTS matches U-Boot's, and the panel also runs without the two VCLK
+settings taken from the vendor kernel. `GATE_IP_LCD0` reads `0xffffffff` before this code touches
+it, so the System MMU gate this code opens was already open on this boot.
+
 ## QEMU
 
 A `qemu` target was not added, by project decision; testing is done on the real board.
 
 ## TODO(verify)
+
+`drivers::cmu` opens the clock gate of the FIMD's System MMU, which stays off. Whether a closed gate
+would block the FIMD's reads is not verified.
 
 
 The UART4 address is not in the Linux 5.15 DTS. Its source is the vendor kernel (`/home/developer/willow`,

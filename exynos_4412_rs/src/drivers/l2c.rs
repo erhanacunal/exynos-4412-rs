@@ -33,6 +33,9 @@ register_structs! {
         /// cache-l2x0.h:31 `L2X0_INV_WAY`.
         (0x77C => inv_way: ReadWrite<u32>),
         (0x780 => _reserved3),
+        /// cache-l2x0.h:32 `L2X0_CLEAN_LINE_PA`.
+        (0x7B0 => clean_line_pa: ReadWrite<u32>),
+        (0x7B4 => _reserved5),
         /// cache-l2x0.h:51 `L310_PREFETCH_CTRL`.
         (0xF60 => prefetch_ctrl: ReadOnly<u32>),
         (0xF64 => _reserved4),
@@ -71,6 +74,9 @@ const AUX_KEEP: u32 = 0xF60F_FFFF;
 /// Full line of zeros stays off, unlike in the vendor kernel: it also needs `ACTLR` bit 3,
 /// which the board leaves clear.
 const AUX_SET: u32 = 0x0840_0000 | (1 << 29) | (1 << 28) | (1 << 30) | (1 << 26);
+
+/// `arch/arm/mm/cache-l2x0.c:37` `CACHE_LINE_SIZE`.
+const LINE_SIZE: usize = 32;
 
 // Turns a stuck controller into a panic instead of a hang.
 const POLL_LIMIT: u32 = 10_000_000;
@@ -156,6 +162,27 @@ impl L2c {
         if !self.is_enabled() {
             panic!("firmware did not enable the L2 cache: CTRL {:#x}", self.ctrl());
         }
+    }
+
+    /// Writes the dirty lines of a physical address range out to DRAM, keeping them valid.
+    /// Does nothing if the cache is off. Clean the L1 cache first:
+    /// [`mmu::clean_dcache_range`](crate::mmu::clean_dcache_range) does both, in that order.
+    ///
+    /// # Panics
+    ///
+    /// If the controller does not finish.
+    pub fn clean_range(&self, start: usize, len: usize) {
+        if len == 0 || !self.is_enabled() {
+            return;
+        }
+        let regs = self.regs();
+        let mut line = start & !(LINE_SIZE - 1);
+        while line < start + len {
+            regs.clean_line_pa.set(line as u32);
+            line += LINE_SIZE;
+        }
+        regs.cache_sync.set(0);
+        wait_until_zero(&regs.cache_sync, 1);
     }
 
     /// Invalidates every way, discarding its contents, even dirty lines.
