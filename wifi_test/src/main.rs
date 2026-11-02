@@ -4,9 +4,9 @@
 //! Reports what U-Boot left, powers the chip up from reset, starts its SDIO bus and reads what the
 //! chip says about itself. It lists the chip's cores, loads the firmware and NVRAM and checks them
 //! by reading them back, runs the firmware, asks it for its version and its MAC address, and lists
-//! the networks it can hear. Then it joins the one named at build time, gets an address, pings the
-//! router and a public address, and stays on the network answering ARP and pings until told to stop.
-//! It does not renew its address, so that lasts as long as the lease.
+//! the networks it can hear. Then it joins the one named at build time and hands it to `smoltcp`,
+//! which gets an address and renews it, pings the router and a public address, and answers ARP and
+//! pings until told to stop.
 //!
 //! The firmware and NVRAM files come from `WIFI_FIRMWARE_DIR` at build time, and the network from
 //! `WIFI_SSID` and `WIFI_PASSWORD`: see `build.rs`. The passphrase is never printed.
@@ -31,9 +31,16 @@ use exynos_4412_rs::drivers::max77686::Max77686;
 use exynos_4412_rs::drivers::power::{self, BootMode, PowerKeys};
 use exynos_4412_rs::drivers::sdhci::Sdhci;
 use exynos_4412_rs::drivers::timer::Mct;
-use exynos_4412_rs::net::{self, Addresses, DhcpReply, Ip, Mac, Packet};
+use exynos_4412_rs::drivers::wifi_device::WifiDevice;
 use exynos_4412_rs::wpa::{self, Supplicant};
 use exynos_4412_rs::{BootArgs, console, mmu, print, println, soc};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
+use smoltcp::phy::{Device, DeviceCapabilities};
+use smoltcp::socket::{dhcpv4, icmp};
+use smoltcp::time::Instant;
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+};
 
 exynos_4412_rs::entry!(main);
 
@@ -56,18 +63,24 @@ const SSID: Option<&str> = option_env!("WIFI_SSID");
 const PASSWORD: Option<&str> = option_env!("WIFI_PASSWORD");
 /// Joining scans first, then authenticates and shakes hands. Not measured.
 const JOIN_TIMEOUT_MS: u64 = 30_000;
-/// How long a server or a host gets to answer, each time.
-const ANSWER_TIMEOUT_MS: u64 = 3_000;
-/// Times to ask before giving up.
-const DHCP_ATTEMPTS: u32 = 4;
-const ARP_ATTEMPTS: u32 = 4;
+/// How long the DHCP server gets to give an address. The stack asks again on its own meanwhile.
+const DHCP_TIMEOUT_MS: u64 = 30_000;
+/// How long a host gets to answer a ping. The first may wait for its address to be found.
+const PING_TIMEOUT_MS: u64 = 3_000;
 /// Pings to each host, and the time between them.
 const PINGS: u16 = 4;
 const PING_INTERVAL_MS: u64 = 1_000;
 /// Identifies this program's pings among the replies.
 const PING_ID: u16 = 0x4534;
+/// What a ping carries.
+const PING_DATA: [u8; 56] = [0x5A; 56];
 /// A public address, to show that traffic gets past the router: a well known name server of Google.
-const PUBLIC_HOST: Ip = [8, 8, 8, 8];
+const PUBLIC_HOST: Ipv4Address = Ipv4Address::new(8, 8, 8, 8);
+/// Sockets: one for DHCP, one for pings.
+const SOCKETS: usize = 2;
+/// Pings each way that the ping socket can hold, and the bytes for them.
+const PING_QUEUE: usize = 4;
+const PING_BUFFER: usize = 256;
 
 fn verdict(good: bool) -> &'static str {
     if good { "OK" } else { "MISMATCH" }
@@ -275,172 +288,170 @@ fn report(activity: Activity) {
     }
 }
 
-fn print_ip(label: &str, ip: Ip) {
-    println!("{}: {}.{}.{}.{}", label, ip[0], ip[1], ip[2], ip[3]);
-}
-
-/// A connected station, and its buffers.
+/// A connected station: its network stack and what it needs.
 struct Station<'a> {
-    chip: &'a mut Bcm4334,
-    supplicant: Supplicant,
+    device: WifiDevice<'a>,
+    interface: Interface,
+    sockets: SocketSet<'a>,
+    dhcp: SocketHandle,
+    ping: SocketHandle,
+    capabilities: DeviceCapabilities,
     mct: Mct,
-    mac: Mac,
-    /// This station's address, once it has one.
-    ip: Option<Ip>,
-    received: [u8; net::FRAME_MAX],
-    sent: [u8; net::FRAME_MAX],
-    answered_arp: u32,
-    answered_pings: u32,
+    /// The router DHCP last named.
+    gateway: Option<Ipv4Address>,
+    /// Whether DHCP has given an address that still holds.
+    has_address: bool,
 }
 
 impl Station<'_> {
-    /// Reads what is waiting, and answers what is for this station. Returns the length of a frame
-    /// now in `received`, if any arrived.
-    fn poll(&mut self) -> Result<Option<usize>, Error> {
-        let length = self.chip.poll(&mut self.supplicant, &mut self.received, report)?;
-        if let Some(length) = length
-            && let Some(own_ip) = self.ip
-        {
-            match net::parse(&self.received[..length]) {
-                Packet::Arp {
-                    request: true,
-                    sender_mac,
-                    sender_ip,
-                    target_ip,
-                } if target_ip == own_ip => {
-                    let reply = net::arp_reply(&mut self.sent, self.mac, own_ip, sender_mac, sender_ip);
-                    self.chip.send_ethernet(&self.sent[..reply])?;
-                    self.answered_arp += 1;
+    fn now(&self) -> Instant {
+        Instant::from_micros((self.mct.count() / (COUNTS_PER_MS / 1000)) as i64)
+    }
+
+    /// Runs the stack once, and applies whatever DHCP decided. Returns the new configuration's
+    /// address, if there is one. An error is the connection ending.
+    fn poll(&mut self) -> Result<Option<Ipv4Address>, Error> {
+        let now = self.now();
+        self.interface.poll(now, &mut self.device, &mut self.sockets);
+        if let Some(failure) = self.device.failure() {
+            return Err(failure);
+        }
+        match self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).poll() {
+            None => Ok(None),
+            Some(dhcpv4::Event::Deconfigured) => {
+                // The socket also says this once on starting, when there was nothing to lose.
+                if self.has_address {
+                    println!("DHCP: address lost");
                 }
-                Packet::EchoRequest {
-                    source_mac,
-                    source_ip,
-                    destination_ip,
-                    rest,
-                } if destination_ip == own_ip => {
-                    let addresses = Addresses {
-                        destination_mac: source_mac,
-                        source_mac: self.mac,
-                        destination_ip: source_ip,
-                        source_ip: own_ip,
-                    };
-                    if let Some(reply) = net::echo_reply(&mut self.sent, addresses, rest) {
-                        self.chip.send_ethernet(&self.sent[..reply])?;
-                        self.answered_pings += 1;
+                self.has_address = false;
+                self.interface.update_ip_addrs(|addresses| addresses.clear());
+                self.interface.routes_mut().remove_default_ipv4_route();
+                Ok(None)
+            }
+            Some(dhcpv4::Event::Configured(config)) => {
+                println!("DHCP: address {}", config.address);
+                self.interface.update_ip_addrs(|addresses| {
+                    addresses.clear();
+                    // There is one address, and room for more: this cannot fail.
+                    let _ = addresses.push(IpCidr::Ipv4(config.address));
+                });
+                match config.router {
+                    Some(router) => {
+                        println!("DHCP: router {}", router);
+                        // The table is emptied of the default route, so there is room in it.
+                        let _ = self.interface.routes_mut().add_default_ipv4_route(router);
+                    }
+                    None => {
+                        println!("DHCP: no router");
+                        self.interface.routes_mut().remove_default_ipv4_route();
                     }
                 }
-                _ => {}
+                for server in &config.dns_servers {
+                    println!("DHCP: name server {}", server);
+                }
+                self.gateway = config.router;
+                self.has_address = true;
+                Ok(Some(config.address.address()))
             }
         }
-        Ok(length)
     }
 
-    /// Serves the connection until `found` likes a frame or the time is up.
-    fn wait_for<T>(&mut self, ms: u64, mut found: impl FnMut(Packet<'_>) -> Option<T>) -> Result<Option<T>, Error> {
+    /// Runs the stack until DHCP gives an address, or the time is up.
+    fn wait_for_address(&mut self) -> Result<Option<Ipv4Address>, Error> {
+        let begin = self.mct.count();
+        while self.mct.count() - begin < DHCP_TIMEOUT_MS * COUNTS_PER_MS {
+            if let Some(address) = self.poll()? {
+                return Ok(Some(address));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Runs the stack for a while.
+    fn run_for(&mut self, ms: u64) -> Result<(), Error> {
         let begin = self.mct.count();
         while self.mct.count() - begin < ms * COUNTS_PER_MS {
-            if let Some(length) = self.poll()?
-                && let Some(value) = found(net::parse(&self.received[..length]))
-            {
-                return Ok(Some(value));
-            }
+            self.poll()?;
         }
-        Ok(None)
+        Ok(())
     }
 
-    fn wait_for_dhcp(
-        &mut self,
-        id: u32,
-        wanted: impl Fn(&DhcpReply) -> bool,
-    ) -> Result<Option<DhcpReply>, Error> {
-        let mac = self.mac;
-        self.wait_for(ANSWER_TIMEOUT_MS, |packet| match packet {
-            Packet::Udp {
-                destination_port,
-                data,
-            } => net::dhcp_reply(destination_port, data, mac, id).filter(&wanted),
-            _ => None,
-        })
-    }
-
-    /// Runs DHCP's two exchanges, and returns what the server acknowledged.
-    fn get_address(&mut self, id: u32) -> Result<Option<DhcpReply>, Error> {
-        for attempt in 1..=DHCP_ATTEMPTS {
-            println!("DHCP: asking, attempt {}", attempt);
-            let length = net::dhcp_discover(&mut self.sent, self.mac, id);
-            self.chip.send_ethernet(&self.sent[..length])?;
-            let Some(offer) = self.wait_for_dhcp(id, |reply| reply.offer)? else {
-                continue;
-            };
-            print_ip("DHCP: offered", offer.address);
-            let length = net::dhcp_request(&mut self.sent, self.mac, id, offer.address, offer.server);
-            self.chip.send_ethernet(&self.sent[..length])?;
-            let Some(reply) = self.wait_for_dhcp(id, |reply| reply.ack || reply.nak)? else {
-                continue;
-            };
-            if reply.ack && reply.address == offer.address {
-                return Ok(Some(reply));
-            }
-            println!("DHCP: refused");
-        }
-        Ok(None)
-    }
-
-    /// Finds the Ethernet address of a host on this network.
-    fn find_mac(&mut self, own_ip: Ip, host: Ip) -> Result<Option<Mac>, Error> {
-        for _ in 0..ARP_ATTEMPTS {
-            let length = net::arp_request(&mut self.sent, self.mac, own_ip, host);
-            self.chip.send_ethernet(&self.sent[..length])?;
-            let found = self.wait_for(ANSWER_TIMEOUT_MS, |packet| match packet {
-                Packet::Arp {
-                    request: false,
-                    sender_mac,
-                    sender_ip,
-                    ..
-                } if sender_ip == host => Some(sender_mac),
-                _ => None,
-            })?;
-            if found.is_some() {
-                return Ok(found);
-            }
-        }
-        Ok(None)
-    }
-
-    /// Pings a host through `next_hop`, and returns how many answered.
-    fn ping(&mut self, own_ip: Ip, next_hop: Mac, host: Ip) -> Result<u16, Error> {
-        let addresses = Addresses {
-            destination_mac: next_hop,
-            source_mac: self.mac,
-            destination_ip: host,
-            source_ip: own_ip,
-        };
+    /// Pings a host, and returns how many answered.
+    fn ping(&mut self, host: Ipv4Address) -> Result<u16, Error> {
         let mut answers = 0;
         for sequence in 1..=PINGS {
             let begin = self.mct.count();
-            let length = net::echo_request(&mut self.sent, addresses, PING_ID, sequence);
-            self.chip.send_ethernet(&self.sent[..length])?;
-            let found = self.wait_for(ANSWER_TIMEOUT_MS, |packet| {
-                (packet
-                    == Packet::EchoReply {
-                        source_ip: host,
-                        id: PING_ID,
-                        sequence,
-                    })
-                .then_some(())
-            })?;
-            let elapsed = (self.mct.count() - begin) / COUNTS_PER_MS;
-            if found.is_some() {
-                println!("Reply {}: {} ms", sequence, elapsed);
+            let answered = self.send_ping(host, sequence) && self.wait_for_reply(host, sequence)?;
+            if answered {
+                println!("Reply {}: {} ms", sequence, (self.mct.count() - begin) / COUNTS_PER_MS);
                 answers += 1;
             } else {
                 println!("Reply {}: none", sequence);
             }
             if sequence != PINGS {
-                self.wait_for(PING_INTERVAL_MS, |_| None::<()>)?;
+                self.run_for(PING_INTERVAL_MS)?;
             }
         }
         Ok(answers)
+    }
+
+    /// Queues a ping. Returns false if the socket has no room for it.
+    fn send_ping(&mut self, host: Ipv4Address, sequence: u16) -> bool {
+        let request = Icmpv4Repr::EchoRequest {
+            ident: PING_ID,
+            seq_no: sequence,
+            data: &PING_DATA,
+        };
+        let socket = self.sockets.get_mut::<icmp::Socket>(self.ping);
+        let Ok(buffer) = socket.send(request.buffer_len(), IpAddress::Ipv4(host)) else {
+            return false;
+        };
+        request.emit(&mut Icmpv4Packet::new_unchecked(buffer), &self.capabilities.checksum);
+        true
+    }
+
+    /// Runs the stack until the host answers this ping, or the time is up.
+    fn wait_for_reply(&mut self, host: Ipv4Address, sequence: u16) -> Result<bool, Error> {
+        let begin = self.mct.count();
+        while self.mct.count() - begin < PING_TIMEOUT_MS * COUNTS_PER_MS {
+            self.poll()?;
+            let socket = self.sockets.get_mut::<icmp::Socket>(self.ping);
+            while let Ok((payload, source)) = socket.recv() {
+                let Ok(packet) = Icmpv4Packet::new_checked(payload) else {
+                    continue;
+                };
+                let Ok(reply) = Icmpv4Repr::parse(&packet, &self.capabilities.checksum) else {
+                    continue;
+                };
+                if source == IpAddress::Ipv4(host)
+                    && matches!(reply, Icmpv4Repr::EchoReply { seq_no, .. } if seq_no == sequence)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Stays on the network, with the stack answering ARP and pings, until told to restart.
+    fn serve(&mut self) -> Result<(), Error> {
+        println!("\nStaying connected, answering pings. UART: r restart, f restart into fastboot");
+        let uart = console::uart();
+        let mut keys = PowerKeys::new();
+        let mut reported = self.device.echo_requests();
+        loop {
+            self.poll()?;
+            keys.service(self.mct);
+            if self.device.echo_requests() != reported {
+                reported = self.device.echo_requests();
+                println!("Pings received: {}", reported);
+            }
+            match uart.try_read_byte() {
+                Some(b'r') => power::restart(BootMode::Normal),
+                Some(b'f') => power::restart(BootMode::Fastboot),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -456,8 +467,8 @@ fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8;
 
     let mut nonce = [0; 32];
     crypto::prf(pool, b"Init Counter", &mct.count().to_le_bytes(), &mut nonce);
-    let mut id = [0; 4];
-    crypto::prf(pool, b"DHCP id", &mct.count().to_le_bytes(), &mut id);
+    let mut seed = [0; 8];
+    crypto::prf(pool, b"Stack seed", &mct.count().to_le_bytes(), &mut seed);
 
     let rsn = &target.rsn[..target.rsn_length];
     let Some(mut supplicant) = Supplicant::new(key, own, target.bssid, rsn, nonce) else {
@@ -480,70 +491,62 @@ fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8;
     chip.connect(ssid.as_bytes(), &mut supplicant, JOIN_TIMEOUT_MS, report)?;
     println!("Connected in {} ms: keys installed", (mct.count() - begin) / COUNTS_PER_MS);
 
+    let mut device = WifiDevice::new(chip, &mut supplicant, report);
+    let capabilities = device.capabilities();
+    let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(own)));
+    config.random_seed = u64::from_le_bytes(seed);
+    let start = Instant::from_micros((mct.count() / (COUNTS_PER_MS / 1000)) as i64);
+    let interface = Interface::new(config, &mut device, start);
+
+    let mut storage = [SocketStorage::EMPTY; SOCKETS];
+    let mut sockets = SocketSet::new(&mut storage[..]);
+    let dhcp = sockets.add(dhcpv4::Socket::new());
+
+    let mut received_meta = [icmp::PacketMetadata::EMPTY; PING_QUEUE];
+    let mut received = [0; PING_BUFFER];
+    let mut sent_meta = [icmp::PacketMetadata::EMPTY; PING_QUEUE];
+    let mut sent = [0; PING_BUFFER];
+    let mut ping_socket = icmp::Socket::new(
+        icmp::PacketBuffer::new(&mut received_meta[..], &mut received[..]),
+        icmp::PacketBuffer::new(&mut sent_meta[..], &mut sent[..]),
+    );
+    // A new socket with a nonzero identifier cannot refuse this.
+    let _ = ping_socket.bind(icmp::Endpoint::Ident(PING_ID));
+    let ping = sockets.add(ping_socket);
+
     let mut station = Station {
-        chip,
-        supplicant,
+        device,
+        interface,
+        sockets,
+        dhcp,
+        ping,
+        capabilities,
         mct,
-        mac: own,
-        ip: None,
-        received: [0; net::FRAME_MAX],
-        sent: [0; net::FRAME_MAX],
-        answered_arp: 0,
-        answered_pings: 0,
+        gateway: None,
+        has_address: false,
     };
 
     println!("\nGetting an address");
     let begin = mct.count();
-    let Some(lease) = station.get_address(u32::from_le_bytes(id))? else {
+    if station.wait_for_address()?.is_none() {
         println!("DHCP: no address (MISMATCH)");
-        return Ok(());
-    };
-    println!("Address in {} ms", (mct.count() - begin) / COUNTS_PER_MS);
-    print_ip("Address", lease.address);
-    print_ip("Mask", lease.mask);
-    print_ip("Router", lease.router);
-    print_ip("Name server", lease.dns);
-    println!("Lease: {} s", lease.lease_seconds);
-    station.ip = Some(lease.address);
-
-    println!("\nPinging the router");
-    let Some(router) = station.find_mac(lease.address, lease.router)? else {
-        println!("The router does not answer ARP (MISMATCH)");
-        return serve(&mut station);
-    };
-    println!(
-        "Router at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        router[0], router[1], router[2], router[3], router[4], router[5],
-    );
-    let answers = station.ping(lease.address, router, lease.router)?;
-    println!("{} of {} answered: {}", answers, PINGS, verdict(answers != 0));
-
-    print_ip("\nPinging, past the router", PUBLIC_HOST);
-    let answers = station.ping(lease.address, router, PUBLIC_HOST)?;
-    println!("{} of {} answered: {}", answers, PINGS, verdict(answers != 0));
-
-    serve(&mut station)
-}
-
-/// Stays on the network, answering ARP and pings, until told to restart.
-fn serve(station: &mut Station<'_>) -> Result<(), Error> {
-    println!("\nStaying connected, answering pings. UART: r restart, f restart into fastboot");
-    let uart = console::uart();
-    let mut keys = PowerKeys::new();
-    let mut reported = 0;
-    loop {
-        station.poll()?;
-        keys.service(station.mct);
-        if station.answered_pings != reported {
-            reported = station.answered_pings;
-            println!("Pings answered: {}, ARP answered: {}", reported, station.answered_arp);
-        }
-        match uart.try_read_byte() {
-            Some(b'r') => power::restart(BootMode::Normal),
-            Some(b'f') => power::restart(BootMode::Fastboot),
-            _ => {}
-        }
+        return station.serve();
     }
+    println!("Address in {} ms", (mct.count() - begin) / COUNTS_PER_MS);
+
+    let Some(router) = station.gateway else {
+        println!("No router to ping (MISMATCH)");
+        return station.serve();
+    };
+    println!("\nPinging the router, {}", router);
+    let answers = station.ping(router)?;
+    println!("{} of {} answered: {}", answers, PINGS, verdict(answers != 0));
+
+    println!("\nPinging past the router, {}", PUBLIC_HOST);
+    let answers = station.ping(PUBLIC_HOST)?;
+    println!("{} of {} answered: {}", answers, PINGS, verdict(answers != 0));
+
+    station.serve()
 }
 
 fn run(pmic: Max77686, mct: Mct) -> Result<(), Error> {

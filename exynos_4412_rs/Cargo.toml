@@ -11,4 +11,5 @@ default = ["panic-handler"]
 panic-handler = []
 
 [dependencies]
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4", "socket-icmp", "auto-icmp-echo-reply"] }
 tock-registers = { version = "0.10.1", default-features = false, features = ["register_types"] }

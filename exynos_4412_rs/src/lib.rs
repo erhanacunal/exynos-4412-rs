@@ -39,7 +39,6 @@ pub mod drivers;
 pub mod exceptions;
 pub mod firmware;
 pub mod mmu;
-pub mod net;
 pub mod nvram;
 pub mod partition;
 #[cfg(feature = "panic-handler")]

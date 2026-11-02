@@ -1,7 +1,7 @@
 //! BCM4334 WiFi chip: its power on this board, loading its firmware, and talking to it over SDIO.
 //!
 //! This runs the firmware, sends it commands, scans for networks, joins a WPA2-Personal network with
-//! [`crate::wpa`], and sends and receives Ethernet frames. IP is left to [`crate::net`].
+//! [`crate::wpa`], and sends and receives Ethernet frames. [`super::wifi_device`] connects it to a network stack.
 //!
 //! # Sources
 //!

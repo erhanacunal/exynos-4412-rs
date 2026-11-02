@@ -26,6 +26,11 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 `exynos_4412_rs/src/crypto.rs` and `exynos_4412_rs/src/wpa.rs` follow the published standards they
 name. Everywhere else in this repository, Linux is used only as a source of register maps.
 
+## Dependencies
+
+Crates this builds with are listed in `Cargo.lock`, under their own licenses. The network stack,
+`smoltcp`, is under 0BSD.
+
 ## Firmware
 
 The chip's firmware and NVRAM files are not in this repository and are not covered by its license.

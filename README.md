@@ -554,7 +554,7 @@ The board has a BCM4334 on `sdhci_3`, over 4-bit SDIO. `drivers::sdhci` is the h
 `drivers::sdio` the card protocol, and `drivers::bcm4334` the chip's power, its firmware, the
 control channel to it, scanning, and joining. `wpa` is the client's side of the WPA2-Personal
 handshake and `crypto` the algorithms it needs: the firmware of this board leaves both to the host.
-`net` builds and reads ARP, IPv4, ICMP echo, UDP and DHCP frames.
+`drivers::wifi_device` makes the chip a device of the `smoltcp` network stack.
 
 - **Sources:** Broadcom publishes no description of this interface, so the chip's side is derived
   from Linux's `brcmfmac`, under the ISC license: see `THIRD_PARTY_NOTICES.md`. This is the one
@@ -600,18 +600,19 @@ passphrase took 77 ms. It then stayed connected for 30 s and received 12 frames,
 decrypted.
 
 `wifi_test` then gets an address by DHCP, pings the router and 8.8.8.8, and answers ARP and pings on
-the network until restarted. `net` holds the packet formats. It does not renew its lease, and has no
-TCP.
+the network until restarted, all with the `smoltcp` crate over `drivers::wifi_device`. Only the
+features this needs are on, so there is no TCP yet. The stack renews its lease, which no test has yet
+lasted long enough to show.
 
 Observed on the board, on a 5 GHz access point:
 
 | Check | Result |
 |---|---|
-| Joining, with the keys in | 1308 ms |
-| DHCP | Address, mask, router, name server and lease in 2239 ms |
-| Pinging the router | 4 of 4, 1 ms each |
+| Joining, with the keys in | 1306 ms |
+| DHCP | Address, router and name servers in 2140 ms |
+| Pinging the router | 4 of 4, 5 ms for the first, which also finds its address, then 1 ms |
 | Pinging 8.8.8.8 | 4 of 4, 46 to 47 ms |
-| Pinged from another computer on the network | 6 answered, with its ARP requests |
+| Pinged from another computer on the network | 4 of 4, 2 to 4 ms |
 
 `WIFI_SSID` and `WIFI_PASSWORD` name the network at build
 time and go into the image, so an image built with them must not be published. Only AES on both
@@ -619,7 +620,7 @@ traffic and broadcasts with a shared passphrase is supported: not TKIP, WPA3, or
 protected management frames. The handshake nonce comes from timing the scan, not a hardware random
 generator: fine to test with, unproven beyond that.
 
-`crypto`, `wpa` and `net` have tests that run on the development machine, with published vectors and values
+`crypto` and `wpa` have tests that run on the development machine, with published vectors and values
 from Python's `hashlib`. Their code needs nothing of the board, so a root that includes only them
 builds with `rustc --test`.
 
