@@ -16,6 +16,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
 - `mmc_test/`: eMMC read test, partition table, no writes
+- `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 
 ## Build
@@ -546,6 +547,81 @@ Test on the board: `make img APP=mmc_test`, same flashing step. Observed:
 
 `EXT_CSD` `BUS_WIDTH` reads 0 although the controller is in 8-bit mode, and data arrives without CRC
 errors. p10 is 28295104 blocks on the card, which ends it exactly where the extended partition ends.
+
+## WiFi
+
+The board has a BCM4334 on `sdhci_3`, over 4-bit SDIO. `drivers::sdhci` is the host controller,
+`drivers::sdio` the card protocol, and `drivers::bcm4334` the chip's power, its firmware, the
+control channel to it, scanning, and joining. `wpa` is the client's side of the WPA2-Personal
+handshake and `crypto` the algorithms it needs: the firmware of this board leaves both to the host.
+`net` builds and reads ARP, IPv4, ICMP echo, UDP and DHCP frames.
+
+- **Sources:** Broadcom publishes no description of this interface, so the chip's side is derived
+  from Linux's `brcmfmac`, under the ISC license: see `THIRD_PARTY_NOTICES.md`. This is the one
+  exception to using Linux only as a register map.
+- **Firmware:** The firmware and NVRAM files are not in this repository. `wifi_test` takes them at
+  build time from the directory in `WIFI_FIRMWARE_DIR`, and stops before loading without it.
+- **Clock:** This controller has no usable divider of its own, so the card clock is `sclk_mmc3`,
+  set in the CMU: 400 kHz to start, then the 16 MHz of the board's DTS.
+- **Transfer:** Polled through the buffer port, with no DMA and no interrupts.
+- **Power:** LDO22 and the chip's enables stay on after the test, and the PMIC keeps its state over
+  a restart. The chip is reset each time it is powered up.
+- **eMMC:** Not involved: it is on another controller and other pins.
+
+Test on the board:
+`WIFI_FIRMWARE_DIR=<directory> make img APP=wifi_test`, same flashing step.
+
+Observed in the first stage, without firmware:
+
+| Check | Result |
+|---|---|
+| Rails found after U-Boot | LDO22 off; of the 32 kHz outputs, only `AP` on |
+| Card | OCR `0xffff00`, 2 functions, address 1 |
+| Vendor and device | `0x02d0`, `0x4334` |
+| Chip ID | `0x16034334`: chip `0x4334`, revision 3, AXI backplane |
+| Bus | 4 bits at 16 MHz |
+| 10000 reads of the ID at that rate | No errors, about 9.6 us each |
+
+Observed with the firmware, 6.10.191:
+
+| Check | Result |
+|---|---|
+| Chip contents | PMU revision 17, 512 KiB of RAM, nine entries in its table of cores |
+| 398010 bytes of firmware, and the NVRAM | Written and read back in 148 ms |
+| Firmware | Starts, answers `ver` and `cur_etheraddr` |
+| MAC | `44:39:c4:64:12:3d`, the chip's own, not the placeholder in the NVRAM file |
+
+Scanning, on the board: 8 networks on both bands in 1212 ms, with the firmware reporting status 0.
+The firmware has no `sup_wpa`, so the WPA2 handshake runs on the host.
+
+Joining, on the board: an access point on channel 11 authenticated and associated the client, the
+4-way handshake finished and the keys went in 1298 ms after asking to join. The key from the
+passphrase took 77 ms. It then stayed connected for 30 s and received 12 frames, which the chip
+decrypted.
+
+`wifi_test` then gets an address by DHCP, pings the router and 8.8.8.8, and answers ARP and pings on
+the network until restarted. `net` holds the packet formats. It does not renew its lease, and has no
+TCP.
+
+Observed on the board, on a 5 GHz access point:
+
+| Check | Result |
+|---|---|
+| Joining, with the keys in | 1308 ms |
+| DHCP | Address, mask, router, name server and lease in 2239 ms |
+| Pinging the router | 4 of 4, 1 ms each |
+| Pinging 8.8.8.8 | 4 of 4, 46 to 47 ms |
+| Pinged from another computer on the network | 6 answered, with its ARP requests |
+
+`WIFI_SSID` and `WIFI_PASSWORD` name the network at build
+time and go into the image, so an image built with them must not be published. Only AES on both
+traffic and broadcasts with a shared passphrase is supported: not TKIP, WPA3, or networks that demand
+protected management frames. The handshake nonce comes from timing the scan, not a hardware random
+generator: fine to test with, unproven beyond that.
+
+`crypto`, `wpa` and `net` have tests that run on the development machine, with published vectors and values
+from Python's `hashlib`. Their code needs nothing of the board, so a root that includes only them
+builds with `rustc --test`.
 
 ## QEMU
 

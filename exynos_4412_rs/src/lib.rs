@@ -34,16 +34,20 @@
 
 pub mod console;
 pub mod cpu;
+pub mod crypto;
 pub mod drivers;
 pub mod exceptions;
 pub mod firmware;
 pub mod mmu;
+pub mod net;
+pub mod nvram;
 pub mod partition;
 #[cfg(feature = "panic-handler")]
 mod panic;
 pub mod soc;
 
 pub mod smp;
+pub mod wpa;
 
 /// State of the CPU when the bootloader jumped to `_start`.
 ///

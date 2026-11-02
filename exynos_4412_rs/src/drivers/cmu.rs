@@ -1,7 +1,8 @@
 //! Clock management unit: reads the clock of the peripheral bus and opens clock gates.
 //!
-//! Nothing here changes a PLL. The only mux and divider it changes are those of the FIMD,
-//! which nothing else uses: see [`Cmu::set_fimd_clock`]. The rest stay as U-Boot set them.
+//! Nothing here changes a PLL. The only muxes and dividers it changes are those of the FIMD and
+//! of `sclk_mmc3`, which nothing else uses: see [`Cmu::set_fimd_clock`] and
+//! [`Cmu::set_mmc3_clock`]. The rest stay as U-Boot set them.
 //!
 //! Register offsets and clock tree are verified against Linux 5.15.198
 //! `drivers/clk/samsung/clk-exynos4.c`, cited as `clk-exynos4.c:<line>`, relative to
@@ -9,8 +10,8 @@
 //!
 //! # Concurrency
 //!
-//! [`Cmu::enable_i2c`], [`Cmu::open_fimd_gates`] and [`Cmu::set_fimd_clock`] are
-//! read-modify-writes of registers shared with other peripherals. They mask IRQs on the
+//! [`Cmu::enable_i2c`], [`Cmu::open_fimd_gates`], [`Cmu::set_fimd_clock`] and
+//! [`Cmu::set_mmc3_clock`] are read-modify-writes of registers shared with other peripherals. They mask IRQs on the
 //! calling core. Use them from one core at a time.
 
 use core::ptr;
@@ -33,6 +34,8 @@ const GATE_IP_LCD0: usize = 0xC934;
 const SRC_FSYS: usize = 0xC240;
 /// clk-exynos4.c:62.
 const SRC_MASK_FSYS: usize = 0xC340;
+/// clk-exynos4.c:77.
+const DIV_FSYS2: usize = 0xC548;
 /// clk-exynos4.c:78.
 const DIV_FSYS3: usize = 0xC54C;
 /// clk-exynos4.c:97.
@@ -59,7 +62,7 @@ const GATE_I2C0_BIT: u32 = 6;
 /// clk-exynos4.c:555: `mout_fimd0` is this field of `SRC_LCD0`.
 const SRC_LCD0_FIMD0_MASK: u32 = 0xF;
 /// Index of `mout_mpll_user_t` in `group1_p4x12`, clk-exynos4.c:340-341. It is the parent the
-/// vendor kernel gives the FIMD: `mach-mehmet.c:4253`.
+/// vendor kernel gives the FIMD: `mach-mehmet.c:4253`. `mout_mmc3` has the same list of parents.
 const SRC_LCD0_FIMD0_MPLL_USER: u32 = 6;
 /// clk-exynos4.c:621: `div_fimd0` is this field of `DIV_LCD0`, plus 1.
 const DIV_LCD0_FIMD0_MASK: u32 = 0xF;
@@ -72,6 +75,19 @@ const GATE_LCD0_FIMD0: u32 = 1 << 0;
 const GATE_LCD0_SMMU_FIMD0: u32 = 1 << 4;
 /// clk-exynos4.c:751: `CLK_SDMMC4`, the register clock of the eMMC controller.
 const GATE_FSYS_SDMMC4: u32 = 1 << 9;
+/// clk-exynos4.c:845: `CLK_SDMMC3`, the register clock of `sdhci_3`.
+const GATE_FSYS_SDMMC3: u32 = 1 << 8;
+/// clk-exynos4.c:561: `mout_mmc3` is this field of `SRC_FSYS`.
+const SRC_FSYS_MMC3_SHIFT: u32 = 12;
+const SRC_FSYS_MMC3_MASK: u32 = 0xF << SRC_FSYS_MMC3_SHIFT;
+/// clk-exynos4.c:773: `CLK_SCLK_MMC3`.
+const SRC_MASK_FSYS_MMC3: u32 = 1 << 12;
+/// clk-exynos4.c:628: `div_mmc3` is this field of `DIV_FSYS2`, plus 1.
+const DIV_FSYS2_MMC3_SHIFT: u32 = 16;
+const DIV_FSYS2_MMC3_MAX: u32 = 16;
+/// clk-exynos4.c:664: `div_mmc_pre3` is this field of `DIV_FSYS2`, plus 1.
+const DIV_FSYS2_MMC3_PRE_SHIFT: u32 = 24;
+const DIV_FSYS2_MMC3_PRE_MAX: u32 = 256;
 /// Number of gates from [`GATE_I2C0_BIT`] that this module opens, leaving out `CLK_I2C_HDMI`.
 const I2C_GATES: usize = 8;
 
@@ -191,6 +207,39 @@ impl Cmu {
         Some(self.mout_mpll_user_t_hz() / ((clocks.div & DIV_LCD0_FIMD0_MASK) + 1))
     }
 
+    /// Opens the gate of the registers of `sdhci_3`.
+    pub fn open_sdmmc3_gate(&self) {
+        self.modify(GATE_IP_FSYS, 0, GATE_FSYS_SDMMC3);
+    }
+
+    /// Runs `sclk_mmc3` from `mout_mpll_user_t`, at the highest rate its two dividers reach that
+    /// is not above `hz`, and lets it through. Returns the rate. Stop the card clock first: this
+    /// can glitch it.
+    ///
+    /// # Panics
+    ///
+    /// If `hz` is too low for the dividers to reach.
+    pub fn set_mmc3_clock(&self, hz: u32) -> u32 {
+        let input = self.mout_mpll_user_t_hz();
+        let wanted = input.div_ceil(hz.max(1));
+        let mut best = None;
+        for div in 1..=DIV_FSYS2_MMC3_MAX {
+            let pre = wanted.div_ceil(div).max(1);
+            if pre <= DIV_FSYS2_MMC3_PRE_MAX && best.is_none_or(|(d, p)| div * pre < d * p) {
+                best = Some((div, pre));
+            }
+        }
+        let (div, pre) = best.expect("sclk_mmc3 rate below what the dividers reach");
+        self.modify(SRC_FSYS, SRC_FSYS_MMC3_MASK, SRC_LCD0_FIMD0_MPLL_USER << SRC_FSYS_MMC3_SHIFT);
+        self.modify(
+            DIV_FSYS2,
+            (0xF << DIV_FSYS2_MMC3_SHIFT) | (0xFF << DIV_FSYS2_MMC3_PRE_SHIFT),
+            ((div - 1) << DIV_FSYS2_MMC3_SHIFT) | ((pre - 1) << DIV_FSYS2_MMC3_PRE_SHIFT),
+        );
+        self.modify(SRC_MASK_FSYS, 0, SRC_MASK_FSYS_MMC3);
+        input / (div * pre)
+    }
+
     /// Opens the gates of the FIMD's registers and of its bus path.
     pub fn open_fimd_gates(&self) {
         self.modify(GATE_IP_LCD0, 0, GATE_LCD0_FIMD0 | GATE_LCD0_SMMU_FIMD0);
@@ -207,7 +256,8 @@ impl Cmu {
     fn modify(&self, offset: usize, clear: u32, set: u32) {
         let address = (soc::CMU_BASE + offset) as *mut u32;
         let was_masked = cpu::mask_irq();
-        // SAFETY: as in `read`. Every caller changes only fields that belong to the FIMD.
+        // SAFETY: as in `read`. Every caller changes only fields of the block it configures: the
+        // FIMD or `sdhci_3`.
         unsafe {
             ptr::write_volatile(address, (ptr::read_volatile(address) & !clear) | set);
         }

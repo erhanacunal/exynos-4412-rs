@@ -117,6 +117,10 @@ pub const PD_LCD0_BASE: usize = 0x1002_3C80;
 /// and `exynos4412-mehmet.dts:1399-1414` has the eMMC on it.
 pub const MSHC_BASE: usize = 0x1255_0000;
 
+/// SD host controller of the WiFi chip, `sdhci_3`. Verified: `exynos4.dtsi:346-348`, node
+/// `sdhci_3: sdhci@12540000`, and `exynos4412-mehmet.dts:1509-1541` has the chip on it.
+pub const SDHCI3_BASE: usize = 0x1254_0000;
+
 /// Number of cores. Verified: `exynos4412.dtsi`, nodes `cpu@a00`..`cpu@a03`. `link.x`
 /// reserves this many stack blocks.
 pub const CPU_COUNT: usize = 4;

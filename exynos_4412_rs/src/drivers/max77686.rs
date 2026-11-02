@@ -27,6 +27,8 @@ use crate::drivers::i2c::{self, I2c};
 pub const ADDRESS: u8 = 0x09;
 /// max77686-private.h:20.
 const REG_DEVICE_ID: u8 = 0x00;
+/// max77686-private.h:136: the enables of the 32 kHz outputs.
+const REG_32KHZ: u8 = 0x7F;
 /// max77686-private.h:80. The other LDOs follow in order: `.enable_reg` and `.vsel_reg` at
 /// max77686-regulator.c:322-324.
 const REG_LDO1_CTRL1: u8 = 0x40;
@@ -86,6 +88,18 @@ impl From<i2c::Error> for Error {
     }
 }
 
+/// One of the PMIC's 32 kHz outputs. The value is the bit in its enable register:
+/// `clk-max77686.c:59,64,69` with `dt-bindings/clock/maxim,max77686.h:13-15`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Clock32k {
+    /// `MAX77686_CLK_AP`.
+    Ap = 0,
+    /// `MAX77686_CLK_CP`.
+    Cp = 1,
+    /// `MAX77686_CLK_PMIC`.
+    Pmic = 2,
+}
+
 /// Contents of one LDO's control register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LdoState {
@@ -137,6 +151,19 @@ impl Max77686 {
     /// Reads the device ID register.
     pub fn device_id(&self) -> Result<u8, Error> {
         self.read(REG_DEVICE_ID)
+    }
+
+    /// Reads the register with the enables of the 32 kHz outputs.
+    pub fn clocks_32k(&self) -> Result<u8, Error> {
+        self.read(REG_32KHZ)
+    }
+
+    /// Turns on a 32 kHz output, leaving the others as they are, and checks that it took.
+    pub fn enable_clock_32k(&self, clock: Clock32k) -> Result<(), Error> {
+        let wrote = self.read(REG_32KHZ)? | (1 << clock as u8);
+        self.i2c.write(ADDRESS, &[REG_32KHZ, wrote])?;
+        let read = self.read(REG_32KHZ)?;
+        if read & wrote == wrote { Ok(()) } else { Err(Error::ReadBack { wrote, read }) }
     }
 
     /// Reads the state of LDO `number`, from 1 to 26.
