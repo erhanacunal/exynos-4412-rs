@@ -21,5 +21,7 @@ fn panic(info: &PanicInfo<'_>) -> ! {
         }
         println!("{}", info.message());
     }
+    // A buffered console would keep the report in its ring: see `console`.
+    crate::console::flush();
     cpu::halt();
 }

@@ -129,7 +129,7 @@ pub fn charger_connected() -> (bool, bool) {
 }
 
 fn reset_with(inform5: Option<u32>, inform6: u32) -> ! {
-    console::uart().flush();
+    console::flush();
     if let Some(mode) = inform5 {
         write(INFORM5, mode);
     }
@@ -163,7 +163,7 @@ pub fn power_off() -> ! {
         reset_with(None, INFORM6_CHARGER_MODE);
     }
     // Drops the line that keeps the PMIC on.
-    console::uart().flush();
+    console::flush();
     write(PS_HOLD_CONTROL, read(PS_HOLD_CONTROL) & !PS_HOLD_HIGH);
     wait_polls(POWER_FALL_POLLS);
     panic!("still powered after dropping PS_HOLD");

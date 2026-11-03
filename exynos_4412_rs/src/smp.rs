@@ -203,7 +203,7 @@ pub fn start_cpu(cpu: usize, entry: fn(usize) -> !) -> Result<(), StartError> {
     mct.start();
     console::enable_locking();
     // The failure trace bypasses the console and does not check the FIFO: empty it first.
-    console::uart().flush();
+    console::flush();
 
     power_up(cpu, mct)?;
 

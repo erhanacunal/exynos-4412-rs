@@ -25,6 +25,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `async_test/`: Embassy on all four cores: timers, tasks, and channels between the cores
 - `mmc_async_test/`: async eMMC: reads and writes awaited on the controller's interrupt, from CPU0 and CPU1
+- `uart_tx_test/`: buffered console: `print!` sent on the UART's transmit interrupt, the ring overflowing, two cores printing, flush before a panic and a restart
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 
 ## Build
@@ -929,7 +930,15 @@ through `embassy-sync` channels, signals and mutexes, which the critical section
   byte not done in 10 ms is a timeout. A transfer dropped part way finishes its byte, reads one
   more without acknowledging it if it was reading, and sends a stop. A polled call on a bus
   during an async transfer on it breaks both.
-- **Not yet present:** async sending, and preemptive threads.
+- **Console:** `embassy::uart::buffer_console` makes `print!` buffered: what does not fit in the
+  UART's FIFO goes into a ring of 16 KiB, and the UART's transmit interrupt, on CPU0, sends it on.
+  `print!` stays atomic across cores and keeps the order. With the ring full, the printing core
+  sends the oldest bytes itself, polled, so nothing is lost, with IRQs masked too; its core
+  runs nothing else meanwhile.
+  `console::flush` sends what is left, polled. The panic handler, the default exception
+  handlers, `power::restart` and `power::power_off` call it. `flush_console().await` waits for
+  the ring to be sent.
+- **Not yet present:** preemptive threads.
 
 Test on the board: `make img APP=async_test`, same flashing step. Observed:
 
@@ -954,6 +963,20 @@ throughout. Observed:
 | The same read async from a task on CPU1 | 238 ms, same hash |
 | A 1 MiB read dropped after 300 us, then read again | Timed out; the next one `Ok`, same hash as before |
 | The last 2 MiB of CACHE written async with a pattern, read back, then restored | 122 ms, 17 MB/s; read back equal; restored hash equal to the one kept |
+
+`make img APP=uart_tx_test` checks the buffered console at 115200 baud, with a task ticking
+every 1 ms on CPU0. Observed:
+
+| Check | Result |
+|---|---|
+| One line of 100 characters, polled | 7380 us in `println!` |
+| The same line buffered | 4 us in `println!`; the ring out 12.3 ms later, with what was in it before; ticker 22 us late at most |
+| Ten lines | 38 us in `println!`, out in 97 ms; ticker 7 us late at most; 0 bytes polled |
+| 200 lines, 20400 bytes, through the 16 KiB ring | 358 ms in `println!`, out in 1781 ms; 4120 bytes polled by the printer, the overflow; ring full at 16384; the ticker held back 357 ms while the printer polled |
+| CPU0 and CPU1, 20 lines each at once | All 40 whole, in order on each core |
+| Totals | 26149 bytes through the ring, 4120 polled, 1576 transmit interrupts |
+| `p`: 30 lines, then a panic at once | All 30 out, then the panic message, which said 3043 bytes were still in the ring |
+| `r` and `f`: 30 lines, then a restart, normal or into fastboot | All 30 out, then the restart line, also with 3043 bytes held when printed |
 
 ## WiFi
 

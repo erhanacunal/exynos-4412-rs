@@ -81,6 +81,7 @@ register_structs! {
 /// transmit bits of `UINTP`, `UINTSP` and `UINTM`. Bit 3 is the modem interrupt.
 const INT_RXD: u32 = 1 << 0;
 const INT_ERROR: u32 = 1 << 1;
+const INT_TXD: u32 = 1 << 2;
 const INT_ALL: u32 = 0xF;
 /// serial_s3c.h:92 `S3C2410_UCON_RXIRQMODE`: bits 1:0 of `UCON` select interrupt or polling
 /// mode for receiving, which are the same mode here; 0 turns receiving off.
@@ -257,6 +258,34 @@ impl Uart {
         regs.ucon.set(ucon);
         regs.uintp.set(INT_ALL);
         regs.uintm.set(INT_ALL & !INT_RXD);
+    }
+
+    /// Masks every interrupt of this UART, the transmit one too, and clears what was pending.
+    /// What U-Boot leaves, `UINTM` at 0, would raise the transmit interrupt at once.
+    pub fn mask_interrupts(&self) {
+        let regs = self.regs();
+        regs.uintm.set(INT_ALL);
+        regs.uintp.set(INT_ALL);
+    }
+
+    /// Unmasks or masks the transmit interrupt, leaving the others. It is pending whenever the
+    /// transmit FIFO holds no more than its trigger level, `UFCON` bits 10:8: unmasked with
+    /// nothing to send, it comes back after every return.
+    pub fn set_tx_interrupt(&self, on: bool) {
+        let regs = self.regs();
+        let mask = regs.uintm.get();
+        regs.uintm.set(if on { mask & !INT_TXD } else { mask | INT_TXD });
+    }
+
+    /// Whether the transmit interrupt is pending.
+    pub fn tx_interrupt_pending(&self) -> bool {
+        self.regs().uintp.get() & INT_TXD != 0
+    }
+
+    /// Clears a pending transmit interrupt, after filling the FIFO: with the FIFO still low it
+    /// becomes pending again.
+    pub fn clear_tx_interrupt(&self) {
+        self.regs().uintp.set(INT_TXD);
     }
 
     /// Masks the receive interrupt again, with the others.

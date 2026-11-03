@@ -137,6 +137,8 @@ fn report_and_halt(kind: ExceptionKind, frame: &ExceptionFrame) -> ! {
         println!("r{:<2} {:#010x}", index, value);
     }
     println!("Halted.");
+    // A buffered console would keep the report in its ring: see `console`.
+    crate::console::flush();
     cpu::halt();
 }
 
