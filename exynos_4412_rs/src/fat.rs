@@ -133,14 +133,17 @@ impl Geometry {
     }
 }
 
-/// Blocks at the start of the device's buffer that card reads go through.
-const READ_BLOCKS: usize = 8;
+/// Read-ahead windows at the start of the device's buffer, and the blocks each holds. Card
+/// reads fill a whole window, from the block asked for on. File data and the FAT are read in
+/// turns, so each keeps a window of its own; the one used least recently is refilled.
+const WINDOWS: usize = 4;
+const WINDOW_BLOCKS: usize = 32;
 /// Dirty blocks kept apart from the run: the FAT blocks, both copies, and directory entries
 /// that `embedded_sdmmc` writes again and again.
 const SLOTS: usize = 8;
-/// The smallest buffer [`PartitionDevice::new`] takes: the read blocks, the slots and a run of
-/// one block.
-pub const MIN_BUFFER: usize = (READ_BLOCKS + SLOTS + 1) * BLOCK_SIZE;
+/// The smallest buffer [`PartitionDevice::new`] takes: the read-ahead windows, the slots and a
+/// run of one block.
+pub const MIN_BUFFER: usize = (WINDOWS * WINDOW_BLOCKS + SLOTS + 1) * BLOCK_SIZE;
 
 /// What a [`PartitionDevice`] has done since it was made, in blocks of the partition.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -151,6 +154,8 @@ pub struct Stats {
     pub blocks_read: u32,
     /// Blocks read from the cache, written but not yet on the card.
     pub cached_reads: u32,
+    /// Blocks read from the read-ahead windows.
+    pub window_reads: u32,
     /// Blocks written by `embedded_sdmmc` or the formatter.
     pub blocks_put: u32,
     /// Write commands sent to the card.
@@ -163,8 +168,15 @@ pub struct Stats {
 struct Cache<'a> {
     card: Mmc,
     writer: MmcWriter,
-    /// Where card reads go, since a [`Block`] need not start on a cache line.
-    read: &'a mut [u8],
+    /// The read-ahead windows, where card reads go, since a [`Block`] need not start on a cache
+    /// line. They hold the newest data of their blocks: writes update them too.
+    windows: &'a mut [u8],
+    /// The first block of each window, and how many it holds; 0 for an empty one.
+    window_start: [u32; WINDOWS],
+    window_len: [usize; WINDOWS],
+    /// When each window was last used, from `clock`.
+    window_used: [u32; WINDOWS],
+    clock: u32,
     /// Single dirty blocks, and which block of the partition each holds.
     slots: &'a mut [u8],
     slot_blocks: [Option<u32>; SLOTS],
@@ -197,36 +209,67 @@ impl Cache<'_> {
         self.slot_of(block).map(|slot| &self.slots[slot * BLOCK_SIZE..][..BLOCK_SIZE])
     }
 
-    fn card_read(&mut self, block: u32, blocks: &mut [Block]) -> Result<(), Error> {
-        let mut lba = self.writer.partition().start + block;
-        for chunk in blocks.chunks_mut(READ_BLOCKS) {
-            let bytes = &mut self.read[..chunk.len() * BLOCK_SIZE];
-            self.card.read_blocks_dma(lba, bytes).map_err(Error::Card)?;
-            for (block, data) in chunk.iter_mut().zip(bytes.as_chunks::<BLOCK_SIZE>().0) {
-                block.contents.copy_from_slice(data);
-            }
-            self.stats.card_reads += 1;
-            self.stats.blocks_read += chunk.len() as u32;
-            lba += chunk.len() as u32;
-        }
-        Ok(())
+    fn window_of(&self, block: u32) -> Option<(usize, usize)> {
+        (0..WINDOWS).find_map(|window| {
+            let index = block.checked_sub(self.window_start[window])? as usize;
+            (index < self.window_len[window]).then_some((window, index))
+        })
     }
 
-    /// Reads through the cache: the card, then the dirty blocks over what it gave.
-    fn read(&mut self, block: u32, blocks: &mut [Block]) -> Result<(), Error> {
-        if let [single] = blocks
-            && let Some(data) = self.dirty(block)
-        {
-            single.contents.copy_from_slice(data);
-            self.stats.cached_reads += 1;
-            return Ok(());
+    fn window_block(&mut self, window: usize, index: usize) -> &mut [u8] {
+        &mut self.windows[(window * WINDOW_BLOCKS + index) * BLOCK_SIZE..][..BLOCK_SIZE]
+    }
+
+    /// Fills the least recently used window from the card, from `block` on, then puts the dirty
+    /// blocks over what the card gave. Returns the window.
+    fn refill(&mut self, block: u32) -> Result<usize, Error> {
+        let partition = self.writer.partition();
+        let window = (0..WINDOWS).min_by_key(|window| self.window_used[*window]).unwrap_or(0);
+        let blocks = WINDOW_BLOCKS.min((partition.count - block) as usize);
+        // Empty while the read is under way, so that a failed one leaves nothing stale.
+        self.window_len[window] = 0;
+        let bytes = &mut self.windows[window * WINDOW_BLOCKS * BLOCK_SIZE..][..blocks * BLOCK_SIZE];
+        self.card.read_blocks_dma(partition.start + block, bytes).map_err(Error::Card)?;
+        self.stats.card_reads += 1;
+        self.stats.blocks_read += blocks as u32;
+        self.window_start[window] = block;
+        self.window_len[window] = blocks;
+        for index in 0..blocks {
+            let lba = block + index as u32;
+            let dirty = if let Some(run) = self.run_index(lba) {
+                Some((true, run))
+            } else {
+                self.slot_of(lba).map(|slot| (false, slot))
+            };
+            if let Some((in_run, at)) = dirty {
+                let target = (window * WINDOW_BLOCKS + index) * BLOCK_SIZE;
+                let source = if in_run { &self.run[at * BLOCK_SIZE..] } else { &self.slots[at * BLOCK_SIZE..] };
+                self.windows[target..target + BLOCK_SIZE].copy_from_slice(&source[..BLOCK_SIZE]);
+            }
         }
-        self.card_read(block, blocks)?;
+        Ok(window)
+    }
+
+    /// Reads through the cache: dirty blocks first, then the windows, refilled from the card
+    /// on a miss.
+    fn read(&mut self, block: u32, blocks: &mut [Block]) -> Result<(), Error> {
         for (offset, target) in blocks.iter_mut().enumerate() {
-            if let Some(data) = self.dirty(block + offset as u32) {
+            let lba = block + offset as u32;
+            if let Some(data) = self.dirty(lba) {
                 target.contents.copy_from_slice(data);
                 self.stats.cached_reads += 1;
+                continue;
             }
+            let (window, index) = match self.window_of(lba) {
+                Some(found) => {
+                    self.stats.window_reads += 1;
+                    found
+                }
+                None => (self.refill(lba)?, 0),
+            };
+            self.clock = self.clock.wrapping_add(1);
+            self.window_used[window] = self.clock;
+            target.contents.copy_from_slice(self.window_block(window, index));
         }
         Ok(())
     }
@@ -235,6 +278,14 @@ impl Cache<'_> {
     /// or a slot.
     fn put(&mut self, block: u32, data: &[u8; BLOCK_SIZE]) -> Result<(), Error> {
         self.stats.blocks_put += 1;
+        // Windows can overlap, a refill starting just before another: every copy is kept new.
+        for window in 0..WINDOWS {
+            if let Some(index) = block.checked_sub(self.window_start[window])
+                && (index as usize) < self.window_len[window]
+            {
+                self.window_block(window, index as usize).copy_from_slice(data);
+            }
+        }
         if let Some(index) = self.run_index(block) {
             self.run[index * BLOCK_SIZE..][..BLOCK_SIZE].copy_from_slice(data);
             return Ok(());
@@ -304,6 +355,7 @@ impl Cache<'_> {
 
     /// Writes `count` zero blocks straight to the card, from `block` on. The cache must be empty.
     fn zero(&mut self, block: u32, count: u32) -> Result<(), Error> {
+        self.window_len = [0; WINDOWS];
         self.run.fill(0);
         let per_chunk = self.run_capacity() as u32;
         let mut done = 0;
@@ -320,6 +372,7 @@ impl Cache<'_> {
 ///
 /// Writes stay in a write-back cache until [`flush`](Self::flush), or until it is full: one
 /// run of consecutive blocks, written to the card with one command, and a few single blocks.
+/// Reads go through read-ahead windows of 16 KiB, each filled with one command.
 /// `embedded_sdmmc` never asks for a flush, so call it after closing files, through
 /// `VolumeManager::device`. Dropping the device flushes too, but cannot report a failure.
 pub struct PartitionDevice<'a> {
@@ -331,8 +384,8 @@ impl<'a> PartitionDevice<'a> {
     /// A device for partition `number`, on the card at address `rca` (see [`MmcWriter::new`]).
     ///
     /// `buffer` must be whole blocks, start on a cache line ([`mmu::DCACHE_LINE`]), lie in DRAM
-    /// and hold at least [`MIN_BUFFER`] bytes. 8 KiB of it go to card reads and the single
-    /// blocks; the rest holds the run, so it sets how much one write command carries.
+    /// and hold at least [`MIN_BUFFER`] bytes. 68 KiB of it go to the read-ahead windows and
+    /// the single blocks; the rest holds the run, so it sets how much one write command carries.
     pub fn new(card: Mmc, rca: u16, number: u32, buffer: &'a mut [u8]) -> Result<Self, Error> {
         if buffer.len() < MIN_BUFFER
             || !buffer.len().is_multiple_of(BLOCK_SIZE)
@@ -341,12 +394,16 @@ impl<'a> PartitionDevice<'a> {
             return Err(Error::BadBuffer);
         }
         let writer = MmcWriter::new(card, rca, number).map_err(Error::Write)?;
-        let (read, rest) = buffer.split_at_mut(READ_BLOCKS * BLOCK_SIZE);
+        let (windows, rest) = buffer.split_at_mut(WINDOWS * WINDOW_BLOCKS * BLOCK_SIZE);
         let (slots, run) = rest.split_at_mut(SLOTS * BLOCK_SIZE);
         let cache = Cache {
             card,
             writer,
-            read,
+            windows,
+            window_start: [0; WINDOWS],
+            window_len: [0; WINDOWS],
+            window_used: [0; WINDOWS],
+            clock: 0,
             slots,
             slot_blocks: [None; SLOTS],
             run,

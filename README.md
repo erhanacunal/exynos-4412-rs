@@ -758,8 +758,23 @@ third boot:
 | `LOGS/BOOT.LOG` | | 24 bytes after the third boot, as expected |
 | Whole test | 2136 ms | 426 ms |
 
-Reads are now most of the time. The crate reads one block per call, and also reads the FAT
+Reads were then most of the time. The crate reads one block per call, and also reads the FAT
 block again for each 4 KiB cluster: 2048 data blocks and 256 FAT reads for 1 MiB.
+
+- **Read-ahead:** reads go through four windows of 16 KiB. A block in none of them refills the
+  one used least recently, from that block on, with one command, and the dirty blocks of the
+  write cache go over what the card gave. File data and the FAT are read in turns, so each keeps
+  a window. Writes update every window that holds the block, since windows can overlap.
+
+With read-ahead too, on the fourth boot:
+
+| Check | Write cache only | With read-ahead |
+|---|---|---|
+| `TEST.BIN` read back, 1 MiB | 253 ms, 4041 KiB/s: 2304 read commands | 39 ms, 26071 KiB/s: 64 read commands of 16 KiB, 2240 blocks from the windows; same hash, no bad byte |
+| `TEST.BIN` write, flush included | 85 ms, 11980 KiB/s | 89 ms, 11380 KiB/s |
+| Reads from the card, whole test | 2328 commands | 70 commands for 2240 blocks |
+| `LOGS/BOOT.LOG` | 24 bytes | 32 bytes, as expected |
+| Whole test | 426 ms | 213 ms |
 
 ## WiFi
 

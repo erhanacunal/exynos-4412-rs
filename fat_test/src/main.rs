@@ -26,7 +26,7 @@ exynos_4412_rs::entry!(main);
 /// The partition used: CACHE.
 const TARGET: u32 = 8;
 const LABEL: &[u8; 11] = b"CACHE      ";
-/// The device's buffer: 8 KiB for reads and single blocks, 256 KiB for the run of writes.
+/// The device's buffer: 68 KiB for read-ahead and single blocks, 256 KiB for the run of writes.
 const DEVICE_BYTES: usize = fat::MIN_BUFFER - 512 + 256 * 1024;
 const CHUNK_BYTES: usize = 32 * 1024;
 const BIG_BYTES: u32 = 1024 * 1024;
@@ -150,14 +150,15 @@ fn stats(volumes: &Volumes) -> Stats {
 /// What the device did between two snapshots.
 fn print_stats(what: &str, before: Stats, after: Stats) {
     println!(
-        "  device, {}: {} blocks put, {} write commands for {} blocks; {} read commands for {} blocks, {} blocks from the cache",
+        "  device, {}: {} blocks put, {} write commands for {} blocks; {} read commands for {} blocks, {} blocks from the write cache, {} from read-ahead",
         what,
         after.blocks_put - before.blocks_put,
         after.card_writes - before.card_writes,
         after.blocks_written - before.blocks_written,
         after.card_reads - before.card_reads,
         after.blocks_read - before.blocks_read,
-        after.cached_reads - before.cached_reads
+        after.cached_reads - before.cached_reads,
+        after.window_reads - before.window_reads
     );
 }
 
