@@ -16,7 +16,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
 - `mmc_test/`: eMMC read test, partition table, no writes
-- `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping
+- `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 
 ## Build
@@ -564,6 +564,9 @@ handshake and `crypto` the algorithms it needs: the firmware of this board leave
 - **Clock:** This controller has no usable divider of its own, so the card clock is `sclk_mmc3`,
   set in the CMU: 400 kHz to start, then the 16 MHz of the board's DTS.
 - **Transfer:** Polled through the buffer port, with no DMA and no interrupts.
+- **Flow control:** The firmware says in each frame it sends how many more it can take. While it
+  has no room, `drivers::wifi_device` tells `smoltcp` it cannot send, so the stack keeps reading
+  instead of dropping frames, such as acknowledgements, while it waits.
 - **Power:** LDO22 and the chip's enables stay on after the test, and the PMIC keeps its state over
   a restart. The chip is reset each time it is powered up.
 - **eMMC:** Not involved: it is on another controller and other pins.
@@ -601,8 +604,42 @@ decrypted.
 
 `wifi_test` then gets an address by DHCP, pings the router and 8.8.8.8, and answers ARP and pings on
 the network until restarted, all with the `smoltcp` crate over `drivers::wifi_device`. Only the
-features this needs are on, so there is no TCP yet. The stack renews its lease, which no test has yet
-lasted long enough to show.
+features this needs are on. The stack renews its lease, which no test has yet lasted long enough to
+show.
+
+TCP, both ways:
+
+- **Out:** After the pings, `wifi_test` connects to `1.1.1.1:80`, asks for `/` and prints the first
+  line of the answer, how many bytes came, and whether both sides closed cleanly.
+- **In:** It then serves HTTP/1.0 on port 80, up to 4 connections at once. `http://<address>/` is a
+  text page about the station; `http://<address>/data` is 1 MiB of text, and the serial log gives
+  the time until the last byte was acknowledged. Other paths get 404, other methods 405.
+- **Closing:** Each response closes its connection. The client is left to close first, so the 10 s
+  wait after a close falls on its side and the socket can listen again at once. A connection with
+  no whole request in 5 s is dropped, as browsers open some ahead of time.
+- **Memory:** The buffers are on the stack: 8 KiB to send and 1 KiB to receive per server
+  connection. The 8 KiB bounds the bytes in flight, and so the speed of `/data`.
+
+From another computer on the network, for example:
+
+```
+curl http://<address>/
+curl -o NUL -w "%{speed_download} bytes/s\n" http://<address>/data
+```
+
+(`-o /dev/null` instead of `-o NUL` outside Windows.)
+
+Observed on the board, on the same 5 GHz access point:
+
+| Check | Result |
+|---|---|
+| Connecting to `1.1.1.1:80` | 5 ms |
+| Its answer | `HTTP/1.1 301 Moved Permanently`, 381 bytes in 8 ms, closed cleanly by both sides |
+| `/` and `/favicon.ico` from a browser | Both answered, the second with 404 |
+| `/data` to a browser | 1 MiB acknowledged in 436 ms, 2348 KiB/s |
+
+`/data` was also the first test that sent full 1514-byte frames, so the first that needed SDIO
+writes of more than one block.
 
 Observed on the board, on a 5 GHz access point:
 

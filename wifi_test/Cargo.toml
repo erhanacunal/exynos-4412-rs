@@ -7,4 +7,4 @@ license = "MIT"
 
 [dependencies]
 exynos_4412_rs = { path = "../exynos_4412_rs" }
-smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4", "socket-icmp", "auto-icmp-echo-reply"] }
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4", "socket-icmp", "socket-tcp", "auto-icmp-echo-reply"] }

@@ -1,11 +1,12 @@
-//! BCM4334 WiFi chip test, fifth stage: loads the firmware, scans, joins a WPA2-Personal network, gets
-//! an address by DHCP, and pings.
+//! BCM4334 WiFi chip test, sixth stage: loads the firmware, scans, joins a WPA2-Personal network, gets
+//! an address by DHCP, pings, and speaks TCP both ways.
 //!
 //! Reports what U-Boot left, powers the chip up from reset, starts its SDIO bus and reads what the
 //! chip says about itself. It lists the chip's cores, loads the firmware and NVRAM and checks them
 //! by reading them back, runs the firmware, asks it for its version and its MAC address, and lists
 //! the networks it can hear. Then it joins the one named at build time and hands it to `smoltcp`,
-//! which gets an address and renews it, pings the router and a public address, and answers ARP and
+//! which gets an address and renews it, and pings the router and a public address. It opens a TCP
+//! connection to a public web server, then serves HTTP on port 80 (see `http`) and answers ARP and
 //! pings until told to stop.
 //!
 //! The firmware and NVRAM files come from `WIFI_FIRMWARE_DIR` at build time, and the network from
@@ -20,6 +21,8 @@
 
 #![no_std]
 #![no_main]
+
+mod http;
 
 use exynos_4412_rs::crypto::{self, Hmac};
 use exynos_4412_rs::drivers::bcm4334::{
@@ -36,8 +39,8 @@ use exynos_4412_rs::wpa::{self, Supplicant};
 use exynos_4412_rs::{BootArgs, console, mmu, print, println, soc};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities};
-use smoltcp::socket::{dhcpv4, icmp};
-use smoltcp::time::Instant;
+use smoltcp::socket::{dhcpv4, icmp, tcp};
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{
     EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
 };
@@ -76,8 +79,28 @@ const PING_ID: u16 = 0x4534;
 const PING_DATA: [u8; 56] = [0x5A; 56];
 /// A public address, to show that traffic gets past the router: a well known name server of Google.
 const PUBLIC_HOST: Ipv4Address = Ipv4Address::new(8, 8, 8, 8);
-/// Sockets: one for DHCP, one for pings.
-const SOCKETS: usize = 2;
+/// A public web server, to show TCP past the router: Cloudflare's, which answers on its address.
+const PUBLIC_WEB: Ipv4Address = Ipv4Address::new(1, 1, 1, 1);
+const PUBLIC_WEB_PORT: u16 = 80;
+/// What is asked of it. Any answer will do: the test is that one comes.
+const PUBLIC_WEB_REQUEST: &[u8] = b"GET / HTTP/1.0\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n";
+/// How long the connection and the answer each get. Not measured.
+const TCP_TIMEOUT_MS: u64 = 5_000;
+/// Bytes of the answer's first line that are kept.
+const STATUS_LINE_MAX: usize = 128;
+/// The first of the ports that connections from here come from: the start of the dynamic range.
+const LOCAL_PORT_BASE: u16 = 49152;
+/// Connections the HTTP server takes at once. Browsers open more than one.
+const SERVERS: usize = 4;
+/// Each server's buffers. What it sends bounds the bytes in flight, so the speed of `/data`.
+const SERVER_RX: usize = 1024;
+const SERVER_TX: usize = 8192;
+const CLIENT_RX: usize = 2048;
+const CLIENT_TX: usize = 256;
+/// A TCP connection that hears nothing for this long is dropped.
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Sockets: one for DHCP, one for pings, one TCP client, and the servers.
+const SOCKETS: usize = 3 + SERVERS;
 /// Pings each way that the ping socket can hold, and the bytes for them.
 const PING_QUEUE: usize = 4;
 const PING_BUFFER: usize = 256;
@@ -295,12 +318,17 @@ struct Station<'a> {
     sockets: SocketSet<'a>,
     dhcp: SocketHandle,
     ping: SocketHandle,
+    client: SocketHandle,
+    servers: [http::Server; SERVERS],
     capabilities: DeviceCapabilities,
     mct: Mct,
+    mac: [u8; 6],
     /// The router DHCP last named.
     gateway: Option<Ipv4Address>,
-    /// Whether DHCP has given an address that still holds.
-    has_address: bool,
+    /// The address DHCP gave, while it holds.
+    address: Option<Ipv4Address>,
+    /// HTTP requests answered.
+    requests: u32,
 }
 
 impl Station<'_> {
@@ -320,10 +348,10 @@ impl Station<'_> {
             None => Ok(None),
             Some(dhcpv4::Event::Deconfigured) => {
                 // The socket also says this once on starting, when there was nothing to lose.
-                if self.has_address {
+                if self.address.is_some() {
                     println!("DHCP: address lost");
                 }
-                self.has_address = false;
+                self.address = None;
                 self.interface.update_ip_addrs(|addresses| addresses.clear());
                 self.interface.routes_mut().remove_default_ipv4_route();
                 Ok(None)
@@ -350,7 +378,7 @@ impl Station<'_> {
                     println!("DHCP: name server {}", server);
                 }
                 self.gateway = config.router;
-                self.has_address = true;
+                self.address = Some(config.address.address());
                 Ok(Some(config.address.address()))
             }
         }
@@ -433,14 +461,135 @@ impl Station<'_> {
         Ok(false)
     }
 
-    /// Stays on the network, with the stack answering ARP and pings, until told to restart.
+    fn ms(&self) -> u64 {
+        self.mct.count() / COUNTS_PER_MS
+    }
+
+    /// Runs the stack until the client socket is in a state that `done` accepts, or the time is up.
+    fn wait_for_client(&mut self, done: impl Fn(&tcp::Socket) -> bool) -> Result<bool, Error> {
+        let begin = self.mct.count();
+        while self.mct.count() - begin < TCP_TIMEOUT_MS * COUNTS_PER_MS {
+            self.poll()?;
+            if done(self.sockets.get::<tcp::Socket>(self.client)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Opens a TCP connection to a web server, asks for a page, and reports the first line of the
+    /// answer and its size. Returns whether an answer came and the connection closed cleanly.
+    fn fetch(&mut self, host: Ipv4Address, port: u16) -> Result<bool, Error> {
+        let local_port = LOCAL_PORT_BASE | (self.mct.count() as u16 & 0x3FFF);
+        let begin = self.mct.count();
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.client);
+        if let Err(error) = socket.connect(self.interface.context(), (IpAddress::Ipv4(host), port), local_port) {
+            println!("Connecting: {:?} (MISMATCH)", error);
+            return Ok(false);
+        }
+        if !self.wait_for_client(|socket| socket.may_send() || !socket.is_open())?
+            || !self.sockets.get::<tcp::Socket>(self.client).may_send()
+        {
+            println!("No connection (MISMATCH)");
+            self.sockets.get_mut::<tcp::Socket>(self.client).abort();
+            return Ok(false);
+        }
+        println!("Connected in {} ms, from port {}", (self.mct.count() - begin) / COUNTS_PER_MS, local_port);
+
+        // A new connection's buffer has room for the whole request.
+        let _ = self.sockets.get_mut::<tcp::Socket>(self.client).send_slice(PUBLIC_WEB_REQUEST);
+        let asked = self.mct.count();
+        let mut line = [0; STATUS_LINE_MAX];
+        let mut line_length = 0;
+        let mut line_done = false;
+        let mut total = 0usize;
+        let mut first_ms = None;
+        let deadline = TCP_TIMEOUT_MS * COUNTS_PER_MS;
+        while self.mct.count() - asked < deadline {
+            self.poll()?;
+            let socket = self.sockets.get_mut::<tcp::Socket>(self.client);
+            let mut chunk = [0; 256];
+            while let Ok(count) = socket.recv_slice(&mut chunk) {
+                if count == 0 {
+                    break;
+                }
+                if first_ms.is_none() {
+                    first_ms = Some((self.mct.count() - asked) / COUNTS_PER_MS);
+                }
+                total += count;
+                for &byte in &chunk[..count] {
+                    if line_done || byte == b'\r' || byte == b'\n' {
+                        line_done |= line_length != 0;
+                    } else if line_length < STATUS_LINE_MAX {
+                        line[line_length] = byte;
+                        line_length += 1;
+                    }
+                }
+            }
+            // The server closes when it is done: nothing more will come.
+            if !socket.may_recv() {
+                break;
+            }
+        }
+        let closed = !self.sockets.get::<tcp::Socket>(self.client).may_recv();
+        match first_ms {
+            Some(ms) => {
+                print!("First bytes in {} ms: ", ms);
+                print_text(&line[..line_length]);
+            }
+            None => println!("No answer (MISMATCH)"),
+        }
+        println!(
+            "{} bytes in {} ms, server closed: {}",
+            total,
+            (self.mct.count() - asked) / COUNTS_PER_MS,
+            if closed { "yes" } else { "no" },
+        );
+
+        let socket = self.sockets.get_mut::<tcp::Socket>(self.client);
+        socket.close();
+        let finished = self.wait_for_client(|socket| matches!(socket.state(), tcp::State::TimeWait | tcp::State::Closed))?;
+        if !finished {
+            self.sockets.get_mut::<tcp::Socket>(self.client).abort();
+        }
+        println!("Closed from this side: {}", verdict(finished));
+        Ok(first_ms.is_some() && closed && finished)
+    }
+
+    /// Lets each HTTP server do what its connection needs.
+    fn serve_http(&mut self) {
+        let now_ms = self.ms();
+        let status = http::Status {
+            uptime_s: now_ms / 1000,
+            address: self.address,
+            router: self.gateway,
+            mac: self.mac,
+            pings: self.device.echo_requests(),
+            requests: self.requests,
+        };
+        for server in &mut self.servers {
+            let socket = self.sockets.get_mut::<tcp::Socket>(server.handle());
+            if server.service(socket, now_ms, &status) {
+                self.requests += 1;
+            }
+        }
+    }
+
+    /// Stays on the network, with the stack answering ARP and pings and the servers HTTP, until
+    /// told to restart.
     fn serve(&mut self) -> Result<(), Error> {
-        println!("\nStaying connected, answering pings. UART: r restart, f restart into fastboot");
+        print!("\nStaying connected, answering pings");
+        match self.address {
+            Some(address) => println!(" and HTTP: http://{}/ and http://{}/data", address, address),
+            None => println!(" and HTTP on port {}", http::PORT),
+        }
+        println!("UART: r restart, f restart into fastboot");
         let uart = console::uart();
         let mut keys = PowerKeys::new();
         let mut reported = self.device.echo_requests();
         loop {
             self.poll()?;
+            self.serve_http();
             keys.service(self.mct);
             if self.device.echo_requests() != reported {
                 reported = self.device.echo_requests();
@@ -453,6 +602,13 @@ impl Station<'_> {
             }
         }
     }
+}
+
+/// A TCP socket on these buffers, which gives up on a peer that goes quiet.
+fn tcp_socket<'a>(rx: &'a mut [u8], tx: &'a mut [u8]) -> tcp::Socket<'a> {
+    let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
+    socket.set_timeout(Some(TCP_IDLE_TIMEOUT));
+    socket
 }
 
 fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8; 20]) -> Result<(), Error> {
@@ -514,16 +670,31 @@ fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8;
     let _ = ping_socket.bind(icmp::Endpoint::Ident(PING_ID));
     let ping = sockets.add(ping_socket);
 
+    let mut client_rx = [0; CLIENT_RX];
+    let mut client_tx = [0; CLIENT_TX];
+    let client = sockets.add(tcp_socket(&mut client_rx[..], &mut client_tx[..]));
+
+    let mut server_rx = [[0; SERVER_RX]; SERVERS];
+    let mut server_tx = [[0; SERVER_TX]; SERVERS];
+    let mut handles = [SocketHandle::default(); SERVERS];
+    for ((handle, rx), tx) in handles.iter_mut().zip(&mut server_rx).zip(&mut server_tx) {
+        *handle = sockets.add(tcp_socket(&mut rx[..], &mut tx[..]));
+    }
+
     let mut station = Station {
         device,
         interface,
         sockets,
         dhcp,
         ping,
+        client,
+        servers: handles.map(http::Server::new),
         capabilities,
         mct,
+        mac: own,
         gateway: None,
-        has_address: false,
+        address: None,
+        requests: 0,
     };
 
     println!("\nGetting an address");
@@ -545,6 +716,10 @@ fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8;
     println!("\nPinging past the router, {}", PUBLIC_HOST);
     let answers = station.ping(PUBLIC_HOST)?;
     println!("{} of {} answered: {}", answers, PINGS, verdict(answers != 0));
+
+    println!("\nTCP to {}:{}", PUBLIC_WEB, PUBLIC_WEB_PORT);
+    let fetched = station.fetch(PUBLIC_WEB, PUBLIC_WEB_PORT)?;
+    println!("TCP: {}", verdict(fetched));
 
     station.serve()
 }
@@ -664,7 +839,7 @@ fn run(pmic: Max77686, mct: Mct) -> Result<(), Error> {
 }
 
 fn main(_args: BootArgs) -> ! {
-    println!("\nBCM4334 WiFi chip test, fifth stage");
+    println!("\nBCM4334 WiFi chip test, sixth stage");
 
     let mct = Mct::new();
     mct.start();

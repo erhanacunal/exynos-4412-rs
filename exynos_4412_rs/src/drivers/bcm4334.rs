@@ -1326,8 +1326,9 @@ impl Bcm4334 {
     }
 
     /// Whether the firmware can take another frame: what `data_ok` in `brcmfmac/sdio.c:675`
-    /// checks, from the limit it gave in its last frame.
-    fn can_send(&self) -> bool {
+    /// checks, from the limit it gave in its last frame. The limit only moves when a frame is
+    /// read, so a caller that finds no room has to keep [`poll`](Self::poll)ing.
+    pub fn can_send(&self) -> bool {
         let room = self.tx_limit.wrapping_sub(self.tx_sequence);
         room != 0 && room & 0x80 == 0
     }

@@ -139,7 +139,10 @@ impl Device for WifiDevice<'_> {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        if self.failure.is_some() {
+        // Without room in the firmware, sending would wait for it and drop the frames that come
+        // meanwhile, such as the acknowledgements of what is being sent. Saying no instead keeps
+        // the stack reading: each frame read updates the room.
+        if self.failure.is_some() || !self.chip.can_send() {
             return None;
         }
         Some(TxToken {

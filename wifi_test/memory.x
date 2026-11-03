@@ -13,5 +13,7 @@ MEMORY
     RAM : ORIGIN = 0x40008000, LENGTH = 4M
 }
 
-/* Frames, the table of networks and the handshake's buffers all live on the stack of main. */
-__svc_stack_size = 32K;
+/* Frames, the table of networks, the handshake's buffers and the TCP buffers all live on the
+ * stack of main. From the disassembly: join's frame is 61 KiB, main's 5 KiB, and the deepest
+ * calls below them add a few more, so 128K leaves room. */
+__svc_stack_size = 128K;
