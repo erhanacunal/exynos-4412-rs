@@ -802,6 +802,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d2d250f87fb3fb6f225c907cf54381509f47b40b74b1d1f12d2dccbc915bdfe"
 
 [[package]]
+name = "touch_async_test"
+version = "0.1.0"
+dependencies = [
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-sync",
+ "embassy-time",
+ "exynos_4412_rs",
+]
+
+[[package]]
 name = "touch_test"
 version = "0.1.0"
 dependencies = [

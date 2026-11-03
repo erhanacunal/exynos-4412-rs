@@ -19,8 +19,10 @@
 //! the bootloader, which answers at [`BOOTLOADER_ADDRESS`] after some resets: its protocol
 //! replaces the firmware. Every write goes to [`ADDRESS`], fixed here.
 //!
-//! The controller pulls [`CHG`] low while it has messages. [`Mxt::read_message`] takes one;
-//! a reader reads until CHG goes high again.
+//! The controller pulls [`CHG`] low while it has messages. [`Mxt::read_message`] takes one,
+//! `None` once there are none left. A polled reader reads while CHG is low. With the
+//! `embassy` feature, `Mxt::next_message` waits on CHG's interrupt instead, through an
+//! [`EintInput`](crate::embassy::eint::EintInput).
 //!
 //! ```ignore
 //! mxt::power_up(pmic, mct)?;
@@ -534,6 +536,23 @@ impl Mxt {
         frame[2..2 + data.len()].copy_from_slice(data);
         self.i2c.write(ADDRESS, &frame[..2 + data.len()])?;
         Ok(())
+    }
+}
+
+#[cfg(feature = "embassy")]
+impl Mxt {
+    /// The next message, waiting on `chg`, made from [`CHG`], while there is none. The I2C
+    /// transfers themselves are polled, about 1.3 ms per message at [`BUS_HZ`]. A message
+    /// already waiting is returned without awaiting anything: a caller that reads one after
+    /// another while fingers move keeps its executor busy, and yields between messages to
+    /// let other tasks run.
+    pub async fn next_message(&self, chg: &crate::embassy::eint::EintInput) -> Result<Message, Error> {
+        loop {
+            if let Some(message) = self.read_message()? {
+                return Ok(message);
+            }
+            chg.wait_low().await;
+        }
     }
 }
 

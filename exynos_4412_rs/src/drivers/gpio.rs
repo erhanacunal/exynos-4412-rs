@@ -386,6 +386,26 @@ impl Eint {
         self.pin
     }
 
+    /// Its place among the 32 wake-up interrupts: 8 per bank, GPX0 first.
+    pub const fn index(&self) -> u8 {
+        match self.pin.bank.wake_index {
+            Some(word) => word * 8 + self.pin.number,
+            None => 0,
+        }
+    }
+
+    /// The interrupt at `index`, as [`index`](Self::index) numbers them. `None` from 32 on.
+    pub const fn from_index(index: u8) -> Option<Self> {
+        let bank = match index / 8 {
+            0 => GPX0,
+            1 => GPX1,
+            2 => GPX2,
+            3 => GPX3,
+            _ => return None,
+        };
+        Some(Self { pin: bank.pin(index % 8) })
+    }
+
     /// The GIC interrupt ID this interrupt reaches.
     pub fn irq(&self) -> u16 {
         match self.word() {
@@ -399,11 +419,22 @@ impl Eint {
     /// reconfiguration is discarded. Set the pull first, with [`Pin::set_pull`].
     pub fn listen(&self, trigger: Trigger) {
         self.mask();
-        let shift = u32::from(self.pin.number) * ECON_WIDTH;
-        modify(&self.regs().con[self.word()], ECON_MASK << shift, trigger.raw() << shift);
+        self.set_trigger(trigger);
         self.pin.set_function(Function::Eint);
         self.clear();
         self.unmask();
+    }
+
+    /// Changes what makes this interrupt pending, leaving the pin's function and the mask as
+    /// they are. Mask it first: the change itself can make it pending.
+    pub fn set_trigger(&self, trigger: Trigger) {
+        let shift = u32::from(self.pin.number) * ECON_WIDTH;
+        modify(&self.regs().con[self.word()], ECON_MASK << shift, trigger.raw() << shift);
+    }
+
+    /// Whether this interrupt is kept from the GIC.
+    pub fn is_masked(&self) -> bool {
+        self.regs().mask[self.word()].get() & self.bit() != 0
     }
 
     /// Stops this interrupt from reaching the GIC. It can still become pending.

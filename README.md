@@ -13,6 +13,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `timer_test/`: per-core MCT local timer test
 - `display_test/`: panel bring-up with FIMD: state report, scan checks, test patterns
 - `touch_test/`: mXT1664S touch controller: object table, touches drawn on the panel, five-point calibration
+- `touch_async_test/`: the touch controller read with `await` on its CHG interrupt, with a 1 ms ticker on the same core
 - `gpio_test/`: GPIO pins and key interrupts test
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
@@ -582,7 +583,8 @@ it, so the System MMU gate this code opens was already open on this boot.
 
 `drivers::mxt` drives the mXT1664S on `i2c_5`. It powers the controller up as in the MAX77686 section,
 reads its information block and object table, checks their CRC, and reads touch messages from T5 while
-CHG (`gpx0-4`) is low. CHG is polled: there is no interrupt for it yet.
+CHG (`gpx0-4`) is low. `touch_test` polls CHG; `touch_async_test` awaits its interrupt, GIC ID 52,
+through `embassy::eint` (see [Async](#async-embassy)).
 
 - **Configuration:** The controller keeps its configuration in non-volatile memory, written there by
   the vendor driver. This driver reads it. Its writes go to RAM only, and a reset brings back what was
@@ -617,6 +619,24 @@ Observed, one finger:
 The controller's own ORIENT already puts X across the panel and Y down it. The fitted scale is 1.1 %
 above the plain one in X (0.31574 against 1279 / 4095 = 0.31233) and 0.4 % below it in Y, with an
 offset of about 3 px. Several fingers at once have not been tried.
+
+`touch_async_test` on the board: `make img APP=touch_async_test`. It draws with the map above, and every
+5 s prints the messages, CHG interrupts, wake-ups that found no message, the time spent reading, and a
+1 ms ticker's count and lateness. Observed, before the task yielded between messages:
+
+| Check | Result |
+|---|---|
+| CHG data bit with the pin in its interrupt function | 0 with messages waiting, 1 after reading them: it follows the line |
+| Nothing touching | No CHG interrupt and no report line; ticker 4965 ticks in 5 s, latest 18 us late |
+| One finger | 140 messages, 140 interrupts in 5 s |
+| Up to six fingers at once | Up to 1607 messages in 5 s against 229 interrupts: several read per interrupt |
+| Wake-ups that found no message | 0 in all |
+| Reading | 1.3 ms per message at 100 kHz: 2134 ms in the busiest 5 s |
+| Ticker while fingers moved | 2925 to 4696 ticks in 5 s, latest up to 66 ms late |
+
+The ticker lost about as many ticks as the milliseconds spent reading. With fingers moving, CHG stays
+low, so the task read message after message without awaiting. It now yields after each message. The
+reading itself still holds the core, 1.3 ms at a time, because the I2C transfers are polled.
 
 ## Restart and power off
 
@@ -883,6 +903,12 @@ through `embassy-sync` channels, signals and mutexes, which the critical section
   50 us with a timer. A transfer dropped part way, by a timeout for one, is let finish, polled,
   before its DMA is stopped: the driver sends no `CMD12`, so a card stopped in the middle would
   go on sending. `MmcWriter::write_async` refuses what `write` refuses.
+- **GPX pins:** `embassy::eint::EintInput` waits for a level on a GPX pin, on its wake-up
+  interrupt, level-triggered. The interrupt stays masked except during a wait, and the handler
+  masks it again, so a level that lasts interrupts once. A wait first clears what an earlier
+  level left pending, so it can end with the level gone: the caller checks the device, and
+  waits again if it has nothing. `Mxt::next_message` waits on CHG this way; its I2C reads stay
+  polled.
 - **Not yet present:** async I2C, async sending, and preemptive threads.
 
 Test on the board: `make img APP=async_test`, same flashing step. Observed:

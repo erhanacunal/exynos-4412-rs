@@ -1,0 +1,13 @@
+[package]
+name = "touch_async_test"
+version = "0.1.0"
+edition = "2024"
+description = "Async touch screen test for exynos_4412_rs: messages awaited on the CHG interrupt"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["embassy"] }
+embassy-executor = "0.10"
+embassy-time = "0.5"
+embassy-sync = "0.8"
+embassy-futures = "0.1"
