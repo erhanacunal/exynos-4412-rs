@@ -15,12 +15,18 @@ register_structs! {
         (0x00 => ctrl: ReadWrite<u32>),
         /// smp_scu.c:19 `SCU_CONFIG`.
         (0x04 => config: ReadOnly<u32>),
-        (0x08 => @END),
+        (0x08 => _reserved),
+        /// smp_scu.c:45, the diagnostic control register, which Linux reaches by its offset.
+        (0x30 => diagnostic: ReadWrite<u32>),
+        (0x34 => @END),
     }
 }
 
 /// smp_scu.c:17 `SCU_ENABLE`.
 const CTRL_ENABLE: u32 = 1;
+/// smp_scu.c:47: the workaround for Cortex-A9 erratum 764369, a cache maintenance operation by
+/// address on Inner Shareable memory that may not reach its point of coherency.
+const DIAGNOSTIC_764369: u32 = 1;
 
 /// Handle to the SCU. Holds no state.
 #[derive(Clone, Copy, Debug, Default)]
@@ -58,9 +64,27 @@ impl Scu {
         (self.config() & 3) as usize + 1
     }
 
-    /// Turns the SCU on, unless it is on already. Call it before any core enables
-    /// its data cache, or that core's lines are invisible to the SCU.
+    /// The raw diagnostic control register.
+    pub fn diagnostic(&self) -> u32 {
+        self.regs().diagnostic.get()
+    }
+
+    /// Whether the workaround for erratum 764369 is on.
+    pub fn erratum_764369_workaround(&self) -> bool {
+        self.diagnostic() & DIAGNOSTIC_764369 != 0
+    }
+
+    fn set_erratum_764369_workaround(&self, on: bool) {
+        let value = self.diagnostic() & !DIAGNOSTIC_764369;
+        self.regs().diagnostic.set(if on { value | DIAGNOSTIC_764369 } else { value });
+    }
+
+    /// Tries to turn on the workaround for erratum 764369, as Linux does whether the SCU is on
+    /// or not (smp_scu.c:42-49). On this board the register stays 0: running Non-secure, the
+    /// write is ignored, as it is for the vendor kernel, which writes it the same way. Then turns the SCU on, unless it is on already. Call it before any
+    /// core enables its data cache, or that core's lines are invisible to the SCU.
     pub(crate) fn enable(&self) {
+        self.set_erratum_764369_workaround(true);
         if !self.is_enabled() {
             self.regs().ctrl.set(self.ctrl() | CTRL_ENABLE);
         }

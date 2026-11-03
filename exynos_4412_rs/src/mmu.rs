@@ -11,7 +11,8 @@
 //! | `0x0000_0000..0x0010_0000` | fault | catches null pointers |
 //! | `0x0010_0000..DRAM` | Device, execute-never | SYSRAM and peripherals; never speculated |
 //! | DRAM | Normal, write-back write-allocate, Shareable | [`soc::DRAM_BASE`] |
-//! | above DRAM | fault | not ours: speculative accesses must not reach it |
+//! | `0xC000_0000`, 16 MiB | Normal, non-cacheable, execute-never | [`DRAM_UNCACHED`]: the start of DRAM again, to see what DRAM holds |
+//! | rest above DRAM | fault | not ours: speculative accesses must not reach it |
 //!
 //! # After [`enable`]
 //!
@@ -22,7 +23,9 @@
 //! - `SCTLR.A` stays set. Generated code is `strict-align`, so nothing needs unaligned
 //!   access, and a real one still faults.
 //! - Anything else using DRAM directly, such as DMA, needs cache maintenance. A device that
-//!   reads needs [`clean_dcache_range`]. TODO: range invalidate, for a device that writes.
+//!   reads needs [`clean_dcache_range`] first. A device that writes needs
+//!   [`discard_dcache_range`] before and [`invalidate_dcache_range`] after, on whole lines of
+//!   [`DCACHE_LINE`] bytes.
 //! - This does not enable the L2 cache: call
 //!   [`L2c::enable`](crate::drivers::l2c::L2c::enable) afterwards.
 
@@ -30,6 +33,8 @@ use core::arch::{asm, global_asm};
 
 /// L1 line of the Cortex-A9. The L2 cache has the same: `arch/arm/mm/cache-l2x0.c:37`.
 const L1_LINE_SIZE: usize = 32;
+/// The line of both data caches. Memory a device writes has to start and end on these.
+pub const DCACHE_LINE: usize = L1_LINE_SIZE;
 
 use crate::cpu;
 use crate::drivers::l2c::L2c;
@@ -38,6 +43,26 @@ use crate::soc;
 
 const SECTION_SIZE: usize = 1 << 20;
 const TABLE_ENTRIES: usize = 4096;
+
+/// Where the start of DRAM shows a second time, without the caches: a read there gets what DRAM
+/// holds, whatever the caches hold for the same address. It is for checking cache maintenance,
+/// as `l2_test` does. Do not write there what the cached view also uses: the two views of one
+/// line disagree by design, and a dirty line would later be written back over the write.
+pub const DRAM_UNCACHED: usize = 0xC000_0000;
+/// How much of DRAM it covers, from [`soc::DRAM_BASE`]: the applications' images, `.bss` and
+/// stacks are all there.
+pub const DRAM_UNCACHED_SIZE: usize = 16 << 20;
+
+const _: () = assert!(DRAM_UNCACHED >= soc::DRAM_BASE + soc::DRAM_SIZE && DRAM_UNCACHED_SIZE <= soc::DRAM_SIZE);
+
+/// The uncached address of a DRAM address, if [`DRAM_UNCACHED`] covers it.
+pub const fn uncached(address: usize) -> Option<usize> {
+    if address >= soc::DRAM_BASE && address < soc::DRAM_BASE + DRAM_UNCACHED_SIZE {
+        Some(address - soc::DRAM_BASE + DRAM_UNCACHED)
+    } else {
+        None
+    }
+}
 
 // Section descriptor bits: Linux 5.15.198 `arch/arm/include/asm/pgtable-2level-hwdef.h`.
 /// Line 19 `PMD_TYPE_SECT`.
@@ -57,6 +82,9 @@ const SECT_TEX1: u32 = 1 << 12;
 
 const DEVICE: u32 = SECT | SECT_AP_FULL | SECT_B | SECT_XN;
 const NORMAL_WBWA: u32 = SECT | SECT_AP_FULL | SECT_TEX1 | SECT_C | SECT_B | SECT_S;
+/// TEX 1 with C 0 and B 0: Normal, non-cacheable, inner and outer (ARMv7-A ARM, short-descriptor
+/// memory region attributes, TEX remap off). Linux 5.15.198 has no section macro for it.
+const NORMAL_UNCACHED: u32 = SECT | SECT_AP_FULL | SECT_TEX1 | SECT_S | SECT_XN;
 
 const _: () = assert!(
     soc::DRAM_BASE.is_multiple_of(SECTION_SIZE) && soc::DRAM_SIZE.is_multiple_of(SECTION_SIZE)
@@ -79,6 +107,12 @@ const fn build_table() -> TranslationTable {
         let attributes = if index < dram_start { DEVICE } else { NORMAL_WBWA };
         entries[index] = (index * SECTION_SIZE) as u32 | attributes;
         index += 1;
+    }
+    let alias_start = DRAM_UNCACHED / SECTION_SIZE;
+    let mut section = 0;
+    while section < DRAM_UNCACHED_SIZE / SECTION_SIZE {
+        entries[alias_start + section] = (soc::DRAM_BASE + section * SECTION_SIZE) as u32 | NORMAL_UNCACHED;
+        section += 1;
     }
     TranslationTable(entries)
 }
@@ -106,6 +140,7 @@ pub fn clean_dcache_range(start: usize, len: usize) {
     if len == 0 {
         return;
     }
+    erratum_764369_barrier();
     let mut line = start & !(L1_LINE_SIZE - 1);
     while line < start + len {
         // SAFETY: cleaning changes no data in the view of any observer. `DCCMVAC`, the same
@@ -122,6 +157,78 @@ pub fn clean_dcache_range(start: usize, len: usize) {
         asm!("dsb", options(nostack, preserves_flags));
     }
     L2c::new().clean_range(start, len);
+}
+
+/// Before a device writes a range of DRAM: drops the range from the L1 cache of this core, then
+/// from the L2 cache, discarding what the CPU wrote there and did not clean. No dirty line is
+/// left to be written back over the device's data later. Some of what the CPU wrote may still
+/// reach DRAM before this returns: on the board, `l2_test` saw a few lines of it do so. That is
+/// before the device starts, so it writes over them. Lines may come back into the caches
+/// meanwhile, but clean: call [`invalidate_dcache_range`] once the device is done.
+///
+/// Same addresses and limits as [`clean_dcache_range`]. Do not touch the range from the CPU
+/// until the device is done.
+///
+/// # Panics
+///
+/// If `start` or `len` is not a multiple of [`DCACHE_LINE`]: a line shared with other data would
+/// lose that data.
+pub fn discard_dcache_range(start: usize, len: usize) {
+    assert_whole_lines(start, len);
+    invalidate_l1_range(start, len);
+    L2c::new().invalidate_range(start, len);
+}
+
+/// After a device wrote a range of DRAM: drops the range from the L2 cache, then from the L1
+/// cache of this core, so that reads come from DRAM. Lines the CPU pulled in while the device
+/// worked, by speculation too, go with them. The L2 cache goes first, or the L1 cache could fill
+/// again from it. Call [`discard_dcache_range`] before the device starts, or a dirty line could
+/// still be written back over what it wrote.
+///
+/// # Panics
+///
+/// If `start` or `len` is not a multiple of [`DCACHE_LINE`].
+pub fn invalidate_dcache_range(start: usize, len: usize) {
+    assert_whole_lines(start, len);
+    L2c::new().invalidate_range(start, len);
+    invalidate_l1_range(start, len);
+}
+
+fn assert_whole_lines(start: usize, len: usize) {
+    assert!(
+        start.is_multiple_of(DCACHE_LINE) && len.is_multiple_of(DCACHE_LINE),
+        "cache invalidate of {:#x}+{:#x}: not whole lines",
+        start,
+        len,
+    );
+}
+
+/// Cortex-A9 erratum 764369: a maintenance operation by address on Inner Shareable memory may
+/// not reach its point of coherency. Linux 5.15.198 puts a `dsb` before its loops
+/// (`cache-v7.S:371`) and sets bit 0 of the SCU diagnostic register
+/// ([`Scu::enable`](crate::drivers::scu::Scu)); this is the first half.
+fn erratum_764369_barrier() {
+    // SAFETY: a barrier has no effect other than ordering.
+    unsafe {
+        asm!("dsb", options(nostack, preserves_flags));
+    }
+}
+
+/// `DCIMVAC` over the range, then a barrier, so the lines are gone before what follows.
+fn invalidate_l1_range(start: usize, len: usize) {
+    erratum_764369_barrier();
+    for line in (start..start + len).step_by(L1_LINE_SIZE) {
+        // SAFETY: the callers check that the range is whole lines, so only data in the range is
+        // discarded, which they ask for. `DCIMVAC`, the operation of
+        // `arch/arm/mm/cache-v7.S:383`. An address without a mapping would fault.
+        unsafe {
+            asm!("mcr p15, 0, {}, c7, c6, 1", in(reg) line, options(nostack, preserves_flags));
+        }
+    }
+    // SAFETY: a barrier has no effect other than ordering.
+    unsafe {
+        asm!("dsb", options(nostack, preserves_flags));
+    }
 }
 
 /// Turns on the MMU, the L1 data and instruction caches and branch prediction on this

@@ -30,6 +30,9 @@ register_structs! {
         /// cache-l2x0.h:28 `L2X0_CACHE_SYNC`.
         (0x730 => cache_sync: ReadWrite<u32>),
         (0x734 => _reserved2),
+        /// cache-l2x0.h:30 `L2X0_INV_LINE_PA`.
+        (0x770 => inv_line_pa: ReadWrite<u32>),
+        (0x774 => _reserved6),
         /// cache-l2x0.h:31 `L2X0_INV_WAY`.
         (0x77C => inv_way: ReadWrite<u32>),
         (0x780 => _reserved3),
@@ -45,6 +48,8 @@ register_structs! {
     }
 }
 
+/// cache-l2x0.h:61 `L2X0_CACHE_ID_RTL_MASK`: the revision field of `CACHE_ID`.
+const CACHE_ID_RTL_MASK: u32 = 0x3F;
 /// cache-l2x0.h:144 `L2X0_CTRL_EN`.
 const CTRL_EN: u32 = 1;
 /// cache-l2x0.h:120 `L310_AUX_CTRL_ASSOCIATIVITY_16`.
@@ -180,6 +185,38 @@ impl L2c {
         while line < start + len {
             regs.clean_line_pa.set(line as u32);
             line += LINE_SIZE;
+        }
+        regs.cache_sync.set(0);
+        wait_until_zero(&regs.cache_sync, 1);
+    }
+
+    /// The RTL release from `CACHE_ID`: `cache-l2x0.h:69-76` lists those of the L310, `0x08`
+    /// being r3p2.
+    pub fn revision(&self) -> u32 {
+        self.cache_id() & CACHE_ID_RTL_MASK
+    }
+
+    /// Drops the lines of a physical address range, discarding their contents, dirty or not.
+    /// Does nothing if the cache is off. The range must be whole lines: see
+    /// [`mmu::invalidate_dcache_range`](crate::mmu::invalidate_dcache_range), which also covers
+    /// the L1 cache, in the right order.
+    ///
+    /// # Panics
+    ///
+    /// If `start` or `len` is not a multiple of the line size, or the controller does not finish.
+    pub fn invalidate_range(&self, start: usize, len: usize) {
+        assert!(
+            start.is_multiple_of(LINE_SIZE) && len.is_multiple_of(LINE_SIZE),
+            "L2 invalidate of {:#x}+{:#x}: not whole lines",
+            start,
+            len,
+        );
+        if len == 0 || !self.is_enabled() {
+            return;
+        }
+        let regs = self.regs();
+        for line in (start..start + len).step_by(LINE_SIZE) {
+            regs.inv_line_pa.set(line as u32);
         }
         regs.cache_sync.set(0);
         wait_until_zero(&regs.cache_sync, 1);

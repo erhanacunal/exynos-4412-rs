@@ -205,7 +205,8 @@ are at the top of `exynos_4412_rs/src/mmu.rs`.
 | `0x0000_0000..0x0010_0000` | fault | catches null pointers |
 | `0x0010_0000..0x4000_0000` | Device, execute-never | SYSRAM and peripherals, no speculation |
 | `0x4000_0000..0xBEA0_0000` | Normal WBWA, Shareable | DRAM from the DTS |
-| `0xBEA0_0000` and above | fault | memory outside the DTS, speculation must not reach it |
+| `0xBEA0_0000..0xC000_0000`, `0xC100_0000` and above | fault | memory outside the DTS, speculation must not reach it |
+| `0xC000_0000..0xC100_0000` | Normal non-cacheable, execute-never | `mmu::DRAM_UNCACHED`: the first 16 MiB of DRAM again, past the caches, to check cache maintenance |
 
 - **Table:** Generated at compile time and placed in `.rodata`; since it is never written, it
   needs no cache maintenance. The image grows by a 16 KiB-aligned section because of this.
@@ -215,7 +216,14 @@ are at the top of `exynos_4412_rs/src/mmu.rs`.
 - **L2:** Comes off from U-Boot on this board. `L2c::enable()` is called after `mmu::enable()`;
   since the board runs Non-secure, this is done via SMC to the secure firmware (`firmware.rs`). The
   call order and values were verified against Linux 5.15 and the board's vendor kernel.
-- **DMA:** L1 and L2 cache maintenance for hardware that uses DRAM directly does not exist yet.
+- **DMA:** For hardware that uses DRAM directly, `mmu` has three range calls over L1 and L2.
+  Ranges must be whole 32-byte lines (`mmu::DCACHE_LINE`): a partial line would drop or write back
+  a neighbour's data, so they assert.
+  - `clean_dcache_range` before the hardware reads: L1, then L2, write back to DRAM.
+  - `discard_dcache_range` before the hardware writes: L1, then L2, dropped without writing back,
+    so no dirty line can be evicted over what the hardware writes.
+  - `invalidate_dcache_range` after the hardware wrote: L2, then L1, dropped, so the CPU reads
+    DRAM. L2 first, so L1 cannot refill from a stale L2 line. Nothing drives DMA yet.
 
 Test on the board: `make img APP=mmu_test`, same flashing step. Observed:
 
@@ -246,10 +254,42 @@ Test on the board: `make img APP=mmu_test`, same flashing step. Observed:
 | Speed, L2 off | 16 KiB 4 ns, 256 KiB 7 ns, 2 MiB 7 ns |
 | Speed, L2 on | 16 KiB 4 ns, 256 KiB 4 ns, 2 MiB 4 ns |
 | `tick N ... no errors` | 11 seconds, about 2100 passes of 2 MiB verification, no errors |
+| `L2 revision` | `0x08`, r3p2: errata 753970 and 769419 are fixed in it |
+| `Discard of 128 KiB` | 16 of 16 rounds `OK`, 115 µs each. The caches wrote 48 words out before the drop (3 rounds) and 24 during it (round 1); nothing after |
+| `Invalidate of 128 KiB` | 16 of 16 rounds `OK`, 115 µs each, reads matched DRAM right after. 8 words written out before (round 11) and 8 during (round 1) |
+| Same, judged against the old values | 1 to 3 rounds in 8 or 16 "failed": the new value of 1 to 6 lines was in DRAM. Through `mmu::DRAM_UNCACHED`: in Invalidate rounds 3 and 16 already before the drop, in Discard round 1 during it. Afterwards, DRAM never changed again and reads always matched it |
+| `SCU diagnostic` | `0x00000000`, and stays so after writing bit 0: Non-secure cannot set the 764369 workaround |
+| Speed, L2 off/on (this run) | 256 KiB and 2 MiB: 12 ns off, 6 ns on |
 
 This measurement is sequential access with a resolution of 1 ns. 4 ns is the duration of the loop
 itself. That 2 MiB also speeds up comes not from L2 capacity but most likely from prefetch; L2's hit
 latency cannot be considered measured by this test. That requires a random-access test.
+
+The drop tests put old values in DRAM with `clean_dcache_range`, write new values over 128 KiB
+and one guard line on each side, then drop the 128 KiB, 16 rounds each. Each round first
+dirties 2 MiB elsewhere, so the L2 cache is busy writing lines out while the range comes in.
+DRAM is read through `mmu::DRAM_UNCACHED`, a non-cacheable view of the first 16 MiB of DRAM at
+`0xC000_0000`: after the clean, before the drop, after it, and after reading 2 MiB elsewhere,
+which evicts the range from both caches, so a dirty line left behind would have reached DRAM by
+then. That DRAM still holds the old values before the drop, while the caches hold the new ones,
+shows that the view really goes past the caches.
+
+- A round passes if the clean put every old value in DRAM, DRAM does not change after the drop,
+  reads through the caches match DRAM after the 2 MiB, and the guard lines keep the new values.
+  `invalidate_dcache_range` must also match DRAM right after the drop.
+- What the CPU wrote may reach DRAM before the drop or during it, and the summary counts those
+  words. Before a device starts, that does no harm: the device writes over it. The board does
+  both. Before: a busy L2 cache evicts lines on its own. During either drop, mostly in round 1:
+  the cause is not known. Possibly `DCIMVAC` writes a dirty line out, which the architecture
+  allows, and the L2 cache sends it on to DRAM. The first test design took these for failures.
+- Right after a discard, a read may still differ from DRAM: a line can come back clean into L1
+  from L2 between the two steps. It is not dirty and never reaches DRAM.
+- Linux's workaround for Cortex-A9 erratum 764369 sets bit 0 of the SCU diagnostic register:
+  a maintenance operation by address on Inner Shareable memory, which is all of DRAM here, may
+  not reach its point of coherency. The vendor kernel enables it in all its configurations, but
+  writes the register directly, as `Scu::enable` does, and from Non-secure that write is
+  ignored. Only the other half, a `dsb` before the maintenance loops, is in effect. The tests
+  pass without the bit.
 
 ## SMP
 

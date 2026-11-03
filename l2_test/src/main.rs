@@ -1,6 +1,7 @@
 //! L2 cache test. Checks the MCT rate against the UART, measures memory speed at three
 //! working set sizes with the L2 cache off and on, checks that data written before the
-//! switch survives it, then keeps verifying memory under a 1 Hz timer interrupt.
+//! switch survives it, checks that dropping a range from the caches brings back what DRAM
+//! holds, then keeps verifying memory under a 1 Hz timer interrupt.
 
 #![no_std]
 #![no_main]
@@ -9,6 +10,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use exynos_4412_rs::drivers::gic::Gic;
 use exynos_4412_rs::drivers::l2c::L2c;
+use exynos_4412_rs::drivers::scu::Scu;
 use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::drivers::uart::Uart;
 use exynos_4412_rs::exceptions::ExceptionFrame;
@@ -30,6 +32,33 @@ const UART_LINES: u64 = 16;
 const UART_LINE_CHARS: u64 = 72;
 
 static BUFFER: [AtomicU32; WORDS_BEYOND] = [const { AtomicU32::new(0) }; WORDS_BEYOND];
+
+/// The range the cache drop tests cover: four times the L1 cache, so that of what the CPU writes
+/// last, most has gone on to the L2 cache and the rest is still in L1.
+const RANGE_BYTES: usize = 128 * 1024;
+const RANGE_WORDS: usize = RANGE_BYTES / 4;
+const LINE_WORDS: usize = mmu::DCACHE_LINE / 4;
+/// What DRAM holds, and what the CPU writes after, for word `index`.
+const fn old_word(index: usize) -> u32 {
+    0x0D0D_0000 ^ index as u32
+}
+const fn new_word(index: usize) -> u32 {
+    0xC0C0_0000 ^ index as u32
+}
+
+/// The range, between two guard lines that must not be touched.
+#[repr(C, align(32))]
+struct Guarded {
+    before: [AtomicU32; LINE_WORDS],
+    range: [AtomicU32; RANGE_WORDS],
+    after: [AtomicU32; LINE_WORDS],
+}
+
+static GUARDED: Guarded = Guarded {
+    before: [const { AtomicU32::new(0) }; LINE_WORDS],
+    range: [const { AtomicU32::new(0) }; RANGE_WORDS],
+    after: [const { AtomicU32::new(0) }; LINE_WORDS],
+};
 static TICKS: AtomicU32 = AtomicU32::new(0);
 
 #[unsafe(no_mangle)]
@@ -104,6 +133,139 @@ fn report_speed(mct: Mct, label: &str) {
     );
 }
 
+fn store_all(words: &[AtomicU32], value: fn(usize) -> u32) {
+    for (index, word) in words.iter().enumerate() {
+        word.store(value(index), Ordering::Relaxed);
+    }
+}
+
+/// How many words of `words` read `value` of their index.
+fn count_matching(words: &[AtomicU32], value: fn(usize) -> u32) -> usize {
+    words.iter().enumerate().filter(|(index, word)| word.load(Ordering::Relaxed) == value(*index)).count()
+}
+
+/// Rounds of each drop test: speculation and prefetch make a single run show little.
+const DROP_ROUNDS: u32 = 16;
+
+/// What a drop call must leave behind. Either may write what the CPU wrote out to DRAM before
+/// it returns, as the caches may on their own: before a device starts, that does no harm.
+/// The board does both (see README).
+#[derive(Clone, Copy, PartialEq)]
+enum Promise {
+    /// No dirty line: nothing reaches DRAM after it returns. Reads right after may differ
+    /// from DRAM, as a line can come back clean into L1 from L2 between the two steps.
+    NothingDirty,
+    /// That, and reads give what DRAM holds, right away.
+    ReadsFromDram,
+}
+
+/// The uncached address of a word of the test range.
+fn uncached_word(words: &[AtomicU32], index: usize) -> u32 {
+    let start = mmu::uncached(words.as_ptr() as usize).expect("test range outside the uncached view");
+    // SAFETY: `uncached` maps the address of a live static to the same DRAM, readable, aligned
+    // as the original, and `index` is within it. Reading changes nothing in caches or DRAM.
+    unsafe { core::ptr::read_volatile((start as *const u32).add(index)) }
+}
+
+/// How many words of `words` read differently through the caches than in DRAM.
+fn differ_from_dram(words: &[AtomicU32]) -> usize {
+    words
+        .iter()
+        .enumerate()
+        .filter(|(index, word)| word.load(Ordering::Relaxed) != uncached_word(words, *index))
+        .count()
+}
+
+/// How many words of `words` DRAM itself holds the old value for, read through
+/// [`mmu::DRAM_UNCACHED`], past both caches.
+fn dram_old(words: &[AtomicU32]) -> usize {
+    (0..words.len()).filter(|index| uncached_word(words, *index) == old_word(*index)).count()
+}
+
+/// Puts the old values in DRAM, writes the new ones over them in the caches only, then lets
+/// `drop` discard the range. DRAM is read through [`mmu::DRAM_UNCACHED`] before and after,
+/// and again after reading 2 MiB elsewhere, which pushes the range out of both caches: a dirty
+/// line left behind would then have reached DRAM. The range is read through the caches right
+/// after the drop and after the 2 MiB, and compared with DRAM. The guard lines on both sides must
+/// keep the new values throughout.
+fn drop_test(mct: Mct, name: &str, drop: fn(usize, usize), promise: Promise) {
+    let start = GUARDED.range.as_ptr() as usize;
+    let mut good_rounds = 0;
+    let mut written_before = 0;
+    let mut written_during = 0;
+    for round in 1..=DROP_ROUNDS {
+        // Dirty lines elsewhere fill the L2 cache first, so that it has to write them out while
+        // the range comes in: the first round of the first run was the only one to fail.
+        fill(WORDS_BEYOND, round);
+        store_all(&GUARDED.before, old_word);
+        store_all(&GUARDED.range, old_word);
+        store_all(&GUARDED.after, old_word);
+        mmu::clean_dcache_range(GUARDED.before.as_ptr() as usize, size_of::<Guarded>());
+        let dram_cleaned = dram_old(&GUARDED.range);
+        store_all(&GUARDED.before, new_word);
+        store_all(&GUARDED.range, new_word);
+        store_all(&GUARDED.after, new_word);
+        // Before the drop, DRAM should still hold every old value: the new ones are only in
+        // the caches. A line written out by the caches on their own shows here.
+        let dram_before = dram_old(&GUARDED.range);
+
+        let begin = mct.count();
+        drop(start, RANGE_BYTES);
+        let us = (mct.count() - begin) / u64::from(soc::MCT_CLOCK_HZ / 1_000_000);
+        let dram_after = dram_old(&GUARDED.range);
+
+        let differ_right_after = differ_from_dram(&GUARDED.range);
+        let mut sum = 0u32;
+        for word in &BUFFER {
+            sum = sum.wrapping_add(word.load(Ordering::Relaxed));
+        }
+        core::hint::black_box(sum);
+        // A dirty line left behind would have been written out by now.
+        let dram_final = dram_old(&GUARDED.range);
+        let differ_final = differ_from_dram(&GUARDED.range);
+        let guards = count_matching(&GUARDED.before, new_word) + count_matching(&GUARDED.after, new_word);
+
+        let good = dram_cleaned == RANGE_WORDS
+            && dram_final == dram_after
+            && differ_final == 0
+            && guards == 2 * LINE_WORDS
+            && (promise == Promise::NothingDirty || differ_right_after == 0);
+        if good {
+            good_rounds += 1;
+        }
+        written_before += RANGE_WORDS - dram_before;
+        written_during += dram_before - dram_after;
+        println!(
+            "{} {}: {} us; new words in DRAM before drop {}, after {}, after 2 MiB elsewhere {}; \
+             reads differing from DRAM right after {}, after 2 MiB {}; guard words {} of {}",
+            name,
+            round,
+            us,
+            RANGE_WORDS - dram_before,
+            RANGE_WORDS - dram_after,
+            RANGE_WORDS - dram_final,
+            differ_right_after,
+            differ_final,
+            guards,
+            2 * LINE_WORDS,
+        );
+    }
+    println!(
+        "{} of {} KiB: {} of {} rounds {}: {}; the caches wrote {} words out before it and {} during",
+        name,
+        RANGE_BYTES / 1024,
+        good_rounds,
+        DROP_ROUNDS,
+        match promise {
+            Promise::NothingDirty => "left nothing dirty",
+            Promise::ReadsFromDram => "left nothing dirty and read DRAM right away",
+        },
+        if good_rounds == DROP_ROUNDS { "OK" } else { "MISMATCH" },
+        written_before,
+        written_during,
+    );
+}
+
 fn report_l2(l2c: L2c) {
     println!(
         "L2: CTRL {:#x} AUX {:#010x} TAG {:#x} DATA {:#x} PREFETCH {:#010x} POWER {:#x}",
@@ -149,6 +311,12 @@ fn main(_args: BootArgs) -> ! {
     println!("Data written before L2 enable is correct");
 
     report_speed(mct, "L2 on ");
+
+    println!("L2 revision {:#04x} (0x08 is r3p2)", l2c.revision());
+    let scu = Scu::new();
+    println!("SCU diagnostic {:#010x}: 764369 workaround {}", scu.diagnostic(), scu.erratum_764369_workaround());
+    drop_test(mct, "Discard", mmu::discard_dcache_range, Promise::NothingDirty);
+    drop_test(mct, "Invalidate", mmu::invalidate_dcache_range, Promise::ReadsFromDram);
 
     let gic = Gic::new();
     gic.init();
