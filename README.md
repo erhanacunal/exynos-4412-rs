@@ -15,6 +15,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `gpio_test/`: GPIO pins and key interrupts test
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
+- `rtc_test/`: MAX77686 RTC test: reads the time, and sets it from a UART command
 - `mmc_test/`: eMMC read test, partition table, polled and DMA reads, no writes
 - `mmc_write_test/`: eMMC write test: writes the last 2 MiB of CACHE and restores them
 - `ext4_test/`: reads the ext4 file systems on the eMMC with the `ext4-view` crate, no writes
@@ -499,12 +500,27 @@ Other findings:
 `max77686::Rtc` reads the PMIC's real-time clock, which runs from the battery while the board is
 off. It answers at its own I2C address, `0x06` (`rtc-max77686.c:20`), so none of its registers can
 reach a regulator. A read sets `RBUDR` in `RTC_UPDATE0`, which copies the counters to the time
-registers, waits 16 ms, then reads the seven of them; this is the only write. Setting the time is
-not covered. `time::DateTime` converts between dates and seconds since 1970.
+registers, waits 16 ms, then reads the seven of them; this is the only write. `Rtc::set` follows
+`max77686_rtc_set_time`: the seven time registers in one write, then `UDR` in `RTC_UPDATE0`, then
+16 ms. It writes nothing unless the RTC is in binary 24-hour mode and the time is a valid one from
+2000 to 2099, the years the RTC holds. `time::DateTime` converts between dates and seconds since
+1970.
 
 Observed in `fat_test`: `RTC_CONTROL` `0x02`, binary and 24-hour mode as Linux left it, years
 from 2000. Two reads 1216 ms apart were 1 s apart. The time was UTC, a few minutes behind the
 host's clock at the moment the log was read, so Linux left the RTC in UTC.
+
+`rtc_test` reads the RTC and writes it only on a UART command, `set YYYY-MM-DD HH:MM:SS` in UTC.
+Observed:
+
+| Command | Result |
+|---|---|
+| Start | `2026-11-03 09:41:10 UTC` |
+| `set 2026-11-03 09:44:00` | Reads back 09:44:00, 0 s off (OK) |
+| `read`, 24 s later | 09:44:24 |
+| `set 2100-11-03 09:44:00` | `BadTime`, nothing written |
+| `set 1980-02-26 09:44:00` | `BadTime`, nothing written |
+| `set 2026-02-30 09:44:00` | Not a valid date, refused before the driver |
 
 ## Display
 

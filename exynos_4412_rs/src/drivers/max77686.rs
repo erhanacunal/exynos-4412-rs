@@ -1,5 +1,5 @@
 //! MAX77686 power management IC: the state of its LDOs, and turning them on and off; and its
-//! real-time clock, [`Rtc`], read only.
+//! real-time clock, [`Rtc`].
 //!
 //! Paths are relative to the Linux 5.15.198 tree. `max77686-regulator.c` is in
 //! `drivers/regulator/`, `max77686-private.h` in `include/linux/mfd/`.
@@ -77,6 +77,11 @@ pub enum Error {
     NoSuchBuck,
     /// The regulator cannot produce this voltage.
     BadVoltage,
+    /// The RTC is not in binary 24-hour mode, the only one [`Rtc::set`] writes. Holds
+    /// `RTC_CONTROL`.
+    RtcMode(u8),
+    /// A time the RTC cannot hold: not a valid date, or outside 2000 to 2099.
+    BadTime,
     /// The register holds something else after the write.
     ReadBack {
         /// The value written.
@@ -251,6 +256,8 @@ const RTC_UPDATE0: u8 = 0x04;
 const RTC_SEC: u8 = 0x07;
 /// rtc-max77686.c:36 `RTC_RBUDR_MASK`: copies the counters to the registers that are read.
 const RTC_RBUDR: u8 = 1 << 4;
+/// rtc-max77686.c:34 `RTC_UDR_MASK`: copies the time registers, once written, to the counters.
+const RTC_UDR: u8 = 1 << 0;
 /// rtc-max77686.c:193 `.delay`: how long that copy takes, in microseconds.
 const RTC_UPDATE_US: u64 = 16_000;
 /// rtc-max77686.c:27,29 `BCD_EN_MASK`, `MODEL24_MASK`, in `RTC_CONTROL`.
@@ -316,15 +323,54 @@ impl Rtc {
         Ok(value[0])
     }
 
+    /// Sets `RTC_UPDATE0` bits `bits`, keeping the others (`regmap_update_bits`), and waits
+    /// 16 ms for the copy they start.
+    fn update(&self, bits: u8, mct: Mct) -> Result<(), Error> {
+        let update = self.read_register(RTC_UPDATE0)?;
+        self.i2c.write(RTC_ADDRESS, &[RTC_UPDATE0, update | bits])?;
+        let wait = RTC_UPDATE_US * u64::from(soc::MCT_CLOCK_HZ / 1_000_000);
+        let begin = mct.count();
+        while mct.count() - begin < wait {}
+        Ok(())
+    }
+
+    /// Sets the time, as `max77686_rtc_set_time` does: the seven time registers in one write,
+    /// then `UDR` in `RTC_UPDATE0`, then 16 ms on `mct`. Every write goes to the RTC's own
+    /// address, and only to `RTC_UPDATE0` and the time registers. Refused unless the RTC is in
+    /// binary 24-hour mode, as Linux sets it, and the time is a valid one from 2000 to 2099.
+    /// The seconds start counting from the write: whatever fraction had passed is lost.
+    pub fn set(&self, time: DateTime, mct: Mct) -> Result<(), Error> {
+        if !time.is_valid() || !(2000..=2099).contains(&time.year) {
+            return Err(Error::BadTime);
+        }
+        let control = self.read_register(RTC_CONTROL)?;
+        if control & (RTC_BCD | RTC_24_HOUR) != RTC_24_HOUR {
+            return Err(Error::RtcMode(control));
+        }
+        // rtc-max77686.c:305-316 `max77686_rtc_tm_to_data`: one bit per weekday, Sunday bit 0;
+        // 1970-01-01 was a Thursday.
+        let weekday = (time.to_unix().div_euclid(86_400) + 4).rem_euclid(7) as u8;
+        self.i2c.write(
+            RTC_ADDRESS,
+            &[
+                RTC_SEC,
+                time.second,
+                time.minute,
+                time.hour,
+                1 << weekday,
+                time.month,
+                (time.year - 2000) as u8,
+                time.day,
+            ],
+        )?;
+        self.update(RTC_UDR, mct)
+    }
+
     /// Reads the time. The one write is to `RTC_UPDATE0`, which copies the counters to the
     /// registers read after it (`max77686_rtc_update`); then waits 16 ms on `mct`, which must
     /// be running.
     pub fn read(&self, mct: Mct) -> Result<RtcReading, Error> {
-        let update = self.read_register(RTC_UPDATE0)?;
-        self.i2c.write(RTC_ADDRESS, &[RTC_UPDATE0, update | RTC_RBUDR])?;
-        let wait = RTC_UPDATE_US * u64::from(soc::MCT_CLOCK_HZ / 1_000_000);
-        let begin = mct.count();
-        while mct.count() - begin < wait {}
+        self.update(RTC_RBUDR, mct)?;
         let control = self.read_register(RTC_CONTROL)?;
         let mut raw = [0; 7];
         self.i2c.write_read(RTC_ADDRESS, &[RTC_SEC], &mut raw)?;

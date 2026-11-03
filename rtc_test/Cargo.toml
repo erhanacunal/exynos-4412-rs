@@ -1,0 +1,9 @@
+[package]
+name = "rtc_test"
+version = "0.1.0"
+edition = "2024"
+description = "MAX77686 RTC test for exynos_4412_rs: reads the time, and sets it from a UART command"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }

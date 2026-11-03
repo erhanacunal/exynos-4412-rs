@@ -280,6 +280,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtc_test"
+version = "0.1.0"
+dependencies = [
+ "exynos_4412_rs",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
