@@ -22,6 +22,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `fat_test/`: FAT32 on CACHE with the `embedded-sdmmc` crate: formats it if needed, writes, reads and lists files
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `async_test/`: Embassy on all four cores: timers, tasks, and channels between the cores
+- `mmc_async_test/`: async eMMC: reads and writes awaited on the controller's interrupt, from CPU0 and CPU1
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 
 ## Build
@@ -834,7 +835,14 @@ through `embassy-sync` channels, signals and mutexes, which the critical section
   masks the UART's other interrupts: U-Boot leaves `UINTM` at 0, and the transmit interrupt,
   pending whenever the transmit FIFO is low, then came back on every return, 370000 times a
   second. Sending stays polled.
-- **Not yet present:** async eMMC and I2C, async sending, and preemptive threads.
+- **eMMC:** `Mmc::read_blocks_async` and `MmcWriter::write_async` run the same DMA transfers
+  as the polled calls, but await the controller's interrupt (GIC ID 109, to CPU0) for the end
+  of data. The handler disables it at the GIC and wakes the waiter, which arms it again. An
+  async mutex keeps one transfer at a time; the card's busy wait after a write is polled every
+  50 us with a timer. A transfer dropped part way, by a timeout for one, is let finish, polled,
+  before its DMA is stopped: the driver sends no `CMD12`, so a card stopped in the middle would
+  go on sending. `MmcWriter::write_async` refuses what `write` refuses.
+- **Not yet present:** async I2C, async sending, and preemptive threads.
 
 Test on the board: `make img APP=async_test`, same flashing step. Observed:
 
@@ -848,6 +856,17 @@ Test on the board: `make img APP=async_test`, same flashing step. Observed:
 | Console UART | `UCON` `0x3c5` from U-Boot, kept; `UFCON` `0x111`; `UINTM` `0xe` after setup |
 | `busy`: CPU0 runs no task for 3 s, nothing typed | 0 interrupts |
 | `busy` with 1753 bytes pasted meanwhile | All 1753 in the ring, in 884 interrupts, 0 dropped; echoed after |
+
+`make img APP=mmc_async_test` checks the eMMC side, with a task ticking every 1 ms on CPU0
+throughout. Observed:
+
+| Check | Result |
+|---|---|
+| 16 MiB of USERDATA read async, 2 MiB at a time | 240 ms reading, 69 MB/s, 16 interrupts; the ticker ran on |
+| The same read polled | 238 ms, 70 MB/s, same hash; the ticker stood still while each 2 MiB was read |
+| The same read async from a task on CPU1 | 238 ms, same hash |
+| A 1 MiB read dropped after 300 us, then read again | Timed out; the next one `Ok`, same hash as before |
+| The last 2 MiB of CACHE written async with a pattern, read back, then restored | 122 ms, 17 MB/s; read back equal; restored hash equal to the one kept |
 
 ## WiFi
 

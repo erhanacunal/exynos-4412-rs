@@ -717,6 +717,15 @@ impl Mmc {
     /// `dw_mci_idmac_start_dma`: the data registers, `FIFOTH`, the DMA interface, the
     /// descriptors, the IDMAC, then the command. Stops the IDMAC on every return.
     fn transfer_dma(&self, lba: u32, start: usize, length: usize, direction: Direction) -> Result<(), Error> {
+        let ring = self.prepare_dma(start, length)?;
+        let result = self.run_dma(lba, length, ring, direction);
+        stop_dma();
+        result
+    }
+
+    /// The data registers, `FIFOTH` and the descriptors for `length` bytes at `start`. Returns
+    /// the descriptor chain's address.
+    fn prepare_dma(&self, start: usize, length: usize) -> Result<usize, Error> {
         let regs = regs();
         wait_not_busy()?;
         self.reset_fifo()?;
@@ -743,13 +752,31 @@ impl Mmc {
         let ring = DESCRIPTORS_RING.0.as_ptr() as usize;
         let ring_bytes = (count * DESCRIPTOR_WORDS * 4).next_multiple_of(mmu::DCACHE_LINE);
         mmu::clean_dcache_range(ring, ring_bytes);
-
-        let result = self.run_dma(lba, length, ring, direction);
-        stop_dma();
-        result
+        Ok(ring)
     }
 
     fn run_dma(&self, lba: u32, length: usize, ring: usize, direction: Direction) -> Result<(), Error> {
+        let dma_done = self.start_dma(lba, length, ring, direction)?;
+        let mut polls = 0;
+        loop {
+            if let Some(result) = dma_progress(dma_done) {
+                result?;
+                break;
+            }
+            polls += 1;
+            if polls == POLL_LIMIT {
+                return Err(Error::Dma(dma_state()));
+            }
+        }
+        if length != BLOCK_SIZE {
+            wait_auto_stop()?;
+        }
+        Ok(())
+    }
+
+    /// The DMA interface, the IDMAC, then the command. Returns the `IDSTS` bit that says the
+    /// IDMAC is done.
+    fn start_dma(&self, lba: u32, length: usize, ring: usize, direction: Direction) -> Result<u32, Error> {
         let regs = regs();
         regs.ctrl.set(regs.ctrl.get() | CTRL_DMA_ENABLE);
         reset_ctrl(CTRL_DMA_RESET)?;
@@ -771,31 +798,7 @@ impl Mmc {
             Direction::Write => (Command::WriteMultipleBlock, IDSTS_TI),
         };
         self.command(command, lba)?;
-
-        // Done when the data has crossed: the controller's transfer is over, and the IDMAC has
-        // finished its side of it.
-        let mut polls = 0;
-        loop {
-            let status = regs.rintsts.get();
-            let dma = regs.idsts.get();
-            if status & DATA_ERRORS != 0 {
-                return Err(Error::Data(status));
-            }
-            if dma & IDSTS_ERRORS != 0 {
-                return Err(Error::Dma(dma_state()));
-            }
-            if status & INT_DATA_OVER != 0 && dma & dma_done != 0 {
-                break;
-            }
-            polls += 1;
-            if polls == POLL_LIMIT {
-                return Err(Error::Dma(dma_state()));
-            }
-        }
-        if !single {
-            wait_auto_stop()?;
-        }
-        Ok(())
+        Ok(dma_done)
     }
 
     /// Moves one FIFO word to `buffer` at `done`, dropping what does not fit. Returns the new
@@ -830,6 +833,21 @@ impl Mmc {
         buffer[done..done + count].copy_from_slice(&word[..count]);
         done + width
     }
+}
+
+/// One look at a DMA transfer: `None` while it runs. It is done when the data has crossed: the
+/// controller's transfer is over, and the IDMAC has finished its side of it, `dma_done`.
+fn dma_progress(dma_done: u32) -> Option<Result<(), Error>> {
+    let regs = regs();
+    let status = regs.rintsts.get();
+    let dma = regs.idsts.get();
+    if status & DATA_ERRORS != 0 {
+        return Some(Err(Error::Data(status)));
+    }
+    if dma & IDSTS_ERRORS != 0 {
+        return Some(Err(Error::Dma(dma_state())));
+    }
+    (status & INT_DATA_OVER != 0 && dma & dma_done != 0).then_some(Ok(()))
 }
 
 /// Which way a DMA transfer goes.
@@ -990,3 +1008,223 @@ fn stop_dma() {
 pub const fn card_state(status: u32) -> u32 {
     (status >> R1_STATE_SHIFT) & R1_STATE_MASK
 }
+
+/// Async DMA transfers: the wait for the data awaits the controller's interrupt, and the wait
+/// for a write to be programmed sleeps between looks. The rest is as in the polled ones.
+#[cfg(feature = "embassy")]
+mod asynch {
+    use core::future::poll_fn;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::Poll;
+
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::mutex::Mutex;
+    use embassy_sync::waitqueue::AtomicWaker;
+    use embassy_time::{Duration, Instant, Timer, with_timeout};
+    use tock_registers::interfaces::{Readable, Writeable};
+
+    use super::{
+        BLOCK_SIZE, CTRL_INT_ENABLE, DATA_ERRORS, DMA_CHUNK_BYTES, Direction, Error, INT_DATA_OVER, Mmc, MmcWriter,
+        POLL_LIMIT, PROTECTED_BLOCKS, R1_READY_FOR_DATA, R1_STATE_TRAN, STATUS_BUSY, WriteError, card_state, check_dma_buffer,
+        dma_progress, dma_state, regs, stop_dma, wait_auto_stop,
+    };
+    use crate::drivers::gic::Gic;
+    use crate::mmu;
+
+    /// `exynos4412.dtsi`, `mshc_0`: `GIC_SPI 77`.
+    pub const IRQ: u16 = 32 + 77;
+    /// Longer than any transfer of [`DMA_CHUNK_BYTES`] should take, or a write to program.
+    const TIMEOUT: Duration = Duration::from_millis(2000);
+    /// Between looks at a card that is programming.
+    const BUSY_POLL: Duration = Duration::from_micros(50);
+
+    static WAKER: AtomicWaker = AtomicWaker::new();
+    /// One async transfer at a time: the controller and the descriptor chain are one each.
+    static LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
+    static INTERRUPTS: AtomicU32 = AtomicU32::new(0);
+
+    /// Interrupts the async transfers have taken, since the start.
+    pub fn interrupts() -> u32 {
+        INTERRUPTS.load(Ordering::Relaxed)
+    }
+
+    /// Routes the controller's interrupt to CPU0, still disabled: each wait enables it. Call it
+    /// after [`Gic::init`], before the first async transfer.
+    pub fn init_interrupt() {
+        let gic = Gic::new();
+        gic.disable(IRQ);
+        gic.set_target(IRQ, 0);
+    }
+
+    /// Handles the controller's interrupt, if `id` is it: turns it off at the GIC, whatever
+    /// raised it, and wakes the waiting transfer, which looks at the status itself.
+    pub fn on_interrupt(id: u16) -> bool {
+        if id != IRQ {
+            return false;
+        }
+        Gic::new().disable(IRQ);
+        INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+        WAKER.wake();
+        true
+    }
+
+    /// The controller's interrupts off.
+    fn quiet() {
+        let regs = regs();
+        regs.ctrl.set(regs.ctrl.get() & !CTRL_INT_ENABLE);
+        regs.intmask.set(0);
+    }
+
+    /// A started transfer. Dropped before it is `finished`, as when its future is dropped, it
+    /// lets the transfer end, polled, before stopping the IDMAC: the buffer it borrowed may be
+    /// reused next, and stopping the engine mid-transfer would leave the card sending, with no
+    /// `CMD12` in this driver to stop it. That wait is at most one command, 1 MiB.
+    struct InFlight {
+        dma_done: u32,
+        multiple: bool,
+        finished: bool,
+    }
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            quiet();
+            Gic::new().disable(IRQ);
+            if !self.finished {
+                let mut polls = 0;
+                while dma_progress(self.dma_done).is_none() && polls < POLL_LIMIT {
+                    polls += 1;
+                }
+                if self.multiple {
+                    // Nowhere to report it: the next transfer finds the controller as it is.
+                    let _ = wait_auto_stop();
+                }
+            }
+            stop_dma();
+        }
+    }
+
+    /// Awaits the end of the data phase of a started transfer.
+    async fn wait_data(dma_done: u32) -> Result<(), Error> {
+        poll_fn(|cx| {
+            if let Some(result) = dma_progress(dma_done) {
+                return Poll::Ready(result);
+            }
+            WAKER.register(cx.waker());
+            // The data-over interrupt, until it has come; the IDMAC's, through IDINTEN, ends it.
+            let regs = regs();
+            let over = if regs.rintsts.get() & INT_DATA_OVER == 0 { INT_DATA_OVER } else { 0 };
+            regs.intmask.set(DATA_ERRORS | over);
+            regs.ctrl.set(regs.ctrl.get() | CTRL_INT_ENABLE);
+            Gic::new().enable(IRQ);
+            // What finished before the interrupt was on still ends the wait now.
+            match dma_progress(dma_done) {
+                Some(result) => Poll::Ready(result),
+                None => Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    impl Mmc {
+        /// One command's worth, as `transfer_dma`, with the data phase awaited.
+        async fn transfer_dma_async(
+            &self,
+            lba: u32,
+            start: usize,
+            length: usize,
+            direction: Direction,
+        ) -> Result<(), Error> {
+            let ring = self.prepare_dma(start, length)?;
+            let multiple = length != BLOCK_SIZE;
+            // Stops the IDMAC however this ends, as the polled path does.
+            let mut transfer = InFlight { dma_done: 0, multiple, finished: true };
+            transfer.dma_done = self.start_dma(lba, length, ring, direction)?;
+            transfer.finished = false;
+            let result = with_timeout(TIMEOUT, wait_data(transfer.dma_done)).await;
+            // Done, failed or timed out: nothing is left to wait for.
+            transfer.finished = true;
+            result.map_err(|_| Error::Dma(dma_state()))??;
+            quiet();
+            if multiple {
+                wait_auto_stop()?;
+            }
+            Ok(())
+        }
+
+        /// Reads as [`read_blocks_dma`](Self::read_blocks_dma) does, awaiting each MiB instead
+        /// of polling for it. One async transfer runs at a time, from any core; do not run
+        /// polled ones meanwhile. Needs [`init_interrupt`] and the `embassy` time driver.
+        ///
+        /// Dropping the future lets the command under way end, polled, then stops; `buffer`
+        /// then holds part of the data, and its cache may not show it.
+        pub async fn read_blocks_async(&self, lba: u32, buffer: &mut [u8]) -> Result<(), Error> {
+            check_dma_buffer(buffer)?;
+            let _lock = LOCK.lock().await;
+            let mut lba = lba;
+            for chunk in buffer.chunks_mut(DMA_CHUNK_BYTES) {
+                let (start, length) = (chunk.as_ptr() as usize, chunk.len());
+                mmu::discard_dcache_range(start, length);
+                let result = self.transfer_dma_async(lba, start, length, Direction::Read).await;
+                mmu::invalidate_dcache_range(start, length);
+                result?;
+                lba += (length / BLOCK_SIZE) as u32;
+            }
+            Ok(())
+        }
+
+        /// As `write_blocks_dma`, awaiting the data and sleeping while the card programs.
+        async fn write_blocks_async(&self, lba: u32, data: &[u8], rca: u16) -> Result<(), Error> {
+            check_dma_buffer(data)?;
+            if lba < PROTECTED_BLOCKS {
+                return Err(Error::Protected(lba));
+            }
+            let _lock = LOCK.lock().await;
+            let mut lba = lba;
+            for chunk in data.chunks(DMA_CHUNK_BYTES) {
+                mmu::clean_dcache_range(chunk.as_ptr() as usize, chunk.len());
+                self.transfer_dma_async(lba, chunk.as_ptr() as usize, chunk.len(), Direction::Write).await?;
+                self.wait_programmed_async(rca).await?;
+                lba += (chunk.len() / BLOCK_SIZE) as u32;
+            }
+            Ok(())
+        }
+
+        /// As `wait_programmed`, sleeping [`BUSY_POLL`] between looks.
+        async fn wait_programmed_async(&self, rca: u16) -> Result<(), Error> {
+            let deadline = Instant::now() + TIMEOUT;
+            while regs().status.get() & STATUS_BUSY != 0 {
+                if Instant::now() > deadline {
+                    return Err(Error::Timeout(regs().rintsts.get()));
+                }
+                Timer::after(BUSY_POLL).await;
+            }
+            loop {
+                let status = self.read_status(rca)?;
+                if status & R1_READY_FOR_DATA != 0 && card_state(status) == R1_STATE_TRAN {
+                    return Ok(());
+                }
+                if Instant::now() > deadline {
+                    return Err(Error::NotReady(status));
+                }
+                Timer::after(BUSY_POLL).await;
+            }
+        }
+    }
+
+    impl MmcWriter {
+        /// As [`write`](Self::write), with the transfer awaited: see [`Mmc::read_blocks_async`].
+        ///
+        /// Dropping the future lets the command under way end, polled, then stops: part of the
+        /// blocks are written.
+        pub async fn write_async(&self, block: u32, data: &[u8]) -> Result<(), WriteError> {
+            let blocks = (data.len() / BLOCK_SIZE) as u64;
+            if u64::from(block) + blocks > u64::from(self.partition.count) {
+                return Err(WriteError::OutOfRange);
+            }
+            self.card.write_blocks_async(self.partition.start + block, data, self.rca).await.map_err(WriteError::Card)
+        }
+    }
+}
+
+#[cfg(feature = "embassy")]
+pub use asynch::{IRQ, init_interrupt, interrupts, on_interrupt};

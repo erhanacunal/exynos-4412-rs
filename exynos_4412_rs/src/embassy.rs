@@ -7,7 +7,9 @@
 //! - the `embassy-time` driver: [`now`] counts the MCT's global counter at 1 MHz, and wake-ups
 //!   go through comparator 0, whose interrupt goes to CPU0;
 //! - [`run`], which starts an executor on the calling core;
-//! - [`uart::UartRx`], receiving on a UART with `await`.
+//! - [`uart::UartRx`], receiving on a UART with `await`;
+//! - async eMMC transfers: `Mmc::read_blocks_async` and `MmcWriter::write_async`, in
+//!   [`drivers::mmc`](crate::drivers::mmc).
 //!
 //! The executor is `embassy-executor`'s raw one, run here: it sleeps with `WFE`, and a wake-up
 //! from any core sends `DSB` then `SEV`, which wakes all of them. An interrupt also ends a
@@ -159,12 +161,12 @@ pub fn init() {
     gic.enable(soc::MCT_G0_IRQ);
 }
 
-/// Handles interrupt `id` if it is this module's, returning whether it was: the MCT's, and
-/// those of the UARTs that [`uart::UartRx`] reads. The application's `handle_irq` calls it
+/// Handles interrupt `id` if it is this module's, returning whether it was: the MCT's, those
+/// of the UARTs that [`uart::UartRx`] reads, and the eMMC controller's for its async transfers. The application's `handle_irq` calls it
 /// after acknowledging the interrupt, and ends it after.
 pub fn on_interrupt(id: u16) -> bool {
     if id != soc::MCT_G0_IRQ {
-        return uart::on_interrupt(id);
+        return uart::on_interrupt(id) || crate::drivers::mmc::on_interrupt(id);
     }
     Mct::new().clear_interrupt();
     critical_section::with(|cs| service_queue(&mut DRIVER.queue.borrow_ref_mut(cs)));
