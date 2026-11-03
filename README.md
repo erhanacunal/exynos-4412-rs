@@ -15,7 +15,8 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `gpio_test/`: GPIO pins and key interrupts test
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
-- `mmc_test/`: eMMC read test, partition table, no writes
+- `mmc_test/`: eMMC read test, partition table, polled and DMA reads, no writes
+- `ext4_test/`: reads the ext4 file systems on the eMMC with the `ext4-view` crate, no writes
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 
@@ -611,6 +612,46 @@ The first version left `IDINTEN` at 0. The card finished each read (`DATA_OVER`,
 
 `EXT_CSD` `BUS_WIDTH` reads 0 although the controller is in 8-bit mode, and data arrives without CRC
 errors. p10 is 28295104 blocks on the card, which ends it exactly where the extended partition ends.
+
+## ext4 (read-only)
+
+`ext4_test` reads the eMMC's ext4 file systems with the [`ext4-view`](https://crates.io/crates/ext4-view)
+crate, which only reads. The library stays without an allocator: the test brings its own
+8 MiB heap (`linked_list_allocator`, in `.bss`), and its image is 12 MiB, still below
+`0x41000000` and inside `mmu::DRAM_UNCACHED`.
+
+- **Reader:** `ext4-view` asks for bytes at any offset. The test's `Ext4Read` turns that into
+  `Mmc::read_blocks_dma` calls on the partition's blocks. Whole blocks into a buffer on a cache
+  line go straight there; anything else goes through a 64 KiB bounce buffer. Reads past the end
+  of the partition are refused.
+- **What is printed:** For each file system: the label, the UUID and how many entries the root
+  has. Beyond that:
+  - EFS (calibration data): nothing more.
+  - SYSTEM: not an Android system on this board. The root's names and a walk of the tree.
+  - USERDATA: the Linux root file system when Linux ran on this board. The root's names, the
+    distribution lines of `/etc/os-release`, a walk of the whole tree, and two timed reads of the
+    largest file under 4 MiB in `/usr`.
+
+  Walks print only counts, so no names from places such as `/home` appear.
+
+Test on the board: `make img APP=ext4_test`, same flashing step. Observed:
+
+| Check | Result |
+|---|---|
+| EFS | Loads in 0.8 ms (4 reads). No label; 5 entries in the root |
+| SYSTEM | Loads in 1 ms. No label; only `lost+found/` and `update/` |
+| USERDATA | Loads in 183 ms: 1728 reads, 108 KiB of group descriptors. Label `rootfs`; 20 entries in the root |
+| Heap | About 360 KiB per loaded file system, all freed after |
+| SYSTEM walk | 3 directories, no files, 1 ms |
+| USERDATA `os-release` | `Debian GNU/Linux 13 (trixie)` |
+| USERDATA walk | 4568 directories, 34517 files (2446 MiB), 3601 symbolic links, 8 others, in 36.6 s. 48038 reads of 32 KiB, 1.5 GiB in all, and 32.3 s of the time in the reader |
+| Largest file in `/usr`, read twice | `/usr/lib/udev/hwdb.d/20-pci-vendor-model.hwdb`, 4132304 bytes, about 39 MB/s, same hash both times |
+
+The walk is bound by reads. `ext4-view` keeps its own cache of only 256 KiB, read 32 KiB at a
+time. Asking for one inode reads 32 KiB, and the next directory's inodes have usually been
+evicted by then, so the walk reads 1.5 GiB to look at 43000 entries. A cache below it, in the
+reader, would keep what it evicts. A file read moves 32 KiB per call too, so it reaches about
+half of the 75 MB/s that DMA reaches with 2 MiB reads.
 
 ## WiFi
 
