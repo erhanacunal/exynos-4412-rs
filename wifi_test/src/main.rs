@@ -56,10 +56,33 @@ const VENDOR_BROADCOM: u16 = 0x02D0;
 const DEVICE_4334: u16 = 0x4334;
 /// Reads of the ID register in the reliability check.
 const ID_READS: u32 = 10_000;
-/// The SDIO data rate. Linux ran this board at [`bcm4334::BOARD_DATA_HZ`], 16 MHz; this tries
-/// the most that default speed allows. The firmware is read back after loading, so a bus that
-/// fails at this rate shows there too.
-const SDIO_HZ: u32 = bcm4334::DEFAULT_SPEED_MAX_HZ;
+/// The SDIO data rate, in MHz, from `WIFI_SDIO_MHZ` at build time. Linux ran this board at
+/// [`bcm4334::BOARD_DATA_HZ`], 16 MHz. Without the variable this asks for the most of high
+/// speed, 50 MHz. The firmware is read back after loading, so a bus that fails at the rate shows
+/// there too.
+const SDIO_MHZ: Option<&str> = option_env!("WIFI_SDIO_MHZ");
+const SDIO_HZ: u32 = match SDIO_MHZ {
+    Some(text) => parse_mhz(text) * 1_000_000,
+    None => bcm4334::HIGH_SPEED_MAX_HZ,
+};
+
+/// A whole number of MHz, or 0 for anything else.
+const fn parse_mhz(text: &str) -> u32 {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || bytes.len() > 3 {
+        return 0;
+    }
+    let mut value = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            return 0;
+        }
+        value = value * 10 + (bytes[i] - b'0') as u32;
+        i += 1;
+    }
+    value
+}
 const COUNTS_PER_MS: u64 = soc::MCT_CLOCK_HZ as u64 / 1000;
 /// Networks kept from a scan.
 const MAX_NETWORKS: usize = 48;
@@ -864,6 +887,11 @@ fn run(pmic: Max77686, mct: Mct) -> Result<(), Error> {
     bcm4334::power_on(pmic, mct)?;
 
     let host = Sdhci::new()?;
+    if SDIO_HZ == 0 {
+        println!("WIFI_SDIO_MHZ is a whole number of MHz (MISMATCH)");
+        return Ok(());
+    }
+    println!("Asking for {} Hz", SDIO_HZ);
     let (mut chip, rate) = Bcm4334::start(host, mct, SDIO_HZ)?;
     let card = chip.card();
     let info = card.info();
@@ -877,7 +905,11 @@ fn run(pmic: Max77686, mct: Mct) -> Result<(), Error> {
         ),
         None => println!("No manufacturer tuple in the CIS (MISMATCH)"),
     }
-    println!("4-bit bus at {} Hz", rate);
+    println!(
+        "4-bit bus at {} Hz, {} speed",
+        rate,
+        if SDIO_HZ > bcm4334::DEFAULT_SPEED_MAX_HZ { "high" } else { "default" },
+    );
 
     println!("\nFinding the chip's contents");
     let id = chip.attach()?;

@@ -6,7 +6,8 @@
 //!
 //! The network to join comes from `WIFI_SSID` and `WIFI_PASSWORD`, and goes into the image, so it
 //! must not be published. Without them the test stops after scanning. `WIFI_BAND`, `2.4` or `5`,
-//! limits joining to access points of that band.
+//! limits joining to access points of that band. `WIFI_SDIO_MHZ` sets the SDIO rate, 50 MHz
+//! without it.
 
 use std::{env, fs, path::PathBuf};
 
@@ -23,7 +24,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=WIFI_FIRMWARE_DIR");
 
-    for name in ["WIFI_SSID", "WIFI_PASSWORD", "WIFI_BAND"] {
+    for name in ["WIFI_SSID", "WIFI_PASSWORD", "WIFI_BAND", "WIFI_SDIO_MHZ"] {
         println!("cargo:rerun-if-env-changed={name}");
         if let Ok(value) = env::var(name) {
             println!("cargo:rustc-env={name}={value}");

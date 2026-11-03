@@ -66,6 +66,8 @@ const IDENTIFY_HZ: u32 = 400_000;
 pub const BOARD_DATA_HZ: u32 = 16_000_000;
 /// The highest rate of an SDIO card in default speed, which needs no switch to high speed.
 pub const DEFAULT_SPEED_MAX_HZ: u32 = 25_000_000;
+/// The highest rate of an SDIO card in high speed.
+pub const HIGH_SPEED_MAX_HZ: u32 = 50_000_000;
 
 /// The function with the backplane window and the chip's clock control.
 const FUNCTION1: u8 = 1;
@@ -515,8 +517,10 @@ pub enum Error {
     BadFrame(u32),
     /// A frame or message that does not fit.
     BadLength,
-    /// A data rate above what default speed allows, which is all this driver uses.
+    /// A data rate above what high speed allows.
     RateTooHigh(u32),
+    /// A data rate that needs high speed, which the card does not support.
+    NoHighSpeed,
     /// The firmware did not answer.
     NoAnswer,
     /// The firmware reports it has stopped: the mailbox value.
@@ -845,15 +849,18 @@ pub struct Timing {
 impl Bcm4334 {
     /// Starts the card on a chip just out of reset: the bus at 1 bit and 400 kHz, then at 4 bits
     /// and the highest rate the clock reaches that is not above `data_hz`, with function 1 on.
-    /// Returns also that rate. The card stays in default speed, so `data_hz` above
-    /// [`DEFAULT_SPEED_MAX_HZ`] is refused.
+    /// Returns also that rate. Above [`DEFAULT_SPEED_MAX_HZ`] the card is switched to high speed
+    /// first, and a card that cannot is an error. Above [`HIGH_SPEED_MAX_HZ`] is refused.
     pub fn start(host: Sdhci, mct: Mct, data_hz: u32) -> Result<(Self, u32), Error> {
-        if data_hz > DEFAULT_SPEED_MAX_HZ {
+        if data_hz > HIGH_SPEED_MAX_HZ {
             return Err(Error::RateTooHigh(data_hz));
         }
         host.set_clock(IDENTIFY_HZ)?;
         let card = Sdio::start(host, mct)?;
         card.set_bus_4bit()?;
+        if data_hz > DEFAULT_SPEED_MAX_HZ && !card.enable_high_speed()? {
+            return Err(Error::NoHighSpeed);
+        }
         let rate = host.set_clock(data_hz)?;
         card.set_block_size(FUNCTION1, FUNCTION1_BLOCK_SIZE)?;
         card.set_block_size(FUNCTION2, FUNCTION2_BLOCK_SIZE)?;

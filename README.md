@@ -563,8 +563,10 @@ handshake and `crypto` the algorithms it needs: the firmware of this board leave
   build time from the directory in `WIFI_FIRMWARE_DIR`, and stops before loading without it.
 - **Clock:** This controller has no usable divider of its own, so the card clock is `sclk_mmc3`,
   set in the CMU: 400 kHz to start, then the data rate `wifi_test` asks for. The board's DTS gives
-  16 MHz, with high speed off. `wifi_test` asks for 25 MHz, the most of default speed, so the card
-  needs no switch. From 25 MHz on, the controller samples with other feedback settings
+  16 MHz, with high speed off. `wifi_test` asks for 50 MHz, or for `WIFI_SDIO_MHZ` when it is set.
+  Above 25 MHz, the most of default speed, the card is switched to high speed first, with `EHS` in
+  its `CCCR`; a card that does not offer it is an error. The controller has no high speed setting
+  of its own (`sdhci-s3c.c:573`). From 25 MHz on, it samples with other feedback settings
   (`sdhci-s3c.c:290-291`).
 - **Transfer:** Polled through the buffer port, with no DMA and no interrupts.
 - **Flow control:** The firmware says in each frame it sends how many more it can take. While it
@@ -682,6 +684,27 @@ The same at 25 MHz with `WIFI_BAND=5`: channel 48, the firmware sending at 150 M
 - **Per frame:** A write takes about 60 us more than its bytes need on the bus, at 16 MHz
   (260 against 192 us) and at 25 MHz (185 against 123 us) alike: the commands, and the CPU at the
   buffer port. A faster clock shortens only the other part.
+
+At 50 MHz in high speed, again on channel 48 at 150 Mbit/s, to a computer on a cable to the
+router, so the frames cross the air once. The bus passed the same checks: 10000
+reads of the ID without error, and the firmware written and read back in 77 ms:
+
+| | Port 80, 8 KiB in flight | Port 8080, 64 KiB in flight |
+|---|---|---|
+| Until all acknowledged | 336 ms, 3047 KiB/s | 153 ms, 6692 KiB/s |
+| Sending frames | 87 ms, 769 frames | 86 ms, 721 frames |
+| Of that, bus writes | 83 ms, 108 us each | 82 ms, 114 us each |
+| Waiting for room in the firmware | 0 ms | 0 ms, told the stack 245 times |
+| Empty polls | 132 ms | 31 ms |
+| Receiving, and the rest | 12 and 104 ms | 2 and 32 ms |
+
+- **The bus:** Writes took 38 % less time than at 25 MHz, the speed went up by 5 %. Sending is now
+  57 % of the time: the bus no longer sets the speed, and DMA would not either.
+- **Past the bus:** The firmware ran out of room 245 times, so frames reach it faster than it
+  sends them on. The radio, or the firmware, now sets the speed, at about 56 Mbit/s of TCP over
+  a 150 Mbit/s link.
+- **Not yet shown:** Whether 50 MHz holds over long use. Linux ran this board at 16 MHz with
+  high speed off, for reasons not recorded.
 
 From another computer on the network, for example:
 

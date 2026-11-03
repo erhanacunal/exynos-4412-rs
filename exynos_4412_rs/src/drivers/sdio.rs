@@ -51,6 +51,15 @@ const BUS_WIDTH_4BIT: u8 = 0x02;
 const CCCR_CAPABILITIES: u32 = 0x08;
 /// sdio.h:119: three bytes, low first.
 const CCCR_CIS_POINTER: u32 = 0x09;
+/// sdio.h:71: the format revision, in the low half of `CCCR_REVISION`, from which the card has
+/// `CCCR_SPEED`.
+const CCCR_FORMAT_1_20: u8 = 2;
+/// sdio.h:134: bus speed select.
+const CCCR_SPEED: u32 = 0x13;
+/// sdio.h:136: the card supports high speed.
+const SPEED_SHS: u8 = 0x01;
+/// sdio.h:144: high speed on.
+const SPEED_EHS: u8 = 0x02;
 /// sdio.h:166: where the registers of function `f` start.
 const FBR_STRIDE: u32 = 0x100;
 /// sdio.h:187: two bytes, low first.
@@ -313,6 +322,23 @@ impl Sdio {
             address += 2 + u32::from(length);
         }
         Ok(None)
+    }
+
+    /// Switches the card to high speed, which allows up to 50 MHz, if it says it supports it.
+    /// Returns whether it is now on. Raise the clock only after: the card changes its timing at
+    /// once. This controller has no high speed setting of its own (`sdhci-s3c.c:573`
+    /// `SDHCI_QUIRK_NO_HISPD_BIT`).
+    pub fn enable_high_speed(&self) -> Result<bool, Error> {
+        let (revision, _) = self.revisions()?;
+        if revision & 0x0F < CCCR_FORMAT_1_20 {
+            return Ok(false);
+        }
+        let speed = self.read_byte(0, CCCR_SPEED)?;
+        if speed & SPEED_SHS == 0 {
+            return Ok(false);
+        }
+        self.write_byte(0, CCCR_SPEED, speed | SPEED_EHS)?;
+        Ok(self.read_byte(0, CCCR_SPEED)? & SPEED_EHS != 0)
     }
 
     /// Sets the data bus to 4 bits in the card, then in the controller.
