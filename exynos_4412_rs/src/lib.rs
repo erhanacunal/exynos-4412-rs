@@ -46,6 +46,7 @@ pub mod partition;
 #[cfg(feature = "panic-handler")]
 mod panic;
 pub mod soc;
+pub mod time;
 
 pub mod smp;
 pub mod wpa;

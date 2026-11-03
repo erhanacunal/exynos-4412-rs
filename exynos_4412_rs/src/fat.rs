@@ -30,8 +30,11 @@ pub use embedded_sdmmc;
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx, TimeSource, Timestamp};
 
 use crate::drivers::mmc::{self, BLOCK_SIZE, Mmc, MmcWriter, WriteError};
+use crate::drivers::timer::Mct;
 use crate::mmu;
 use crate::partition::Partition;
+use crate::soc;
+use crate::time::DateTime;
 
 /// The type byte of the made-up partition: FAT32 with LBA addressing.
 const TYPE_FAT32_LBA: u8 = 0x0C;
@@ -644,5 +647,50 @@ impl Default for FixedTime {
 impl TimeSource for FixedTime {
     fn get_timestamp(&self) -> Timestamp {
         self.0
+    }
+}
+
+/// A clock that starts at a given time and runs on the MCT, such as one read from the RTC at
+/// boot: [`max77686::Rtc`](crate::drivers::max77686::Rtc).
+///
+/// FAT stores local time, so `start` should be local time too.
+#[derive(Clone, Copy, Debug)]
+pub struct MctClock {
+    start: DateTime,
+    start_count: u64,
+    mct: Mct,
+}
+
+impl MctClock {
+    /// A clock that reads `start` now, on `mct`, which must be running.
+    pub fn new(start: DateTime, mct: Mct) -> Self {
+        Self { start, start_count: mct.count(), mct }
+    }
+
+    /// The time now.
+    pub fn now(&self) -> DateTime {
+        let elapsed = (self.mct.count() - self.start_count) / u64::from(soc::MCT_CLOCK_HZ);
+        self.start.add_seconds(elapsed as i64)
+    }
+}
+
+impl TimeSource for MctClock {
+    /// The time now. FAT timestamps cover 1980 to 2107, and `Timestamp` 1970 to 2225: a time
+    /// outside gives the nearest end of 1980 to 2107.
+    fn get_timestamp(&self) -> Timestamp {
+        let now = self.now();
+        let now = match now.year {
+            ..1980 => DateTime { year: 1980, month: 1, day: 1, hour: 0, minute: 0, second: 0 },
+            2108.. => DateTime { year: 2107, month: 12, day: 31, hour: 23, minute: 59, second: 58 },
+            _ => now,
+        };
+        Timestamp {
+            year_since_1970: (now.year - 1970) as u8,
+            zero_indexed_month: now.month - 1,
+            zero_indexed_day: now.day - 1,
+            hours: now.hour,
+            minutes: now.minute,
+            seconds: now.second,
+        }
     }
 }

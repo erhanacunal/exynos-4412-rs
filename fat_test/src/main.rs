@@ -1,8 +1,9 @@
 //! FAT32 test on CACHE (p8), through `exynos_4412_rs::fat` and `embedded_sdmmc`.
 //!
-//! If CACHE holds no FAT32 file system, formats it: this erases what it held. Then counts
+//! First reads the MAX77686 RTC twice, to check that it runs; files are stamped with its time,
+//! in UTC+3. If CACHE holds no FAT32 file system, formats it: this erases what it held. Then counts
 //! the boots in `BOOTS.TXT`, writes a 1 MiB file and reads it back, timed and hashed, deletes
-//! it, appends a line to `LOGS/BOOT.LOG` and lists the root directory.
+//! it, appends a line with the time to `LOGS/BOOT.LOG` and lists the root directory.
 //!
 //! Every write goes through an `MmcWriter` for CACHE, which refuses blocks outside it. The
 //! device caches writes; the test flushes it after each step and prints what reached the card.
@@ -11,14 +12,18 @@
 #![no_main]
 
 use core::cell::UnsafeCell;
+use core::fmt::Write;
 use core::ops::ControlFlow;
 
+use exynos_4412_rs::drivers::i2c::{Bus, I2c};
 use exynos_4412_rs::drivers::l2c::L2c;
+use exynos_4412_rs::drivers::max77686::Rtc;
 use exynos_4412_rs::drivers::mmc::{self, Mmc};
 use exynos_4412_rs::drivers::power::{self, BootMode, PowerKeys};
 use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::fat::embedded_sdmmc::{Directory, Mode, VolumeIdx, VolumeManager};
-use exynos_4412_rs::fat::{self, FixedTime, PartitionDevice, Stats};
+use exynos_4412_rs::fat::{self, MctClock, PartitionDevice, Stats};
+use exynos_4412_rs::time::DateTime;
 use exynos_4412_rs::{BootArgs, console, mmu, println, soc};
 
 exynos_4412_rs::entry!(main);
@@ -32,10 +37,24 @@ const CHUNK_BYTES: usize = 32 * 1024;
 const BIG_BYTES: u32 = 1024 * 1024;
 /// Guesses at the address U-Boot gave the card, which it does not report.
 const RCA_GUESSES: [u16; 2] = [1, 2];
+/// The RTC keeps UTC, as Linux left it (`hwclock` default); FAT keeps local time. Turkey is
+/// UTC+3 all year.
+const UTC_OFFSET_SECONDS: i64 = 3 * 3600;
+/// The clock's start when the RTC holds no valid time.
+const FALLBACK: DateTime = DateTime {
+    year: 2026,
+    month: 1,
+    day: 1,
+    hour: 0,
+    minute: 0,
+    second: 0,
+};
+/// The gap between the two RTC reads that check it runs.
+const RTC_GAP_MS: u64 = 1200;
 
 type FsError = fat::embedded_sdmmc::Error<fat::Error>;
-type Volumes = VolumeManager<PartitionDevice<'static>, FixedTime, 4, 4, 1>;
-type Root<'a> = Directory<'a, PartitionDevice<'static>, FixedTime, 4, 4, 1>;
+type Volumes = VolumeManager<PartitionDevice<'static>, MctClock, 4, 4, 1>;
+type Root<'a> = Directory<'a, PartitionDevice<'static>, MctClock, 4, 4, 1>;
 
 #[repr(C, align(32))]
 struct Buffer<const N: usize>(UnsafeCell<[u8; N]>);
@@ -240,8 +259,26 @@ fn big_file(
     Ok(())
 }
 
-/// Appends the boot number to `LOGS/BOOT.LOG`, making the directory if needed.
-fn append_log(root: &Root<'_>, boot: u32) -> Result<(), FsError> {
+/// A line of text in a fixed buffer.
+struct Line {
+    bytes: [u8; 64],
+    length: usize,
+}
+
+impl Write for Line {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let end = self.length + text.len();
+        self.bytes
+            .get_mut(self.length..end)
+            .ok_or(core::fmt::Error)?
+            .copy_from_slice(text.as_bytes());
+        self.length = end;
+        Ok(())
+    }
+}
+
+/// Appends the boot number and the time to `LOGS/BOOT.LOG`, making the directory if needed.
+fn append_log(root: &Root<'_>, boot: u32, now: DateTime) -> Result<(), FsError> {
     match root.make_dir_in_dir("LOGS") {
         Ok(()) => println!("LOGS: made"),
         Err(FsError::DirAlreadyExists) => {}
@@ -249,26 +286,28 @@ fn append_log(root: &Root<'_>, boot: u32) -> Result<(), FsError> {
     }
     let logs = root.open_dir("LOGS")?;
     let file = logs.open_file_in_dir("BOOT.LOG", Mode::ReadWriteCreateOrAppend)?;
-    let mut line = [0u8; 16];
-    let length = decimal_line(boot, &mut line);
-    file.write(b"boot ")?;
-    file.write(&line[..length])?;
+    let before = file.length();
+    let mut line = Line {
+        bytes: [0; 64],
+        length: 0,
+    };
+    // The buffer holds the longest line this can make.
+    let _ = write!(line, "boot {} at {}\r\n", boot, now);
+    file.write(&line.bytes[..line.length])?;
     let size = file.length();
     file.close()?;
     println!(
-        "LOGS/BOOT.LOG: {} bytes after the append (expected {})",
+        "LOGS/BOOT.LOG: {} + {} bytes = {} ({})",
+        before,
+        line.length,
         size,
-        boot_log_size(boot)
+        if size == before + line.length as u32 {
+            "OK"
+        } else {
+            "MISMATCH"
+        }
     );
     logs.close()
-}
-
-/// The size `LOGS/BOOT.LOG` has after `boots` appends: "boot <n>\r\n" each.
-fn boot_log_size(boots: u32) -> u32 {
-    let mut line = [0u8; 16];
-    (1..=boots)
-        .map(|boot| 5 + decimal_line(boot, &mut line) as u32)
-        .sum()
 }
 
 fn list(root: &Root<'_>) -> Result<(), FsError> {
@@ -282,7 +321,67 @@ fn list(root: &Root<'_>) -> Result<(), FsError> {
     })
 }
 
-fn run(card: Mmc, rca: u16, mct: Mct) -> Result<(), FsError> {
+/// Reads the RTC twice, `RTC_GAP_MS` apart, and returns a clock in local time that starts at
+/// the second reading, or at `FALLBACK` if the RTC fails or holds no valid time.
+fn start_clock(mct: Mct) -> MctClock {
+    let i2c = I2c::new(Bus::I2c0);
+    if let Err(error) = i2c.init(400_000, 100) {
+        println!("I2C ERROR {:x?}: clock starts at {}", error, FALLBACK);
+        return MctClock::new(FALLBACK, mct);
+    }
+    let rtc = Rtc::new(i2c);
+    let first = match rtc.read(mct) {
+        Ok(reading) => reading,
+        Err(error) => {
+            println!("RTC ERROR {:x?}: clock starts at {}", error, FALLBACK);
+            return MctClock::new(FALLBACK, mct);
+        }
+    };
+    let begin = mct.count();
+    while us(mct.count() - begin) < RTC_GAP_MS * 1000 {}
+    let second = rtc.read(mct);
+    let gap_ms = us(mct.count() - begin) / 1000;
+    println!(
+        "RTC: CONTROL {:#04x} ({}, {}), registers {:02x?}",
+        first.control,
+        if first.control & 1 != 0 {
+            "BCD"
+        } else {
+            "binary"
+        },
+        if first.control & 2 != 0 {
+            "24-hour"
+        } else {
+            "12-hour"
+        },
+        first.raw
+    );
+    let (Some(start), Ok(Some(then))) = (first.time(), second.map(|reading| reading.time())) else {
+        println!(
+            "RTC: no valid time ({:?}): clock starts at {}",
+            second, FALLBACK
+        );
+        return MctClock::new(FALLBACK, mct);
+    };
+    let ticked = then.to_unix() - start.to_unix();
+    println!(
+        "RTC: {} UTC, then {} after {} ms: {} s ({})",
+        start,
+        then,
+        gap_ms,
+        ticked,
+        if (1..=2).contains(&ticked) {
+            "OK"
+        } else {
+            "MISMATCH"
+        }
+    );
+    let local = then.add_seconds(UTC_OFFSET_SECONDS);
+    println!("Clock: local time {} (UTC+3)", local);
+    MctClock::new(local, mct)
+}
+
+fn run(card: Mmc, rca: u16, mct: Mct, clock: MctClock) -> Result<(), FsError> {
     // SAFETY: `run` is called once, and these are the only references to the buffers.
     let (buffer, chunk) = unsafe { (&mut *DEVICE.0.get(), &mut *CHUNK.0.get()) };
     let device = PartitionDevice::new(card, rca, TARGET, buffer)?;
@@ -316,14 +415,14 @@ fn run(card: Mmc, rca: u16, mct: Mct) -> Result<(), FsError> {
         }
     }
 
-    let volumes: Volumes = VolumeManager::new(device, FixedTime::default());
+    let volumes: Volumes = VolumeManager::new(device, clock);
     let volume = volumes.open_volume(VolumeIdx(0))?;
     let root = volume.open_root_dir()?;
     let boot = count_boot(&root)?;
     flush(&volumes)?;
     println!("BOOTS.TXT: this is boot {} with this file system", boot);
     big_file(&volumes, &root, mct, chunk)?;
-    append_log(&root, boot)?;
+    append_log(&root, boot, clock.now())?;
     flush(&volumes)?;
     list(&root)?;
     root.close()?;
@@ -370,8 +469,9 @@ fn main(_args: BootArgs) -> ! {
         );
         idle(mct);
     };
+    let clock = start_clock(mct);
     let begin = mct.count();
-    match run(card, rca, mct) {
+    match run(card, rca, mct, clock) {
         Ok(()) => println!("All steps done in {} ms", us(mct.count() - begin) / 1000),
         Err(error) => println!("ERROR {:x?}", error),
     }

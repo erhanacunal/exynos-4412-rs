@@ -494,6 +494,18 @@ Other findings:
 - **BUCK8 and BUCK9:** Their mode bits read 0. BUCK8 feeds the eMMC, which works, so 0 does not mean off
   for these two: Linux has GPIO control for them (`max77686-regulator.c:103-107`).
 
+### RTC
+
+`max77686::Rtc` reads the PMIC's real-time clock, which runs from the battery while the board is
+off. It answers at its own I2C address, `0x06` (`rtc-max77686.c:20`), so none of its registers can
+reach a regulator. A read sets `RBUDR` in `RTC_UPDATE0`, which copies the counters to the time
+registers, waits 16 ms, then reads the seven of them; this is the only write. Setting the time is
+not covered. `time::DateTime` converts between dates and seconds since 1970.
+
+Observed in `fat_test`: `RTC_CONTROL` `0x02`, binary and 24-hour mode as Linux left it, years
+from 2000. Two reads 1216 ms apart were 1 s apart. The time was UTC, a few minutes behind the
+host's clock at the moment the log was read, so Linux left the RTC in UTC.
+
 ## Display
 
 `drivers::display` drives the FIMD on the board's panel, `samsung,ltn101al03`, 1280x800 over LVDS:
@@ -725,8 +737,10 @@ CACHE (p8, 445 MiB) is the one used, since nothing on this board needs what it h
 - **Probe:** `PartitionDevice::probe` checks the boot sector itself before the crate reads it,
   so that another file system is not taken for FAT. Only a FAT32 boot sector whose geometry fits
   the partition passes.
-- **Names:** the crate makes 8.3 names only. It has no clock here: `FixedTime` stamps every file
-  2026-01-01 00:00.
+- **Names:** the crate makes 8.3 names only.
+- **Time:** `MctClock` starts at a given time and runs on the MCT. `fat_test` starts it from the
+  RTC, plus 3 hours: FAT keeps local time and Turkey is UTC+3 all year. If the RTC holds no valid
+  time, the clock starts at 2026-01-01 00:00. `FixedTime` stamps every file with one time.
 
 Test on the board: `make img APP=fat_test`, same flashing step. The first run formats CACHE.
 Each run then counts itself in `BOOTS.TXT`, writes `TEST.BIN` (1 MiB), reads it back, timed and
@@ -775,6 +789,10 @@ With read-ahead too, on the fourth boot:
 | Reads from the card, whole test | 2328 commands | 70 commands for 2240 blocks |
 | `LOGS/BOOT.LOG` | 24 bytes | 32 bytes, as expected |
 | Whole test | 426 ms | 213 ms |
+
+On the fifth boot, with the RTC: `BOOTS.TXT` stamped 2026-11-03 12:36:28, local time, and
+`LOGS/BOOT.LOG` got `boot 5 at 2026-11-03 12:36:28`. `LOGS`, made on the first boot, keeps
+2026-01-01.
 
 ## WiFi
 

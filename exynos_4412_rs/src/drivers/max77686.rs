@@ -1,4 +1,5 @@
-//! MAX77686 power management IC: the state of its LDOs, and turning them on and off.
+//! MAX77686 power management IC: the state of its LDOs, and turning them on and off; and its
+//! real-time clock, [`Rtc`], read only.
 //!
 //! Paths are relative to the Linux 5.15.198 tree. `max77686-regulator.c` is in
 //! `drivers/regulator/`, `max77686-private.h` in `include/linux/mfd/`.
@@ -22,6 +23,9 @@
 //! BUCK8, BUCK9 and LDO20 to LDO22 (`max77686-regulator.c:103-107`) is not.
 
 use crate::drivers::i2c::{self, I2c};
+use crate::drivers::timer::Mct;
+use crate::soc;
+use crate::time::DateTime;
 
 /// `exynos4412-mehmet.dts:962`, `max77686: pmic@9`, on `i2c_0`.
 pub const ADDRESS: u8 = 0x09;
@@ -233,4 +237,97 @@ fn voltage_select(ldo: u8, millivolts: u16) -> Option<u8> {
     let above_min = millivolts.checked_sub(MIN_MILLIVOLTS)?;
     let vsel = above_min / step;
     (above_min % step == 0 && vsel <= u16::from(VSEL_MASK)).then_some(vsel as u8)
+}
+
+/// `drivers/rtc/rtc-max77686.c:20` `MAX77686_I2C_ADDR_RTC`: the RTC answers at an address of its
+/// own on the PMIC's bus, so none of its registers can reach the regulators.
+pub const RTC_ADDRESS: u8 = 0x0C >> 1;
+/// max77686-private.h:145 `MAX77686_RTC_CONTROL`.
+const RTC_CONTROL: u8 = 0x03;
+/// max77686-private.h:146 `MAX77686_RTC_UPDATE0`.
+const RTC_UPDATE0: u8 = 0x04;
+/// max77686-private.h:149 `MAX77686_RTC_SEC`, the first of seven: seconds, minutes, hours,
+/// weekday, month, year, date.
+const RTC_SEC: u8 = 0x07;
+/// rtc-max77686.c:36 `RTC_RBUDR_MASK`: copies the counters to the registers that are read.
+const RTC_RBUDR: u8 = 1 << 4;
+/// rtc-max77686.c:193 `.delay`: how long that copy takes, in microseconds.
+const RTC_UPDATE_US: u64 = 16_000;
+/// rtc-max77686.c:27,29 `BCD_EN_MASK`, `MODEL24_MASK`, in `RTC_CONTROL`.
+const RTC_BCD: u8 = 1 << 0;
+const RTC_24_HOUR: u8 = 1 << 1;
+/// rtc-max77686.c:37 `HOUR_PM_MASK`.
+const RTC_PM: u8 = 1 << 6;
+/// rtc-max77686.c:194 `.mask`: bit 7 of each time register enables an alarm field instead.
+const RTC_MASK: u8 = 0x7F;
+
+/// The RTC registers as one read gave them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RtcReading {
+    /// `RTC_CONTROL`: bit 0 set for BCD, bit 1 set for 24-hour mode. Linux sets binary and
+    /// 24-hour mode (`max77686_rtc_init_reg`).
+    pub control: u8,
+    /// Seconds, minutes, hours, weekday, month, year, date: the order of the registers.
+    pub raw: [u8; 7],
+}
+
+impl RtcReading {
+    /// The time it holds, decoded as `max77686_rtc_data_to_tm` does, with years from 2000.
+    /// `None` if a field is out of range, as after the RTC lost its supply.
+    pub fn time(&self) -> Option<DateTime> {
+        let bcd = self.control & RTC_BCD != 0;
+        let field = |value: u8| {
+            let value = value & RTC_MASK;
+            if bcd { (value >> 4) * 10 + (value & 0xF) } else { value }
+        };
+        let [second, minute, hour, _weekday, month, year, date] = self.raw;
+        let hour = if self.control & RTC_24_HOUR != 0 {
+            field(hour & 0x3F)
+        } else {
+            field(hour & 0x1F) % 12 + if hour & RTC_PM != 0 { 12 } else { 0 }
+        };
+        let time = DateTime {
+            year: 2000 + u16::from(field(year)),
+            month: field(month & 0x1F),
+            day: field(date & 0x3F),
+            hour,
+            minute: field(minute),
+            second: field(second),
+        };
+        time.is_valid().then_some(time)
+    }
+}
+
+/// The MAX77686's real-time clock, which runs from the battery while the board is off.
+#[derive(Clone, Copy, Debug)]
+pub struct Rtc {
+    i2c: I2c,
+}
+
+impl Rtc {
+    /// Creates a handle on the bus the PMIC is on.
+    pub const fn new(i2c: I2c) -> Self {
+        Self { i2c }
+    }
+
+    fn read_register(&self, register: u8) -> Result<u8, Error> {
+        let mut value = [0];
+        self.i2c.write_read(RTC_ADDRESS, &[register], &mut value)?;
+        Ok(value[0])
+    }
+
+    /// Reads the time. The one write is to `RTC_UPDATE0`, which copies the counters to the
+    /// registers read after it (`max77686_rtc_update`); then waits 16 ms on `mct`, which must
+    /// be running.
+    pub fn read(&self, mct: Mct) -> Result<RtcReading, Error> {
+        let update = self.read_register(RTC_UPDATE0)?;
+        self.i2c.write(RTC_ADDRESS, &[RTC_UPDATE0, update | RTC_RBUDR])?;
+        let wait = RTC_UPDATE_US * u64::from(soc::MCT_CLOCK_HZ / 1_000_000);
+        let begin = mct.count();
+        while mct.count() - begin < wait {}
+        let control = self.read_register(RTC_CONTROL)?;
+        let mut raw = [0; 7];
+        self.i2c.write_read(RTC_ADDRESS, &[RTC_SEC], &mut raw)?;
+        Ok(RtcReading { control, raw })
+    }
 }
