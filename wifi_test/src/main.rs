@@ -23,6 +23,7 @@
 #![no_main]
 
 mod http;
+mod once;
 
 use exynos_4412_rs::crypto::{self, Hmac};
 use exynos_4412_rs::drivers::bcm4334::{
@@ -37,7 +38,9 @@ use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::drivers::wifi_device::{Stats, WifiDevice};
 use exynos_4412_rs::wpa::{self, Supplicant};
 use exynos_4412_rs::{BootArgs, console, mmu, print, println, soc};
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
+use smoltcp::iface::{
+    Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet, SocketStorage,
+};
 use smoltcp::phy::{Device, DeviceCapabilities};
 use smoltcp::socket::{dhcpv4, icmp, tcp};
 use smoltcp::time::{Duration, Instant};
@@ -128,11 +131,19 @@ const SERVERS: usize = 4;
 /// Each server's buffers. What it sends bounds the bytes in flight, so the speed of `/data`.
 const SERVER_RX: usize = 1024;
 const SERVER_TX: usize = 8192;
-/// A second port, with one connection that can have far more in flight, to compare against.
+/// A second port, with connections that can have far more in flight, to compare against. There
+/// are two: one stays open for a while after its response, until the client acknowledges the
+/// close, and the next request may come before that.
 const LARGE_PORT: u16 = 8080;
+const LARGE_SERVERS: usize = 2;
 const LARGE_TX: usize = 65536;
-/// Every server, the large one last.
-const ALL_SERVERS: usize = SERVERS + 1;
+/// What it can receive before the stack reads it: the window an upload gets.
+const LARGE_RX: usize = 32768;
+/// Every server, the large ones last.
+const ALL_SERVERS: usize = SERVERS + LARGE_SERVERS;
+/// The large servers' buffers, too large for the stack.
+static LARGE_RX_BUFFERS: [once::Once<LARGE_RX>; LARGE_SERVERS] = [const { once::Once::new() }; LARGE_SERVERS];
+static LARGE_TX_BUFFERS: [once::Once<LARGE_TX>; LARGE_SERVERS] = [const { once::Once::new() }; LARGE_SERVERS];
 const CLIENT_RX: usize = 2048;
 const CLIENT_TX: usize = 256;
 /// A TCP connection that hears nothing for this long is dropped.
@@ -429,6 +440,12 @@ fn report_transfer(before: &Mark, after: &Mark) {
         ms(a.chip.frame_reads - b.chip.frame_reads),
     );
     println!("  Stack told there was no room: {} times", a.refused - b.refused);
+    println!(
+        "  TCP data in: {} segments, {} after a gap, {} sent again",
+        a.tcp_segments - b.tcp_segments,
+        a.tcp_gaps - b.tcp_gaps,
+        a.tcp_repeats - b.tcp_repeats,
+    );
 }
 
 /// A connected station: its network stack and what it needs.
@@ -451,6 +468,8 @@ struct Station<'a> {
     address: Option<Ipv4Address>,
     /// HTTP requests answered.
     requests: u32,
+    /// Whether the HTTP servers run, which they do between frames too.
+    serving: bool,
 }
 
 impl Station<'_> {
@@ -462,7 +481,19 @@ impl Station<'_> {
     /// address, if there is one. An error is the connection ending.
     fn poll(&mut self) -> Result<Option<Ipv4Address>, Error> {
         let now = self.now();
-        self.interface.poll(now, &mut self.device, &mut self.sockets);
+        // What `Interface::poll` does, with the servers between the frames that come in. The
+        // acknowledgements go out after, so they offer the room that reading made. Otherwise a
+        // burst fills the receive buffer, the stack acknowledges it with a window nearly shut, and
+        // the sender holds back (seen with uploads: 1474 bytes offered of 32 KiB).
+        self.interface.poll_maintenance(now);
+        while self.interface.poll_ingress_single(now, &mut self.device, &mut self.sockets)
+            != PollIngressSingleResult::None
+        {
+            if self.serving {
+                self.serve_http();
+            }
+        }
+        while self.interface.poll_egress(now, &mut self.device, &mut self.sockets) != PollResult::None {}
         if let Some(failure) = self.device.failure() {
             return Err(failure);
         }
@@ -701,13 +732,13 @@ impl Station<'_> {
                         count: self.mct.count(),
                     };
                 }
-                http::Event::DataAcknowledged => {
+                http::Event::DataAcknowledged | http::Event::UploadReceived => {
                     let now = Mark {
                         stats: self.device.stats(),
                         count: self.mct.count(),
                     };
+                    // Not the link too: asking the firmware loses the frames that come meanwhile.
                     report_transfer(mark, &now);
-                    report_link(self.device.chip());
                 }
             }
         }
@@ -718,20 +749,23 @@ impl Station<'_> {
     fn serve(&mut self) -> Result<(), Error> {
         print!("\nStaying connected, answering pings");
         match self.address {
-            Some(address) => println!(
-                " and HTTP: http://{}/ and http://{}/data, and with {} KiB in flight http://{}:{}/data",
-                address,
-                address,
-                LARGE_TX / 1024,
-                address,
-                LARGE_PORT,
-            ),
+            Some(address) => {
+                println!(" and HTTP: http://{}/ and http://{}/data", address, address);
+                println!(
+                    "With {} KiB in flight, {} at once: http://{}:{}/data, and POST to /upload there",
+                    LARGE_TX / 1024,
+                    LARGE_SERVERS,
+                    address,
+                    LARGE_PORT,
+                );
+            }
             None => println!(" and HTTP on ports {} and {}", HTTP_PORT, LARGE_PORT),
         }
         println!("UART: r restart, f restart into fastboot");
         let uart = console::uart();
         let mut keys = PowerKeys::new();
         let mut reported = self.device.echo_requests();
+        self.serving = true;
         loop {
             self.poll()?;
             self.serve_http();
@@ -822,15 +856,20 @@ fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8;
 
     let mut server_rx = [[0; SERVER_RX]; SERVERS];
     let mut server_tx = [[0; SERVER_TX]; SERVERS];
-    let mut large_rx = [0; SERVER_RX];
-    let mut large_tx = [0; LARGE_TX];
     let mut handles = [SocketHandle::default(); ALL_SERVERS];
     for ((handle, rx), tx) in handles.iter_mut().zip(&mut server_rx).zip(&mut server_tx) {
         *handle = sockets.add(tcp_socket(&mut rx[..], &mut tx[..]));
     }
-    handles[SERVERS] = sockets.add(tcp_socket(&mut large_rx[..], &mut large_tx[..]));
+    let large = handles[SERVERS..].iter_mut().zip(&LARGE_RX_BUFFERS).zip(&LARGE_TX_BUFFERS);
+    for ((handle, rx), tx) in large {
+        let (Some(rx), Some(tx)) = (rx.take(), tx.take()) else {
+            println!("The large servers' buffers are taken already (MISMATCH)");
+            return Ok(());
+        };
+        *handle = sockets.add(tcp_socket(&mut rx[..], &mut tx[..]));
+    }
     let mut ports = [HTTP_PORT; ALL_SERVERS];
-    ports[SERVERS] = LARGE_PORT;
+    ports[SERVERS..].fill(LARGE_PORT);
     let mut servers_at = handles.iter().zip(ports);
     let servers = core::array::from_fn(|_| match servers_at.next() {
         Some((&handle, port)) => http::Server::new(handle, port),
@@ -853,6 +892,7 @@ fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8;
         gateway: None,
         address: None,
         requests: 0,
+        serving: false,
     };
 
     println!("\nGetting an address");

@@ -1,12 +1,15 @@
 //! A small HTTP/1.0 server, one connection per `smoltcp` TCP socket.
 //!
 //! `/` is a plain text page about the station, and `/data` is [`DATA_BYTES`] of text, to measure
-//! how fast TCP sends. Each response closes its connection. The client is left to close first, so
-//! that the 10 s wait after a close falls on its side and the socket can listen again at once.
+//! how fast TCP sends. A `POST` to `/upload` measures receiving: the answer gives the bytes, the
+//! time and the SHA-1 of what came, for the client to compare. Each response closes its
+//! connection. The client is left to close first, so that the 10 s wait after a close falls on its
+//! side and the socket can listen again at once.
 
 use core::fmt::{self, Write};
 
-use exynos_4412_rs::println;
+use exynos_4412_rs::crypto::Sha1;
+use exynos_4412_rs::{print, println};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::{self, State};
 use smoltcp::wire::Ipv4Address;
@@ -19,7 +22,10 @@ pub enum Event {
     Answered,
     /// All of `/data` was acknowledged.
     DataAcknowledged,
+    /// All of an upload came.
+    UploadReceived,
 }
+
 /// Bytes that `/data` sends.
 pub const DATA_BYTES: u32 = 1 << 20;
 /// Bytes of a request that are kept. Only its first line is used.
@@ -30,6 +36,10 @@ const HEAD_MAX: usize = 1024;
 const REQUEST_TIMEOUT_MS: u64 = 5_000;
 /// How long the client gets to close, once it has everything.
 const LINGER_MS: u64 = 5_000;
+/// The most an upload may send.
+const UPLOAD_MAX: u32 = 64 << 20;
+/// What a client that waits before sending a body is told.
+const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 /// What `/data` repeats: 64 bytes, a line of text.
 const LINE: &[u8; 64] = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.\n";
 
@@ -85,6 +95,8 @@ impl fmt::Display for Ascii<'_> {
 enum Phase {
     /// Listening, or reading a request.
     Request,
+    /// Reading the body of an upload.
+    Receiving,
     /// Queueing the response.
     Sending,
     /// All of the response is queued: waiting for it to be acknowledged, then for the client to
@@ -108,6 +120,9 @@ pub struct Server {
     /// When the request was answered, in ms.
     answered_ms: u64,
     acknowledged: bool,
+    upload_left: u32,
+    upload_total: u32,
+    upload_hash: Sha1,
 }
 
 impl Server {
@@ -126,6 +141,9 @@ impl Server {
             data_total: 0,
             answered_ms: 0,
             acknowledged: false,
+            upload_left: 0,
+            upload_total: 0,
+            upload_hash: Sha1::new(),
         }
     }
 
@@ -142,6 +160,9 @@ impl Server {
         self.data_left = 0;
         self.data_total = 0;
         self.acknowledged = false;
+        self.upload_left = 0;
+        self.upload_total = 0;
+        self.upload_hash = Sha1::new();
     }
 
     /// Does what the connection needs now.
@@ -160,6 +181,7 @@ impl Server {
                     Event::Nothing
                 }
             }
+            Phase::Receiving => self.receive_upload(socket, now_ms),
             Phase::Sending => {
                 self.send(socket, now_ms);
                 Event::Nothing
@@ -179,7 +201,8 @@ impl Server {
             self.request_length += count;
         }
         let request = &self.request[..self.request_length];
-        let complete = request.windows(4).any(|end| end == b"\r\n\r\n") || request.len() == REQUEST_MAX;
+        let head_end = request.windows(4).position(|end| end == b"\r\n\r\n").map(|at| at + 4);
+        let complete = head_end.is_some() || request.len() == REQUEST_MAX;
         if !complete {
             if socket.state() == State::CloseWait {
                 // The client is done, without a whole request.
@@ -213,14 +236,95 @@ impl Server {
                 self.data_left = DATA_BYTES;
                 self.data_total = DATA_BYTES;
             }
-            (b"GET", _) => self.write_error("404 Not Found", "Not found. Try / or /data\n"),
+            (b"POST", b"/upload") => {
+                let head_end = head_end.unwrap_or(self.request_length);
+                let headers = &self.request[..head_end];
+                match header(headers, b"content-length").and_then(parse_u32) {
+                    None => self.write_error("411 Length Required", "Send a Content-Length\n"),
+                    Some(length) if length > UPLOAD_MAX => {
+                        self.write_error("413 Content Too Large", "At most 64 MiB\n");
+                    }
+                    Some(length) => {
+                        let expect = header(headers, b"expect");
+                        if expect.is_some_and(|value| value.eq_ignore_ascii_case(b"100-continue")) {
+                            // Nothing is queued yet, so this fits.
+                            let _ = socket.send_slice(CONTINUE);
+                        }
+                        self.upload_total = length;
+                        self.upload_left = length;
+                        self.upload_hash = Sha1::new();
+                        // Some of the body may have come with the head.
+                        let early = (self.request_length - head_end).min(length as usize);
+                        self.upload_hash.update(&self.request[head_end..head_end + early]);
+                        self.upload_left -= early as u32;
+                        self.phase = Phase::Receiving;
+                        self.answered_ms = now_ms;
+                        self.receive_upload(socket, now_ms);
+                        return true;
+                    }
+                }
+            }
+            (b"GET", _) => self.write_error("404 Not Found", "Not found. Try / or /data, or POST to /upload\n"),
             (_, b"") => self.write_error("400 Bad Request", "Bad request\n"),
-            _ => self.write_error("405 Method Not Allowed", "Only GET\n"),
+            _ => self.write_error("405 Method Not Allowed", "Only GET, and POST to /upload\n"),
         }
         self.phase = Phase::Sending;
         self.answered_ms = now_ms;
         self.send(socket, now_ms);
         true
+    }
+
+    fn receive_upload(&mut self, socket: &mut tcp::Socket, now_ms: u64) -> Event {
+        while self.upload_left != 0 {
+            let left = self.upload_left as usize;
+            let hash = &mut self.upload_hash;
+            let count = socket
+                .recv(|bytes| {
+                    let count = bytes.len().min(left);
+                    hash.update(&bytes[..count]);
+                    (count, count)
+                })
+                .unwrap_or(0);
+            if count == 0 {
+                break;
+            }
+            self.upload_left -= count as u32;
+        }
+        if self.upload_left != 0 {
+            if !socket.may_recv() {
+                println!(
+                    "HTTP: upload ended after {} of {} bytes (MISMATCH)",
+                    self.upload_total - self.upload_left,
+                    self.upload_total,
+                );
+                socket.close();
+                self.phase = Phase::Linger;
+            }
+            return Event::Nothing;
+        }
+
+        let digest = core::mem::replace(&mut self.upload_hash, Sha1::new()).finish();
+        let ms = (now_ms - self.answered_ms).max(1);
+        let mut body = Text::<160>::new();
+        let _ = writeln!(
+            body,
+            "Received {} bytes in {} ms, {} KiB/s",
+            self.upload_total,
+            ms,
+            u64::from(self.upload_total) * 1000 / 1024 / ms,
+        );
+        let _ = body.write_str("SHA-1 ");
+        for byte in digest {
+            let _ = write!(body, "{:02x}", byte);
+        }
+        let _ = body.write_str("\n");
+        let text = core::str::from_utf8(body.as_bytes()).unwrap_or("");
+        print!("HTTP: {}", text);
+        let _ = self.write_head("200 OK", "text/plain; charset=utf-8", body.length as u32);
+        let _ = self.head.write_str(text);
+        self.phase = Phase::Sending;
+        self.send(socket, now_ms);
+        Event::UploadReceived
     }
 
     fn write_head(&mut self, status: &str, content_type: &str, length: u32) -> fmt::Result {
@@ -297,6 +401,31 @@ impl Server {
         }
         event
     }
+}
+
+/// The value of a header of the request, without the spaces around it. `name` is lower case.
+fn header<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    head.split(|&byte| byte == b'\n').skip(1).find_map(|line| {
+        let colon = line.iter().position(|&byte| byte == b':')?;
+        if !line[..colon].eq_ignore_ascii_case(name) {
+            return None;
+        }
+        Some(line[colon + 1..].trim_ascii())
+    })
+}
+
+fn parse_u32(text: &[u8]) -> Option<u32> {
+    if text.is_empty() || text.len() > 10 {
+        return None;
+    }
+    let mut value: u32 = 0;
+    for &byte in text {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    Some(value)
 }
 
 fn write_status(out: &mut impl Write, status: &Status) -> fmt::Result {

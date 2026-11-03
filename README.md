@@ -624,12 +624,46 @@ TCP, both ways:
   no whole request in 5 s is dropped, as browsers open some ahead of time.
 - **Memory:** The buffers are on the stack: 8 KiB to send and 1 KiB to receive per server
   connection. The 8 KiB bounds the bytes in flight, and so the speed of `/data`.
-- **Second port:** Port 8080 takes one connection, with 64 KiB to send, to compare against.
+- **Second port:** Port 8080 takes two connections, each with 64 KiB to send and 32 KiB to
+  receive, to compare against. With one, a request that came while the last connection was still
+  closing was refused. Their buffers are in `.bss`, the rest on the stack.
+- **Upload:** A `POST` to `/upload`, of up to 64 MiB with a `Content-Length`, is read and hashed.
+  The answer, also in the serial log, gives the bytes, the time and their SHA-1. `curl` asks
+  first with `Expect: 100-continue`, and gets its answer.
+- **Checking it all:** `wifi_test/soak.sh <address> [rounds] [port]` downloads `/data` and
+  uploads 1 MiB of new random bytes each round, 100 rounds on port 8080 by default, and compares
+  the SHA-1 of each with what it should be. It needs `curl`, `sha1sum` and `head`.
+
+`soak.sh` on the board, at 50 MHz on channel 48, to a computer on a cable to the router:
+
+| | Result |
+|---|---|
+| 100 downloads of 1 MiB | All with the right SHA-1. 6191 to 8939 KiB/s, half above 8626 |
+| 100 uploads of 1 MiB | All with the right SHA-1. 781 to 1053 KiB/s, half above 967 |
+| Serial log | No error |
+| TCP data that came in | No segment after a gap, none sent again |
+
+The first run had one connection on port 8080, and 158 of its 200 transfers were refused at once,
+for the reason above; none of those that ran went wrong.
+
+- **Uploads:** Nothing was lost, and the board waited for data about half the time. The sender
+  said why (`ss -ti`): it was limited by the receive window 100 % of the time, which the board
+  offered as 1474 bytes of its 32 KiB, and it halved its segments to fit. `Interface::poll`
+  takes in every frame that is waiting before it sends the acknowledgements, and the HTTP
+  server reads only after. A burst so filled the buffer, and was acknowledged with the window
+  nearly shut. `wifi_test` now takes frames in one at a time, lets the servers read after each,
+  and sends the acknowledgements last. On the development machine, over `smoltcp`'s loopback with
+  the same buffers, the window offered went from alternating between 32768 and 648 to 32768
+  throughout. Not yet measured on the board.
 - **Where the time goes:** When `/data` is all acknowledged, the log splits the time since the
   request into sending frames, receiving them, polling the chip for nothing, and the rest (the
   stack, HTTP and the console). It gives the frames each way, the time each took, how much of
   sending was bus writes and waiting for room in the firmware, and how often the stack was told
-  there was no room. Other traffic in that time counts too, so test one transfer at a time.
+  there was no room. It also counts the TCP segments with data that came in, and of those the
+  ones that start past where the last ended (something was lost or late) and the ones that start
+  before (data sent again). Other traffic in that time counts too, so test one transfer at a time.
+  The rate and the signal are asked only after joining: the firmware's answer would cost the
+  frames that come meanwhile.
 
 Measured on the board, 1 MiB of `/data` to `curl` each, with the bus at 16 MHz. The access point's
 band was not recorded:

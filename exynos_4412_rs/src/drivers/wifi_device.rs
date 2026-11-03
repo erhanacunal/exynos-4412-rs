@@ -6,7 +6,9 @@
 
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetFrame, EthernetProtocol, Icmpv4Message, Icmpv4Packet, IpProtocol, Ipv4Packet};
+use smoltcp::wire::{
+    EthernetFrame, EthernetProtocol, Icmpv4Message, Icmpv4Packet, IpProtocol, Ipv4Packet, TcpPacket,
+};
 
 use super::bcm4334::{Activity, Bcm4334, Error, Timing};
 use super::timer::Mct;
@@ -35,6 +37,13 @@ pub struct Stats {
     pub empty_poll_time: u64,
     /// Times the stack was told it cannot send, as the firmware had no room.
     pub refused: u32,
+    /// TCP segments with data that came for this station.
+    pub tcp_segments: u32,
+    /// Of those, the ones that start past where the last one of their connection ended: something
+    /// between was lost, or comes late. Only the latest connection is followed.
+    pub tcp_gaps: u32,
+    /// Of those, the ones that start before where the last one ended: data sent again.
+    pub tcp_repeats: u32,
     /// The chip's own share of the times above.
     pub chip: Timing,
 }
@@ -50,13 +59,27 @@ pub struct WifiDevice<'a> {
     failure: Option<Error>,
     echo_requests: u32,
     stats: Stats,
+    flow: Option<Flow>,
+}
+
+/// Where the TCP data of a connection that came in last should go on.
+#[derive(Clone, Copy)]
+struct Flow {
+    /// The sender's address and port, and this station's port.
+    key: (u32, u16, u16),
+    next: u32,
 }
 
 impl<'a> WifiDevice<'a> {
     /// Takes a chip that [`Bcm4334::connect`] has joined to a network, and the handshake state
     /// that did it. `report` hears of what happens to the connection.
     /// `mct` times what it does: see [`stats`](Self::stats).
-    pub const fn new(chip: &'a mut Bcm4334, supplicant: &'a mut Supplicant, report: fn(Activity), mct: Mct) -> Self {
+    pub const fn new(
+        chip: &'a mut Bcm4334,
+        supplicant: &'a mut Supplicant,
+        report: fn(Activity),
+        mct: Mct,
+    ) -> Self {
         Self {
             chip,
             supplicant,
@@ -66,6 +89,7 @@ impl<'a> WifiDevice<'a> {
             sent: [0; FRAME_MAX],
             failure: None,
             echo_requests: 0,
+            flow: None,
             stats: Stats {
                 sent: 0,
                 sent_bytes: 0,
@@ -75,6 +99,9 @@ impl<'a> WifiDevice<'a> {
                 empty_polls: 0,
                 empty_poll_time: 0,
                 refused: 0,
+                tcp_segments: 0,
+                tcp_gaps: 0,
+                tcp_repeats: 0,
                 chip: Timing {
                     frame_writes: 0,
                     frame_reads: 0,
@@ -125,6 +152,52 @@ fn is_echo_request(frame: &[u8]) -> bool {
         return false;
     }
     Icmpv4Packet::new_checked(ip.payload()).is_ok_and(|icmp| icmp.msg_type() == Icmpv4Message::EchoRequest)
+}
+
+/// The connection, first byte and length of the data of a TCP segment sent to this station
+/// alone, if the frame is one.
+fn tcp_data(frame: &[u8]) -> Option<((u32, u16, u16), u32, u32)> {
+    let ethernet = EthernetFrame::new_checked(frame).ok()?;
+    if ethernet.ethertype() != EthernetProtocol::Ipv4 || !ethernet.dst_addr().is_unicast() {
+        return None;
+    }
+    let ip = Ipv4Packet::new_checked(ethernet.payload()).ok()?;
+    if ip.next_header() != IpProtocol::Tcp {
+        return None;
+    }
+    let tcp = TcpPacket::new_checked(ip.payload()).ok()?;
+    let length = tcp.payload().len() as u32;
+    if length == 0 {
+        return None;
+    }
+    let key = (u32::from_be_bytes(ip.src_addr().octets()), tcp.src_port(), tcp.dst_port());
+    Some((key, tcp.seq_number().0 as u32, length))
+}
+
+/// Counts a segment of TCP data against what its connection sent before.
+fn follow(flow: &mut Option<Flow>, stats: &mut Stats, frame: &[u8]) {
+    let Some((key, start, length)) = tcp_data(frame) else {
+        return;
+    };
+    stats.tcp_segments += 1;
+    let end = start.wrapping_add(length);
+    let next = match *flow {
+        Some(known) if known.key == key => {
+            // Sequence numbers wrap: the sign of the difference says which comes first.
+            let ahead = start.wrapping_sub(known.next) as i32;
+            if ahead > 0 {
+                stats.tcp_gaps += 1;
+                end
+            } else if ahead < 0 {
+                stats.tcp_repeats += 1;
+                if (end.wrapping_sub(known.next) as i32) > 0 { end } else { known.next }
+            } else {
+                end
+            }
+        }
+        _ => end,
+    };
+    *flow = Some(Flow { key, next });
 }
 
 /// Lets `smoltcp` read a frame.
@@ -206,6 +279,7 @@ impl Device for WifiDevice<'_> {
         if is_echo_request(frame) {
             self.echo_requests += 1;
         }
+        follow(&mut self.flow, &mut self.stats, frame);
         let transmit = TxToken {
             chip: self.chip,
             buffer: &mut self.sent,
