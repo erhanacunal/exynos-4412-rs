@@ -36,6 +36,8 @@ pub mod console;
 pub mod cpu;
 pub mod crypto;
 pub mod drivers;
+#[cfg(feature = "embassy")]
+pub mod embassy;
 pub mod exceptions;
 #[cfg(feature = "fat")]
 pub mod fat;

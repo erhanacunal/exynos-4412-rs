@@ -21,6 +21,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `ext4_test/`: reads the ext4 file systems on the eMMC with the `ext4-view` crate, no writes
 - `fat_test/`: FAT32 on CACHE with the `embedded-sdmmc` crate: formats it if needed, writes, reads and lists files
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
+- `async_test/`: Embassy on all four cores: timers, tasks, and channels between the cores
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 
 ## Build
@@ -809,6 +810,35 @@ With read-ahead too, on the fourth boot:
 On the fifth boot, with the RTC: `BOOTS.TXT` stamped 2026-11-03 12:36:28, local time, and
 `LOGS/BOOT.LOG` got `boot 5 at 2026-11-03 12:36:28`. `LOGS`, made on the first boot, keeps
 2026-01-01.
+
+## Async (Embassy)
+
+The library's `embassy` module, behind the `embassy` feature, runs [Embassy](https://embassy.dev)
+async tasks, with one executor per core. Tasks stay on the core that spawned them; cores talk
+through `embassy-sync` channels, signals and mutexes, which the critical section below covers.
+
+- **Critical section:** the `critical-section` implementation masks IRQs on the calling core and
+  takes one lock shared by the four cores. The same core may enter again inside; the restore
+  state records it. It needs the MMU on, for exclusive accesses.
+- **Time:** the `embassy-time` driver counts the MCT global counter at 1 MHz. Wake-ups go through
+  comparator 0, now also usable once (`Mct::set_alarm`), whose interrupt goes to CPU0. One queue
+  holds the timers of all cores. The application's `handle_irq` passes each interrupt to
+  `embassy::on_interrupt`.
+- **Executor:** `embassy::run` runs `embassy-executor`'s raw executor on the calling core. It
+  sleeps with `WFE`; a task woken from any core or interrupt sends `DSB` then `SEV`. The crate's
+  own Cortex-A platform is not used: its `SEV` has no barrier before it, so a woken core could
+  look at its run queue before the task is there, and sleep again.
+- **Not yet present:** async drivers (UART, eMMC DMA, I2C), and preemptive threads.
+
+Test on the board: `make img APP=async_test`, same flashing step. Observed:
+
+| Check | Result |
+|---|---|
+| CPU0 timers of 1, 10, 100, 500 ms | 7, 7, 7, 4 us late by `embassy-time`; 7, 6, 6, 3 us by the MCT |
+| Timers of 100, 200 and 300 ms awaited together | 300 ms |
+| CPU1-3, 10 timers of 50 ms each, woken through CPU0's interrupt and `SEV` | 2-3 us late on average, 4 us at most |
+| Primes below 200000 three times on CPU0 | 17984 each, 1443 ms |
+| The same three jobs sent over a channel to CPU1-3 | 17984 on each core, 480 ms each, 487 ms in all: 2.95x |
 
 ## WiFi
 

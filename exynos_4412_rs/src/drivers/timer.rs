@@ -146,6 +146,24 @@ impl Mct {
         regs.g_int_enb.set(0);
     }
 
+    /// Raises [`soc::MCT_G0_IRQ`] once, when the counter reaches `at`, replacing any earlier
+    /// alarm or periodic interrupt. The comparator matches one count only: an `at` already
+    /// passed raises nothing until the counter wraps, so check the counter afterwards.
+    ///
+    /// The interrupt handler must call [`clear_interrupt`](Self::clear_interrupt).
+    pub fn set_alarm(&self, at: u64) {
+        let regs = self.regs();
+        // exynos_mct.c `exynos4_mct_comp0_start`: the comparator off while its value changes.
+        self.set_tcon(regs.g_tcon.get() & !(TCON_COMP0_ENABLE | TCON_COMP0_AUTO_INC));
+        regs.g_comp0_l.set(at as u32);
+        self.wait_write(WSTAT_COMP0_L);
+        regs.g_comp0_u.set((at >> 32) as u32);
+        self.wait_write(WSTAT_COMP0_U);
+        self.clear_interrupt();
+        regs.g_int_enb.set(INT_COMP0);
+        self.set_tcon(regs.g_tcon.get() | TCON_COMP0_ENABLE);
+    }
+
     /// Clears a pending comparator interrupt.
     pub fn clear_interrupt(&self) {
         self.regs().g_int_cstat.set(INT_COMP0);
