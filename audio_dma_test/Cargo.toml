@@ -1,0 +1,9 @@
+[package]
+name = "audio_dma_test"
+version = "0.1.0"
+edition = "2024"
+description = "WM8758 and I2S0 through pdma0 for exynos_4412_rs: a tone and WAV samples from a DMA ring"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["embassy"] }

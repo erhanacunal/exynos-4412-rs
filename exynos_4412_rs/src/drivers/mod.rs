@@ -10,6 +10,7 @@ pub mod i2c;
 pub mod l2c;
 pub mod max77686;
 pub mod mxt;
+pub mod pl330;
 pub mod mmc;
 pub mod power;
 pub mod scu;

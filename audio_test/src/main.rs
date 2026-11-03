@@ -152,6 +152,7 @@ impl Tone {
                     }
                     None => {
                         self.sample = None;
+                        self.silent = true;
                         self.finished = true;
                         continue;
                     }
@@ -355,7 +356,7 @@ fn main(_args: BootArgs) -> ! {
 
         if tone.finished {
             tone.finished = false;
-            println!("Sample done; back to the tone");
+            println!("Sample done; silence, s for the tone");
         }
 
         let Some(key) = uart.try_read_byte() else { continue };
@@ -376,6 +377,7 @@ fn main(_args: BootArgs) -> ! {
                                 }
                             );
                             tone.sample = Some(playing);
+                            tone.silent = false;
                         }
                         Err(why) => println!("{}: {}", name, why),
                     }

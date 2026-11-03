@@ -29,6 +29,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio_dma_test"
+version = "0.1.0"
+dependencies = [
+ "exynos_4412_rs",
+]
+
+[[package]]
 name = "audio_test"
 version = "0.1.0"
 dependencies = [

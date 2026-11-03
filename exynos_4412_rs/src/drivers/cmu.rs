@@ -12,7 +12,8 @@
 //! # Concurrency
 //!
 //! [`Cmu::enable_i2c`], [`Cmu::open_fimd_gates`], [`Cmu::set_fimd_clock`],
-//! [`Cmu::set_mmc3_clock`] and [`Cmu::open_audio_gates`] are read-modify-writes of registers shared with other peripherals. They mask IRQs on the
+//! [`Cmu::set_mmc3_clock`], [`Cmu::open_audio_gates`] and [`Cmu::open_pdma0_gate`] are
+//! read-modify-writes of registers shared with other peripherals. They mask IRQs on the
 //! calling core. Use them from one core at a time.
 
 use core::ptr;
@@ -100,6 +101,8 @@ const GATE_LCD0_FIMD0: u32 = 1 << 0;
 const GATE_LCD0_SMMU_FIMD0: u32 = 1 << 4;
 /// clk-exynos4.c:751: `CLK_SDMMC4`, the register clock of the eMMC controller.
 const GATE_FSYS_SDMMC4: u32 = 1 << 9;
+/// clk-exynos4.c:835: `CLK_PDMA0`.
+const GATE_FSYS_PDMA0: u32 = 1 << 0;
 /// clk-exynos4.c:845: `CLK_SDMMC3`, the register clock of `sdhci_3`.
 const GATE_FSYS_SDMMC3: u32 = 1 << 8;
 /// clk-exynos4.c:561: `mout_mmc3` is this field of `SRC_FSYS`.
@@ -308,6 +311,11 @@ impl Cmu {
         Some(self.mout_mpll_user_t_hz() / ((clocks.div & DIV_LCD0_FIMD0_MASK) + 1))
     }
 
+    /// Opens the gate of `pdma0`, the DMA controller with the audio requests.
+    pub fn open_pdma0_gate(&self) {
+        self.modify(GATE_IP_FSYS, 0, GATE_FSYS_PDMA0);
+    }
+
     /// Opens the gate of the registers of `sdhci_3`.
     pub fn open_sdmmc3_gate(&self) {
         self.modify(GATE_IP_FSYS, 0, GATE_FSYS_SDMMC3);
@@ -358,7 +366,7 @@ impl Cmu {
         let address = (soc::CMU_BASE + offset) as *mut u32;
         let was_masked = cpu::mask_irq();
         // SAFETY: as in `read`. Every caller changes only fields of the block it configures: the
-        // FIMD, `sdhci_3` or the audio subsystem.
+        // FIMD, `sdhci_3`, `pdma0` or the audio subsystem.
         unsafe {
             ptr::write_volatile(address, (ptr::read_volatile(address) & !clear) | set);
         }
