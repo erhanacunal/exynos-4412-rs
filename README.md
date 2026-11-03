@@ -12,6 +12,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `smp_test/`: CPU1-3 bring-up, inter-core memory and SGI tests, L2 latency measurement
 - `timer_test/`: per-core MCT local timer test
 - `display_test/`: panel bring-up with FIMD: state report, scan checks, test patterns
+- `touch_test/`: mXT1664S touch controller: object table, touches drawn on the panel, five-point calibration
 - `gpio_test/`: GPIO pins and key interrupts test
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
@@ -476,8 +477,8 @@ The touch controller needs more than its own rails. This power-up works from a p
 4. After 70 ms release reset, and after 300 ms read the controller at `0x4a`.
 
 Observed: family `0xa2`, version `0x20`, build `0xab`, matrix 32 x 52, 33 objects, 100 reads with 0 errors.
-That build matches the vendor firmware `mXT1664S__APP_V2-0-AB`. No touch input is read yet: there is no
-driver for the controller.
+That build matches the vendor firmware `mXT1664S__APP_V2-0-AB`. `drivers::mxt` does this power-up: see
+[Touch screen](#touch-screen).
 
 | Touch power-up | Result |
 |---|---|
@@ -576,6 +577,46 @@ U-Boot leaves the display running, so the panel works from the moment the applic
 So the timing derived from the DTS matches U-Boot's, and the panel also runs without the two VCLK
 settings taken from the vendor kernel. `GATE_IP_LCD0` reads `0xffffffff` before this code touches
 it, so the System MMU gate this code opens was already open on this boot.
+
+## Touch screen
+
+`drivers::mxt` drives the mXT1664S on `i2c_5`. It powers the controller up as in the MAX77686 section,
+reads its information block and object table, checks their CRC, and reads touch messages from T5 while
+CHG (`gpx0-4`) is low. CHG is polled: there is no interrupt for it yet.
+
+- **Configuration:** The controller keeps its configuration in non-volatile memory, written there by
+  the vendor driver. This driver reads it. Its writes go to RAM only, and a reset brings back what was
+  stored:
+  - the calibrate command, which takes a new reference of the untouched screen;
+  - run settings of T7 and T9, sent only if the stored ones would report nothing.
+
+  The backup command, which would store a configuration, is never sent. Nothing is sent to the
+  bootloader at `0x26` either, whose protocol replaces the firmware.
+- **Calibration:** `touch::Calibration` maps controller positions to pixels with an affine map, fitted by
+  least squares to touches on drawn targets. `touch_test` uses five targets: four 10 % in from the
+  corners, and one in the middle. The map is printed, not stored.
+
+`touch_test` on the board: `make img APP=touch_test`, same flashing step. It prints the object table and
+the T9 and T7 settings, then draws the targets. After calibration each finger draws in its own color,
+and press and release are printed. Keys: `c` calibrate again, `x` clear, `k` controller calibrate
+command, `i` settings.
+
+Observed, one finger:
+
+| Item | Observed |
+|---|---|
+| Power-up | Answers at `0x4a` after one reset, 401 ms; CHG low with the reset message waiting |
+| Information block | Family `0xa2`, version `0x20`, build `0xab`, 33 objects, CRC OK |
+| T9 | CTRL `0x8f`, ORIENT `0x01` (X and Y switched), 11 touches, range 4095 x 4095, 2 instances |
+| T7 | Idle and active 255 ms, as stored: nothing written |
+| T6 after reset | `0x80` reset, then `0x00` running; configuration CRC `0x0342cc` |
+| Calibration, five targets | Worst 12 px off with the range scaled onto the panel, 5 px with the fitted map |
+| Fitted map | `x = 0.31574 rx + 0.00030 ry - 2.7`, `y = 0.00097 rx + 0.19425 ry - 2.7` |
+| Drawing | Taps and strokes follow the finger; press and release reported for each |
+
+The controller's own ORIENT already puts X across the panel and Y down it. The fitted scale is 1.1 %
+above the plain one in X (0.31574 against 1279 / 4095 = 0.31233) and 0.4 % below it in Y, with an
+offset of about 3 px. Several fingers at once have not been tried.
 
 ## Restart and power off
 

@@ -49,6 +49,7 @@ pub mod partition;
 mod panic;
 pub mod soc;
 pub mod time;
+pub mod touch;
 
 pub mod smp;
 pub mod wpa;

@@ -1,0 +1,9 @@
+[package]
+name = "touch_test"
+version = "0.1.0"
+edition = "2024"
+description = "Touch screen test and calibration for exynos_4412_rs"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }
