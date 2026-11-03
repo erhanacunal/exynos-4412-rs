@@ -828,7 +828,13 @@ through `embassy-sync` channels, signals and mutexes, which the critical section
   sleeps with `WFE`; a task woken from any core or interrupt sends `DSB` then `SEV`. The crate's
   own Cortex-A platform is not used: its `SEV` has no barrier before it, so a woken core could
   look at its run queue before the task is there, and sleep again.
-- **Not yet present:** async drivers (UART, eMMC DMA, I2C), and preemptive threads.
+- **UART:** `embassy::uart::UartRx` receives on a UART's interrupt (UART0-3, GIC IDs 84-87):
+  the handler clears it, moves the FIFO into a ring of 2 KiB and wakes the reader, which
+  awaits `read`. The ring holds what comes while the reading task's core is busy. Its setup
+  masks the UART's other interrupts: U-Boot leaves `UINTM` at 0, and the transmit interrupt,
+  pending whenever the transmit FIFO is low, then came back on every return, 370000 times a
+  second. Sending stays polled.
+- **Not yet present:** async eMMC and I2C, async sending, and preemptive threads.
 
 Test on the board: `make img APP=async_test`, same flashing step. Observed:
 
@@ -839,6 +845,9 @@ Test on the board: `make img APP=async_test`, same flashing step. Observed:
 | CPU1-3, 10 timers of 50 ms each, woken through CPU0's interrupt and `SEV` | 2-3 us late on average, 4 us at most |
 | Primes below 200000 three times on CPU0 | 17984 each, 1443 ms |
 | The same three jobs sent over a channel to CPU1-3 | 17984 on each core, 480 ms each, 487 ms in all: 2.95x |
+| Console UART | `UCON` `0x3c5` from U-Boot, kept; `UFCON` `0x111`; `UINTM` `0xe` after setup |
+| `busy`: CPU0 runs no task for 3 s, nothing typed | 0 interrupts |
+| `busy` with 1753 bytes pasted meanwhile | All 1753 in the ring, in 884 interrupts, 0 dropped; echoed after |
 
 ## WiFi
 

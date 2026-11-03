@@ -6,7 +6,8 @@
 //!   and one lock between the cores, which the same core may take again inside;
 //! - the `embassy-time` driver: [`now`] counts the MCT's global counter at 1 MHz, and wake-ups
 //!   go through comparator 0, whose interrupt goes to CPU0;
-//! - [`run`], which starts an executor on the calling core.
+//! - [`run`], which starts an executor on the calling core;
+//! - [`uart::UartRx`], receiving on a UART with `await`.
 //!
 //! The executor is `embassy-executor`'s raw one, run here: it sleeps with `WFE`, and a wake-up
 //! from any core sends `DSB` then `SEV`, which wakes all of them. An interrupt also ends a
@@ -31,6 +32,8 @@
 //! `task` attribute, and on `embassy-time` and `embassy-sync` as it needs them; the features
 //! that select the 1 MHz tick are set here. Do not enable an `embassy-executor` platform: this
 //! module provides the pender.
+
+pub mod uart;
 
 use core::cell::{RefCell, UnsafeCell};
 use core::mem::MaybeUninit;
@@ -156,11 +159,12 @@ pub fn init() {
     gic.enable(soc::MCT_G0_IRQ);
 }
 
-/// Handles interrupt `id` if it is this module's, returning whether it was. The application's
-/// `handle_irq` calls it after acknowledging the interrupt, and ends it after.
+/// Handles interrupt `id` if it is this module's, returning whether it was: the MCT's, and
+/// those of the UARTs that [`uart::UartRx`] reads. The application's `handle_irq` calls it
+/// after acknowledging the interrupt, and ends it after.
 pub fn on_interrupt(id: u16) -> bool {
     if id != soc::MCT_G0_IRQ {
-        return false;
+        return uart::on_interrupt(id);
     }
     Mct::new().clear_interrupt();
     critical_section::with(|cs| service_queue(&mut DRIVER.queue.borrow_ref_mut(cs)));

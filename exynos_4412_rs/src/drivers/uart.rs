@@ -1,4 +1,5 @@
-//! Polled driver for the Samsung UART.
+//! Driver for the Samsung UART: polled, and the receive interrupt that the `embassy` feature's
+//! async reader uses.
 //!
 //! Clocks, pins, line settings and the baud rate are inherited from U-Boot. The
 //! FIFO may be on or off: each status check follows the current `UFCON` setting.
@@ -43,13 +44,14 @@ register_structs! {
         /// serial_s3c.h:21 `S3C2410_ULCON`.
         (0x00 => ulcon: ReadOnly<u32>),
         /// serial_s3c.h:22 `S3C2410_UCON`.
-        (0x04 => ucon: ReadOnly<u32>),
+        (0x04 => ucon: ReadWrite<u32>),
         /// serial_s3c.h:23 `S3C2410_UFCON`.
         (0x08 => ufcon: ReadOnly<u32, UFCON::Register>),
         (0x0C => _reserved0),
         /// serial_s3c.h:26 `S3C2410_UTRSTAT`.
         (0x10 => utrstat: ReadOnly<u32, UTRSTAT::Register>),
-        (0x14 => _reserved1),
+        /// serial_s3c.h:27 `S3C2410_UERSTAT`: receive errors, cleared by the read.
+        (0x14 => uerstat: ReadOnly<u32>),
         /// serial_s3c.h:28 `S3C2410_UFSTAT`.
         (0x18 => ufstat: ReadOnly<u32, UFSTAT::Register>),
         (0x1C => _reserved2),
@@ -65,9 +67,28 @@ register_structs! {
         /// serial_s3c.h:196 `S3C2443_DIVSLOT`; `samsung_tty.c` sets `has_fracval` on
         /// Exynos, which makes this the UFRACVAL register.
         (0x2C => ufracval: ReadWrite<u32>),
-        (0x30 => @END),
+        /// serial_s3c.h:199 `S3C64XX_UINTP`: pending interrupts, cleared by writing 1.
+        (0x30 => uintp: ReadWrite<u32>),
+        /// serial_s3c.h:200 `S3C64XX_UINTSP`: interrupt sources, before the mask.
+        (0x34 => uintsp: ReadOnly<u32>),
+        /// serial_s3c.h:201 `S3C64XX_UINTM`: a set bit masks that interrupt.
+        (0x38 => uintm: ReadWrite<u32>),
+        (0x3C => @END),
     }
 }
+
+/// serial_s3c.h:206-208 `S3C64XX_UINTM_RXD_MSK`, `_ERR_MSK`, `_TXD_MSK`: the receive, error and
+/// transmit bits of `UINTP`, `UINTSP` and `UINTM`. Bit 3 is the modem interrupt.
+const INT_RXD: u32 = 1 << 0;
+const INT_ERROR: u32 = 1 << 1;
+const INT_ALL: u32 = 0xF;
+/// serial_s3c.h:92 `S3C2410_UCON_RXIRQMODE`: bits 1:0 of `UCON` select interrupt or polling
+/// mode for receiving, which are the same mode here; 0 turns receiving off.
+const UCON_RX_MODE_MASK: u32 = 0b11;
+const UCON_RX_MODE_IRQ: u32 = 0b01;
+/// serial_s3c.h:93 `S3C2410_UCON_RXFIFO_TOI`: an interrupt also when bytes wait in the FIFO
+/// below its trigger level and the line has gone quiet.
+const UCON_RX_TIMEOUT: u32 = 1 << 7;
 
 /// One of the five UART blocks of the SoC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +115,15 @@ impl UartId {
             Self::Uart2 => soc::UART2_BASE,
             Self::Uart3 => soc::UART3_BASE,
             Self::Uart4 => soc::UART4_BASE,
+        }
+    }
+
+    /// The GIC interrupt ID: `exynos4.dtsi`, `GIC_SPI 52` to `55` for `serial_0` to `serial_3`.
+    /// `None` for UART4, which the device tree does not describe.
+    pub const fn irq(self) -> Option<u16> {
+        match self {
+            Self::Uart4 => None,
+            other => Some(32 + 52 + other as u16),
         }
     }
 
@@ -212,6 +242,45 @@ impl Uart {
         while !self.regs().utrstat.is_set(UTRSTAT::TX_EMPTY) {
             core::hint::spin_loop();
         }
+    }
+
+    /// Turns on the receive interrupt, at the FIFO's trigger level and after a quiet line with
+    /// bytes below it, and masks the UART's others. Keeps the other `UCON` bits; clears what
+    /// was pending.
+    ///
+    /// U-Boot leaves `UINTM` at 0, everything unmasked: the transmit interrupt is then pending
+    /// whenever the transmit FIFO is low, and would come back at once after every return.
+    pub fn enable_rx_interrupt(&self) {
+        let regs = self.regs();
+        regs.uintm.set(INT_ALL);
+        let ucon = (regs.ucon.get() & !UCON_RX_MODE_MASK) | UCON_RX_MODE_IRQ | UCON_RX_TIMEOUT;
+        regs.ucon.set(ucon);
+        regs.uintp.set(INT_ALL);
+        regs.uintm.set(INT_ALL & !INT_RXD);
+    }
+
+    /// Masks the receive interrupt again, with the others.
+    pub fn disable_rx_interrupt(&self) {
+        let regs = self.regs();
+        regs.uintm.set(INT_ALL);
+    }
+
+    /// Clears a pending receive or error interrupt, before reading the FIFO: a byte that comes
+    /// after raises it again.
+    pub fn clear_rx_interrupt(&self) {
+        self.regs().uintp.set(INT_RXD | INT_ERROR);
+    }
+
+    /// The receive errors since the last call, as `UERSTAT` bits: 0 overrun, 1 parity,
+    /// 2 frame, 3 break (serial_s3c.h:184-187). Reading clears them.
+    pub fn take_errors(&self) -> u32 {
+        self.regs().uerstat.get() & 0xF
+    }
+
+    /// Raw `UINTP`, `UINTSP` and `UINTM`.
+    pub fn interrupt_registers(&self) -> (u32, u32, u32) {
+        let regs = self.regs();
+        (regs.uintp.get(), regs.uintsp.get(), regs.uintm.get())
     }
 
     /// Reads the line configuration inherited from the bootloader.

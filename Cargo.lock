@@ -336,6 +336,7 @@ version = "0.1.0"
 dependencies = [
  "critical-section",
  "embassy-executor",
+ "embassy-sync",
  "embassy-time-driver",
  "embassy-time-queue-utils",
  "embedded-sdmmc",

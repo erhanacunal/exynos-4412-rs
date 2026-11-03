@@ -2,8 +2,9 @@
 //!
 //! On CPU0: how late timers of 1 to 500 ms wake, three timers awaited together, then a job
 //! run three times on CPU0 alone and once on each of CPU1-3 at the same time. CPU1-3 first
-//! check their own timers, which wake through CPU0's MCT interrupt and `SEV`. Afterwards a
-//! task keeps the UART and the keys served, at 10 ms.
+//! check their own timers, which wake through CPU0's MCT interrupt and `SEV`. Afterwards the
+//! console is read with `await`, on the UART's receive interrupt, and the keys are served
+//! every 10 ms.
 
 #![no_std]
 #![no_main]
@@ -17,8 +18,9 @@ use exynos_4412_rs::drivers::gic::Gic;
 use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::drivers::power::{self, BootMode, PowerKeys};
 use exynos_4412_rs::drivers::timer::Mct;
+use exynos_4412_rs::embassy::uart::UartRx;
 use exynos_4412_rs::exceptions::ExceptionFrame;
-use exynos_4412_rs::{BootArgs, console, cpu, embassy, mmu, println, smp, soc};
+use exynos_4412_rs::{BootArgs, console, cpu, embassy, mmu, print, println, smp, soc};
 
 exynos_4412_rs::entry!(main);
 
@@ -203,24 +205,99 @@ async fn supervisor(spawner: Spawner) {
         }
     );
 
+    spawner.spawn(keys_task().unwrap());
     spawner.spawn(console_task().unwrap());
 }
 
-/// Stays where the board can still be restarted from the UART or the keys.
+/// Serves the keys every 10 ms, as `power_test` does.
 #[embassy_executor::task]
-async fn console_task() {
-    println!("Done. UART: r restart, f restart into fastboot. Keys: as in power_test.");
-    let uart = console::uart();
+async fn keys_task() {
     let mut keys = PowerKeys::new();
     let mct = Mct::new();
     loop {
         keys.service(mct);
-        match uart.try_read_byte() {
-            Some(b'r') => power::restart(BootMode::Normal),
-            Some(b'f') => power::restart(BootMode::Fastboot),
-            _ => {}
-        }
         Timer::after(Duration::from_millis(10)).await;
+    }
+}
+
+/// How long `busy` keeps CPU0 from running tasks.
+const BUSY_MS: u64 = 3000;
+const LINE_MAX: usize = 256;
+
+/// Reads the console with `await`, echoes it, and runs the commands of each line.
+#[embassy_executor::task]
+async fn console_task() {
+    let uart = console::uart();
+    let config = uart.config();
+    let rx = UartRx::new(uart.id()).expect("the console UART has an interrupt");
+    let (pending, source, mask) = uart.interrupt_registers();
+    println!(
+        "Console {:?}: UCON {:#x} -> {:#x}, UFCON {:#x}, UINTP {:#x} UINTSP {:#x} UINTM {:#x}",
+        uart.id(),
+        config.ucon,
+        uart.config().ucon,
+        config.ufcon,
+        pending,
+        source,
+        mask
+    );
+    println!(
+        "Done. Type a line: r restart, f fastboot, busy (CPU0 runs no task for {} s: type or paste meanwhile), stats. Keys: as in power_test.",
+        BUSY_MS / 1000
+    );
+    print!("> ");
+    let mut line = [0u8; LINE_MAX];
+    let mut length = 0;
+    let mut last = 0u8;
+    let mut chunk = [0u8; 64];
+    loop {
+        let count = rx.read(&mut chunk).await;
+        for &byte in &chunk[..count] {
+            let previous = core::mem::replace(&mut last, byte);
+            match byte {
+                b'\n' if previous == b'\r' => {}
+                b'\r' | b'\n' => {
+                    println!();
+                    command(&rx, &line[..length]);
+                    length = 0;
+                    print!("> ");
+                }
+                0x08 | 0x7F if length > 0 => {
+                    length -= 1;
+                    print!("\x08 \x08");
+                }
+                0x20..=0x7E if length < LINE_MAX => {
+                    line[length] = byte;
+                    length += 1;
+                    print!("{}", byte as char);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn command(rx: &UartRx, line: &[u8]) {
+    match line {
+        b"r" => power::restart(BootMode::Normal),
+        b"f" => power::restart(BootMode::Fastboot),
+        b"busy" => {
+            let before = rx.stats();
+            let mct = Mct::new();
+            let begin = mct.count();
+            while us(mct.count() - begin) < BUSY_MS * 1000 {}
+            let after = rx.stats();
+            println!(
+                "Busy {} s: {} bytes came in meanwhile, in {} interrupts, {} dropped",
+                BUSY_MS / 1000,
+                after.received - before.received,
+                after.interrupts - before.interrupts,
+                after.dropped - before.dropped
+            );
+        }
+        b"stats" => println!("{:?}", rx.stats()),
+        b"" => {}
+        other => println!("Line of {} bytes", other.len()),
     }
 }
 
