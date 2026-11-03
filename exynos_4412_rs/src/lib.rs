@@ -50,6 +50,7 @@ mod panic;
 pub mod soc;
 pub mod time;
 pub mod touch;
+pub mod wav;
 
 pub mod smp;
 pub mod wpa;

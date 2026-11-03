@@ -14,6 +14,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `display_test/`: panel bring-up with FIMD: state report, scan checks, test patterns
 - `touch_test/`: mXT1664S touch controller: object table, touches drawn on the panel, five-point calibration
 - `touch_async_test/`: the touch controller read with `await` on its CHG interrupt, with a 1 ms ticker on the same core
+- `audio_test/`: WM8758 codec over I2S0: a tone and WAV samples on the headphones and the speakers, the FIFO filled by the CPU
 - `gpio_test/`: GPIO pins and key interrupts test
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
@@ -652,6 +653,49 @@ With nothing to do the ticker gets 4965 ticks in 5 s, the same as with fingers m
 takes a little over 1 ms. In the first 5 s it was once 120 ms late, from the check lines above, sent
 polled in that period. An awaited byte costs about 2 us more than a polled one, the interrupt and the
 wake-up.
+
+## Audio
+
+The WM8758 codec sits on `i2c_1` at `0x1a`, its four supplies on LDO25 (`vdd_audio`, 3300 mV).
+I2S0, in the audio subsystem at `0x0383_0000`, is the clock master: it sends the codec its
+master clock on CDCLK, and BCLK and LRCLK. 16-bit stereo I2S at 48 kHz.
+
+- **Clocks:** `drivers::i2s::set_clocks` runs the EPLL at 196.608 MHz (`Cmu::set_epll`,
+  M 197, P 3, S 3, K -25690, the entry of Linux's table) and divides it in the audio subsystem:
+  `dout_srp` /4, `dout_aud_bus` /4 = 12.288 MHz, the registers' clock and I2S0's RCLK, 256 times
+  48 kHz; BCLK is 32 times it. The dividers are written directly. Linux picks them from rates:
+  the EPLL's 196608001.7 Hz is listed as 196608001, and `DIV_ROUND_UP(196608001, 16)` is
+  12288001 (`drivers/clk/clk-divider.c:145`), above 12288000, so asking for 12288000 lands on /17, about 45.2 kHz and a mechanical
+  sound. This board's DTS asks for 12288001 for that reason.
+- **Order:** the EPLL first. The audio subsystem's registers run from `sclk_epll`, which
+  U-Boot leaves on the EPLL, at 96 MHz here.
+- **I2S0:** `drivers::i2s::I2s` sets it up as master and takes one frame per 32-bit word, the
+  left channel in the high half (heard on the board). The CPU fills the FIFO; no DMA yet.
+  `take_underrun` reads and clears the FIFO's underrun flag.
+- **Codec:** `drivers::wm8758`. Its registers are 9 bits and write-only, so only the
+  acknowledgement can be checked. `start_headphones` follows Linux's anti-pop order: bias and
+  VMID first (500 ms), then the DAC, mixers and headphone outputs, muted until they are on.
+  `set_speakers` adds LOUT2/ROUT2 and the speaker amplifier (`gpm1-2`). The pop suppressor
+  (`gpm1-3`) is driven high as in Linux. The jack pin (`gpx1-6`) is low while a jack is in.
+- **WAV:** `wav::Wav` reads the header of a PCM WAV file and its 16-bit samples.
+
+`make img APP=audio_test`, same flashing step. It embeds alsa-utils' `speaker-test` voices if
+the build finds them (`AUDIO_SAMPLES_DIR`, by default buildroot's alsa-utils tree); they are
+not in this repository, being under alsa-utils' license. The console is buffered: a polled
+line holds the CPU for 7 ms, and the FIFO lasts 1.3 ms. Observed:
+
+| Check | Result |
+|---|---|
+| From U-Boot | EPLL `0xa0400203`/`0x66010000`, 96 MHz; `sclk_epll` from the EPLL; all MAUDIO gates open |
+| Clocks set | EPLL `0xa0c50303`/`0x66019ba6`, 196608001 Hz, locked; `dout_aud_bus` 12288000 Hz; AUDSS src `0x1`, div `0xf33`, gate `0x1ff` |
+| Frame rate against the MCT, 1 s after start | 47999.85-47999.90 Hz |
+| Frame rate, 5 s windows while playing | 48000.18-48000.20 Hz: 4 ppm, the same in every window, so the MCT and the EPLL disagree by that much; not a divider |
+| 1 kHz at -12 dBFS on the headphones, -30 dB to 0 dB | Clean, no gaps; volume steps heard |
+| Left and right | Swapped at first; right after putting the left channel in the high half, checked with the `Front_Left` and `Front_Right` voices |
+| Speakers | Sound with `set_speakers`; off again with it |
+| Codec MCLK divider /2 (Linux, vendor kernel) and /1 | No difference heard |
+| Nine voices, 16-bit mono 48 kHz | Frame counts as on the host; clear, no distortion |
+| Underruns | None while playing. One each time the speakers were switched, both times in silence: the five I2C writes take longer than the FIFO lasts |
 
 ## Restart and power off
 

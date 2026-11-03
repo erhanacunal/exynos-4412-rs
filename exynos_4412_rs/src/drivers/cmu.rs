@@ -1,7 +1,8 @@
 //! Clock management unit: reads the clock of the peripheral bus and opens clock gates.
 //!
-//! Nothing here changes a PLL. The only muxes and dividers it changes are those of the FIMD and
-//! of `sclk_mmc3`, which nothing else uses: see [`Cmu::set_fimd_clock`] and
+//! The only PLL it changes is the EPLL, for audio: see [`Cmu::set_epll`]. Nothing else here
+//! runs from the EPLL. The only muxes and dividers it changes are those of the FIMD and of
+//! `sclk_mmc3`, which nothing else uses: see [`Cmu::set_fimd_clock`] and
 //! [`Cmu::set_mmc3_clock`]. The rest stay as U-Boot set them.
 //!
 //! Register offsets and clock tree are verified against Linux 5.15.198
@@ -10,13 +11,35 @@
 //!
 //! # Concurrency
 //!
-//! [`Cmu::enable_i2c`], [`Cmu::open_fimd_gates`], [`Cmu::set_fimd_clock`] and
-//! [`Cmu::set_mmc3_clock`] are read-modify-writes of registers shared with other peripherals. They mask IRQs on the
+//! [`Cmu::enable_i2c`], [`Cmu::open_fimd_gates`], [`Cmu::set_fimd_clock`],
+//! [`Cmu::set_mmc3_clock`] and [`Cmu::open_audio_gates`] are read-modify-writes of registers shared with other peripherals. They mask IRQs on the
 //! calling core. Use them from one core at a time.
 
 use core::ptr;
 
+use crate::drivers::timer::Mct;
 use crate::{cpu, soc};
+
+/// clk-exynos4.c:32.
+const EPLL_LOCK: usize = 0xC010;
+/// clk-exynos4.c:34.
+const EPLL_CON0: usize = 0xC110;
+/// clk-exynos4.c:35.
+const EPLL_CON1: usize = 0xC114;
+/// clk-exynos4.c:96 `E4X12_GATE_IP_MAUDIO`.
+const GATE_IP_MAUDIO: usize = 0xC93C;
+/// clk-exynos4.c:962: `CLK_AUDSS`, the clock of the audio subsystem's registers.
+const GATE_MAUDIO_AUDSS: u32 = 1 << 0;
+/// clk-exynos4.c:1001: `CLK_I2S0`.
+const GATE_MAUDIO_I2S0: u32 = 1 << 3;
+/// `drivers/clk/samsung/clk-pll.c:321`.
+const PLL36XX_ENABLE: u32 = 1 << 31;
+/// `clk-pll.c:320`.
+const PLL36XX_LOCKED: u32 = 1 << 29;
+/// `clk-pll.c:310`: the lock time, in input cycles, is this times P.
+const PLL36XX_LOCK_FACTOR: u32 = 3000;
+/// `clk-pll.c:20` `PLL_TIMEOUT_US`.
+const PLL_TIMEOUT_US: u64 = 20_000;
 
 /// clk-exynos4.c:40.
 const SRC_TOP0: usize = 0xC210;
@@ -51,6 +74,8 @@ const SRC_DMC: usize = 0x1_0200;
 
 /// clk-exynos4.c:531: `mout_aclk100` selects `sclk_apll` when set (clk-exynos4.c:352).
 const SRC_TOP0_ACLK100_APLL: u32 = 1 << 16;
+/// clk-exynos4.c:431: `sclk_epll` selects `fout_epll` when set (clk-exynos4.c:281).
+const SRC_TOP0_SCLK_EPLL: u32 = 1 << 4;
 /// clk-exynos4.c:523-524: `mout_mpll_user_t` selects `sclk_mpll` when set (clk-exynos4.c:335).
 const SRC_TOP1_MPLL_USER_T: u32 = 1 << 12;
 /// clk-exynos4.c:540: `sclk_mpll` selects `fout_mpll` when set (clk-exynos4.c:280).
@@ -90,6 +115,82 @@ const DIV_FSYS2_MMC3_PRE_SHIFT: u32 = 24;
 const DIV_FSYS2_MMC3_PRE_MAX: u32 = 256;
 /// Number of gates from [`GATE_I2C0_BIT`] that this module opens, leaving out `CLK_I2C_HDMI`.
 const I2C_GATES: usize = 8;
+
+/// The settings of a PLL36xx, the type of the EPLL (clk-exynos4.c:1162), as in
+/// `clk-pll.c:310-321`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pll36xx {
+    /// Feedback divider, 9 bits.
+    pub m: u16,
+    /// Input divider, 6 bits.
+    pub p: u8,
+    /// Output divider, a power of two, 3 bits.
+    pub s: u8,
+    /// Fraction of M, in 1/65536.
+    pub k: i16,
+}
+
+impl Pll36xx {
+    /// 196.608 MHz from 24 MHz, `clk-exynos4.c:1124`: 16 times 12.288 MHz, which is 256 times
+    /// 48 kHz. Linux lists it as 196608001 Hz, rounded down; the rate is
+    /// 196608001.7 Hz.
+    pub const AUDIO_196_608_MHZ: Self = Self { m: 197, p: 3, s: 3, k: -25690 };
+
+    /// The settings in `con0` and `con1`.
+    pub const fn from_registers(con0: u32, con1: u32) -> Self {
+        Self {
+            m: ((con0 >> 16) & 0x1FF) as u16,
+            p: ((con0 >> 8) & 0x3F) as u8,
+            s: (con0 & 7) as u8,
+            k: con1 as u16 as i16,
+        }
+    }
+
+    /// The output rate from `fin_hz`, rounded down as `clk-pll.c:323-343` does.
+    pub const fn hz(&self, fin_hz: u32) -> u32 {
+        let multiplier = ((self.m as i64) << 16) + self.k as i64;
+        let divider = (self.p as i64) << self.s;
+        if multiplier <= 0 || divider == 0 {
+            return 0;
+        }
+        ((fin_hz as i64 * multiplier / divider) >> 16) as u32
+    }
+}
+
+/// The EPLL as it is now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Epll {
+    /// `EPLL_CON0`.
+    pub con0: u32,
+    /// `EPLL_CON1`.
+    pub con1: u32,
+}
+
+impl Epll {
+    /// Whether it runs.
+    pub const fn enabled(&self) -> bool {
+        self.con0 & PLL36XX_ENABLE != 0
+    }
+
+    /// Whether it has locked.
+    pub const fn locked(&self) -> bool {
+        self.con0 & PLL36XX_LOCKED != 0
+    }
+
+    /// Its settings.
+    pub const fn settings(&self) -> Pll36xx {
+        Pll36xx::from_registers(self.con0, self.con1)
+    }
+
+    /// Its output rate, 0 if it does not run.
+    pub const fn hz(&self) -> u32 {
+        if self.enabled() { self.settings().hz(soc::FIN_PLL_HZ) } else { 0 }
+    }
+}
+
+/// The EPLL did not lock within [`PLL_TIMEOUT_US`] of being set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpllTimeout(pub Epll);
 
 /// Raw clock registers of the FIMD, for reports.
 #[derive(Clone, Copy, Debug)]
@@ -257,11 +358,67 @@ impl Cmu {
         let address = (soc::CMU_BASE + offset) as *mut u32;
         let was_masked = cpu::mask_irq();
         // SAFETY: as in `read`. Every caller changes only fields of the block it configures: the
-        // FIMD or `sdhci_3`.
+        // FIMD, `sdhci_3` or the audio subsystem.
         unsafe {
             ptr::write_volatile(address, (ptr::read_volatile(address) & !clear) | set);
         }
         cpu::restore_irq(was_masked);
+    }
+
+    /// The EPLL as it is now.
+    pub fn epll(&self) -> Epll {
+        Epll { con0: self.read(EPLL_CON0), con1: self.read(EPLL_CON1) }
+    }
+
+    /// Runs the EPLL with `settings` and waits until it has locked, as
+    /// `clk-pll.c:358-404` does. Does nothing if it runs locked with them already. Returns
+    /// its rate. Stop what runs from it first; in this crate only the audio subsystem does.
+    pub fn set_epll(&self, settings: Pll36xx, mct: Mct) -> Result<u32, EpllTimeout> {
+        let now = self.epll();
+        if now.enabled() && now.locked() && now.settings() == settings {
+            return Ok(now.hz());
+        }
+        let field = |value: u32, shift: u32, mask: u32| (value & mask) << shift;
+        let con0 = PLL36XX_ENABLE
+            | field(settings.m.into(), 16, 0x1FF)
+            | field(settings.p.into(), 8, 0x3F)
+            | field(settings.s.into(), 0, 7);
+        // SAFETY: as in `read`; these three registers are the EPLL's alone.
+        unsafe {
+            ptr::write_volatile(
+                (soc::CMU_BASE + EPLL_LOCK) as *mut u32,
+                u32::from(settings.p) * PLL36XX_LOCK_FACTOR,
+            );
+            // The fraction first, so that the PLL locks once, on the final settings.
+            ptr::write_volatile((soc::CMU_BASE + EPLL_CON1) as *mut u32, (now.con1 & !0xFFFF) | u32::from(settings.k as u16));
+            ptr::write_volatile((soc::CMU_BASE + EPLL_CON0) as *mut u32, (now.con0 & !0x01FF_3F07) | con0);
+        }
+        let end = mct.count() + PLL_TIMEOUT_US * u64::from(soc::MCT_CLOCK_HZ / 1_000_000);
+        loop {
+            let epll = self.epll();
+            if epll.locked() {
+                return Ok(epll.hz());
+            }
+            if mct.count() > end {
+                return Err(EpllTimeout(epll));
+            }
+        }
+    }
+
+    /// Opens the gates of the audio subsystem's registers and of I2S0's.
+    pub fn open_audio_gates(&self) {
+        self.modify(GATE_IP_MAUDIO, 0, GATE_MAUDIO_AUDSS | GATE_MAUDIO_I2S0);
+    }
+
+    /// Whether `sclk_epll`, the clock of the audio subsystem's registers, comes from the EPLL
+    /// rather than the 24 MHz input (clk-exynos4.c:281,431).
+    pub fn sclk_epll_is_epll(&self) -> bool {
+        self.read(SRC_TOP0) & SRC_TOP0_SCLK_EPLL != 0
+    }
+
+    /// `E4X12_GATE_IP_MAUDIO`, for reports.
+    pub fn audio_gates(&self) -> u32 {
+        self.read(GATE_IP_MAUDIO)
     }
 
     /// Opens the clock gate of the I2C controller `bus`, below 8.

@@ -121,6 +121,13 @@ pub const MSHC_BASE: usize = 0x1255_0000;
 /// `sdhci_3: sdhci@12540000`, and `exynos4412-mehmet.dts:1509-1541` has the chip on it.
 pub const SDHCI3_BASE: usize = 0x1254_0000;
 
+/// Clock controller of the audio subsystem. Verified: `exynos4.dtsi:66-68`, node
+/// `clock_audss: clock-controller@3810000`, `reg`.
+pub const AUDSS_BASE: usize = 0x0381_0000;
+/// I2S controller 0, in the audio subsystem. Verified: `exynos4.dtsi:77-79`, node
+/// `i2s0: i2s@3830000`, and `exynos4412-mehmet.dts` has the codec on it.
+pub const I2S0_BASE: usize = 0x0383_0000;
+
 /// Number of cores. Verified: `exynos4412.dtsi`, nodes `cpu@a00`..`cpu@a03`. `link.x`
 /// reserves this many stack blocks.
 pub const CPU_COUNT: usize = 4;
