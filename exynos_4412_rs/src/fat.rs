@@ -5,19 +5,22 @@
 //! memory, which lists one FAT32 partition from block 1 on, and block `n` from 1 on is block
 //! `n - 1` of the partition. The card's own table is never changed, so the partition keeps its
 //! type byte there. Every write goes through an [`MmcWriter`], which keeps it inside the
-//! partition; writes to the made-up block 0 are refused.
+//! partition; writes to the made-up block 0 are refused. Writes are cached and merged into
+//! multiple block commands: see [`PartitionDevice`] for when they reach the card.
 //!
 //! [`PartitionDevice::format`] makes an empty FAT32 file system, which `embedded_sdmmc` cannot
 //! do. The layout follows Microsoft's FAT specification, `fatgen103`, cited as
 //! `fatgen103 <page>`.
 //!
 //! ```ignore
-//! let device = PartitionDevice::new(card, rca, 8, bounce)?;
+//! let device = PartitionDevice::new(card, rca, 8, buffer)?;
 //! if !device.probe()? {
 //!     device.format(0x1234_5678, b"CACHE      ")?;
 //! }
 //! let volumes = VolumeManager::new(device, FixedTime::default());
 //! let volume = volumes.open_volume(VolumeIdx(0))?;
+//! // ... write and close files ...
+//! volumes.device(|device| device.flush())?;
 //! ```
 
 use core::cell::RefCell;
@@ -71,7 +74,7 @@ pub enum Error {
     MadeUpRecord,
     /// A block past the end of the device.
     OutOfRange,
-    /// A bounce buffer that is empty, not whole blocks, or not on a cache line.
+    /// A buffer smaller than [`MIN_BUFFER`], not whole blocks, or not on a cache line.
     BadBuffer,
     /// The partition is too small for FAT32, or too large for this formatter. Holds its blocks.
     BadSize(u32),
@@ -130,80 +133,264 @@ impl Geometry {
     }
 }
 
-/// One eMMC partition as a disk for `embedded_sdmmc`. See the module documentation.
-pub struct PartitionDevice<'a> {
-    card: Mmc,
-    writer: MmcWriter,
-    /// Where the DMA reads and writes go, since a [`Block`] need not start on a cache line.
-    bounce: RefCell<&'a mut [u8]>,
+/// Blocks at the start of the device's buffer that card reads go through.
+const READ_BLOCKS: usize = 8;
+/// Dirty blocks kept apart from the run: the FAT blocks, both copies, and directory entries
+/// that `embedded_sdmmc` writes again and again.
+const SLOTS: usize = 8;
+/// The smallest buffer [`PartitionDevice::new`] takes: the read blocks, the slots and a run of
+/// one block.
+pub const MIN_BUFFER: usize = (READ_BLOCKS + SLOTS + 1) * BLOCK_SIZE;
+
+/// What a [`PartitionDevice`] has done since it was made, in blocks of the partition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Read commands sent to the card.
+    pub card_reads: u32,
+    /// Blocks they read.
+    pub blocks_read: u32,
+    /// Blocks read from the cache, written but not yet on the card.
+    pub cached_reads: u32,
+    /// Blocks written by `embedded_sdmmc` or the formatter.
+    pub blocks_put: u32,
+    /// Write commands sent to the card.
+    pub card_writes: u32,
+    /// Blocks they wrote.
+    pub blocks_written: u32,
 }
 
-impl<'a> PartitionDevice<'a> {
-    /// A device for partition `number`, on the card at address `rca` (see [`MmcWriter::new`]).
-    /// `bounce` must be whole blocks and start on a cache line ([`mmu::DCACHE_LINE`]); 32 KiB
-    /// is plenty, as `embedded_sdmmc` moves one block at a time.
-    pub fn new(card: Mmc, rca: u16, number: u32, bounce: &'a mut [u8]) -> Result<Self, Error> {
-        if bounce.is_empty()
-            || !bounce.len().is_multiple_of(BLOCK_SIZE)
-            || !(bounce.as_ptr() as usize).is_multiple_of(mmu::DCACHE_LINE)
-        {
-            return Err(Error::BadBuffer);
-        }
-        let writer = MmcWriter::new(card, rca, number).map_err(Error::Write)?;
-        Ok(Self { card, writer, bounce: RefCell::new(bounce) })
+/// The write-back cache, with what it needs to reach the card.
+struct Cache<'a> {
+    card: Mmc,
+    writer: MmcWriter,
+    /// Where card reads go, since a [`Block`] need not start on a cache line.
+    read: &'a mut [u8],
+    /// Single dirty blocks, and which block of the partition each holds.
+    slots: &'a mut [u8],
+    slot_blocks: [Option<u32>; SLOTS],
+    /// Consecutive dirty blocks, from `run_start` on, written with one command.
+    run: &'a mut [u8],
+    run_start: u32,
+    run_len: usize,
+    stats: Stats,
+}
+
+impl Cache<'_> {
+    fn run_capacity(&self) -> usize {
+        self.run.len() / BLOCK_SIZE
     }
 
-    /// The partition, as the card's table gives it.
-    pub const fn partition(&self) -> Partition {
-        self.writer.partition()
+    fn slot_of(&self, block: u32) -> Option<usize> {
+        self.slot_blocks.iter().position(|slot| *slot == Some(block))
     }
 
-    /// Reads blocks of the partition, counted from its start.
-    pub fn read_partition(&self, block: u32, blocks: &mut [Block]) -> Result<(), Error> {
-        let partition = self.partition();
-        if u64::from(block) + blocks.len() as u64 > u64::from(partition.count) {
-            return Err(Error::OutOfRange);
+    fn run_index(&self, block: u32) -> Option<usize> {
+        let index = block.checked_sub(self.run_start)? as usize;
+        (index < self.run_len).then_some(index)
+    }
+
+    /// The dirty copy of `block`, if the cache holds one.
+    fn dirty(&self, block: u32) -> Option<&[u8]> {
+        if let Some(index) = self.run_index(block) {
+            return Some(&self.run[index * BLOCK_SIZE..][..BLOCK_SIZE]);
         }
-        let mut bounce = self.bounce.borrow_mut();
-        let per_chunk = bounce.len() / BLOCK_SIZE;
-        let mut lba = partition.start + block;
-        for chunk in blocks.chunks_mut(per_chunk) {
-            let bytes = &mut bounce[..chunk.len() * BLOCK_SIZE];
+        self.slot_of(block).map(|slot| &self.slots[slot * BLOCK_SIZE..][..BLOCK_SIZE])
+    }
+
+    fn card_read(&mut self, block: u32, blocks: &mut [Block]) -> Result<(), Error> {
+        let mut lba = self.writer.partition().start + block;
+        for chunk in blocks.chunks_mut(READ_BLOCKS) {
+            let bytes = &mut self.read[..chunk.len() * BLOCK_SIZE];
             self.card.read_blocks_dma(lba, bytes).map_err(Error::Card)?;
             for (block, data) in chunk.iter_mut().zip(bytes.as_chunks::<BLOCK_SIZE>().0) {
                 block.contents.copy_from_slice(data);
             }
+            self.stats.card_reads += 1;
+            self.stats.blocks_read += chunk.len() as u32;
             lba += chunk.len() as u32;
         }
         Ok(())
     }
 
-    /// Writes blocks of the partition, counted from its start.
-    pub fn write_partition(&self, block: u32, blocks: &[Block]) -> Result<(), Error> {
-        let mut bounce = self.bounce.borrow_mut();
-        let per_chunk = bounce.len() / BLOCK_SIZE;
-        let mut block = block;
-        for chunk in blocks.chunks(per_chunk) {
-            let bytes = &mut bounce[..chunk.len() * BLOCK_SIZE];
-            for (data, block) in bytes.as_chunks_mut::<BLOCK_SIZE>().0.iter_mut().zip(chunk) {
-                data.copy_from_slice(&block.contents);
+    /// Reads through the cache: the card, then the dirty blocks over what it gave.
+    fn read(&mut self, block: u32, blocks: &mut [Block]) -> Result<(), Error> {
+        if let [single] = blocks
+            && let Some(data) = self.dirty(block)
+        {
+            single.contents.copy_from_slice(data);
+            self.stats.cached_reads += 1;
+            return Ok(());
+        }
+        self.card_read(block, blocks)?;
+        for (offset, target) in blocks.iter_mut().enumerate() {
+            if let Some(data) = self.dirty(block + offset as u32) {
+                target.contents.copy_from_slice(data);
+                self.stats.cached_reads += 1;
             }
-            self.writer.write(block, bytes).map_err(Error::Write)?;
-            block += chunk.len() as u32;
         }
         Ok(())
     }
 
-    /// Writes `count` zero blocks of the partition, from `block` on.
-    fn zero_partition(&self, block: u32, count: u32) -> Result<(), Error> {
-        let mut bounce = self.bounce.borrow_mut();
-        bounce.fill(0);
-        let per_chunk = (bounce.len() / BLOCK_SIZE) as u32;
+    /// Takes one written block into the cache. Each block is in at most one place: the run
+    /// or a slot.
+    fn put(&mut self, block: u32, data: &[u8; BLOCK_SIZE]) -> Result<(), Error> {
+        self.stats.blocks_put += 1;
+        if let Some(index) = self.run_index(block) {
+            self.run[index * BLOCK_SIZE..][..BLOCK_SIZE].copy_from_slice(data);
+            return Ok(());
+        }
+        if let Some(slot) = self.slot_of(block) {
+            self.slots[slot * BLOCK_SIZE..][..BLOCK_SIZE].copy_from_slice(data);
+            return Ok(());
+        }
+        if self.run_len > 0 && block == self.run_start + self.run_len as u32 {
+            if self.run_len < self.run_capacity() {
+                self.run[self.run_len * BLOCK_SIZE..][..BLOCK_SIZE].copy_from_slice(data);
+                self.run_len += 1;
+                return Ok(());
+            }
+            self.flush_run()?;
+        }
+        if self.run_len > 0 {
+            match self.slot_blocks.iter().position(Option::is_none) {
+                // A run of one is more likely a FAT or directory block, written before the
+                // file data that follows: it moves to a slot, and the run starts again here.
+                Some(free) if self.run_len == 1 => {
+                    self.slots[free * BLOCK_SIZE..][..BLOCK_SIZE].copy_from_slice(&self.run[..BLOCK_SIZE]);
+                    self.slot_blocks[free] = Some(self.run_start);
+                    self.run_len = 0;
+                }
+                Some(free) => {
+                    self.slots[free * BLOCK_SIZE..][..BLOCK_SIZE].copy_from_slice(data);
+                    self.slot_blocks[free] = Some(block);
+                    return Ok(());
+                }
+                None => self.flush()?,
+            }
+        }
+        self.run[..BLOCK_SIZE].copy_from_slice(data);
+        self.run_start = block;
+        self.run_len = 1;
+        Ok(())
+    }
+
+    fn card_write(writer: &MmcWriter, stats: &mut Stats, block: u32, bytes: &[u8]) -> Result<(), Error> {
+        writer.write(block, bytes).map_err(Error::Write)?;
+        stats.card_writes += 1;
+        stats.blocks_written += (bytes.len() / BLOCK_SIZE) as u32;
+        Ok(())
+    }
+
+    fn flush_run(&mut self) -> Result<(), Error> {
+        if self.run_len > 0 {
+            Self::card_write(&self.writer, &mut self.stats, self.run_start, &self.run[..self.run_len * BLOCK_SIZE])?;
+            self.run_len = 0;
+        }
+        Ok(())
+    }
+
+    /// The run first, so that file data reaches the card before the FAT entries that point at it.
+    fn flush(&mut self) -> Result<(), Error> {
+        self.flush_run()?;
+        for slot in 0..SLOTS {
+            if let Some(block) = self.slot_blocks[slot] {
+                let bytes = &self.slots[slot * BLOCK_SIZE..][..BLOCK_SIZE];
+                Self::card_write(&self.writer, &mut self.stats, block, bytes)?;
+                self.slot_blocks[slot] = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes `count` zero blocks straight to the card, from `block` on. The cache must be empty.
+    fn zero(&mut self, block: u32, count: u32) -> Result<(), Error> {
+        self.run.fill(0);
+        let per_chunk = self.run_capacity() as u32;
         let mut done = 0;
         while done < count {
             let blocks = per_chunk.min(count - done);
-            self.writer.write(block + done, &bounce[..blocks as usize * BLOCK_SIZE]).map_err(Error::Write)?;
+            Self::card_write(&self.writer, &mut self.stats, block + done, &self.run[..blocks as usize * BLOCK_SIZE])?;
             done += blocks;
+        }
+        Ok(())
+    }
+}
+
+/// One eMMC partition as a disk for `embedded_sdmmc`. See the module documentation.
+///
+/// Writes stay in a write-back cache until [`flush`](Self::flush), or until it is full: one
+/// run of consecutive blocks, written to the card with one command, and a few single blocks.
+/// `embedded_sdmmc` never asks for a flush, so call it after closing files, through
+/// `VolumeManager::device`. Dropping the device flushes too, but cannot report a failure.
+pub struct PartitionDevice<'a> {
+    partition: Partition,
+    cache: RefCell<Cache<'a>>,
+}
+
+impl<'a> PartitionDevice<'a> {
+    /// A device for partition `number`, on the card at address `rca` (see [`MmcWriter::new`]).
+    ///
+    /// `buffer` must be whole blocks, start on a cache line ([`mmu::DCACHE_LINE`]), lie in DRAM
+    /// and hold at least [`MIN_BUFFER`] bytes. 8 KiB of it go to card reads and the single
+    /// blocks; the rest holds the run, so it sets how much one write command carries.
+    pub fn new(card: Mmc, rca: u16, number: u32, buffer: &'a mut [u8]) -> Result<Self, Error> {
+        if buffer.len() < MIN_BUFFER
+            || !buffer.len().is_multiple_of(BLOCK_SIZE)
+            || !(buffer.as_ptr() as usize).is_multiple_of(mmu::DCACHE_LINE)
+        {
+            return Err(Error::BadBuffer);
+        }
+        let writer = MmcWriter::new(card, rca, number).map_err(Error::Write)?;
+        let (read, rest) = buffer.split_at_mut(READ_BLOCKS * BLOCK_SIZE);
+        let (slots, run) = rest.split_at_mut(SLOTS * BLOCK_SIZE);
+        let cache = Cache {
+            card,
+            writer,
+            read,
+            slots,
+            slot_blocks: [None; SLOTS],
+            run,
+            run_start: 0,
+            run_len: 0,
+            stats: Stats::default(),
+        };
+        Ok(Self { partition: writer.partition(), cache: RefCell::new(cache) })
+    }
+
+    /// The partition, as the card's table gives it.
+    pub const fn partition(&self) -> Partition {
+        self.partition
+    }
+
+    /// What the device has done so far.
+    pub fn stats(&self) -> Stats {
+        self.cache.borrow().stats
+    }
+
+    /// Writes every cached block to the card. Returns once the card has programmed them.
+    pub fn flush(&self) -> Result<(), Error> {
+        self.cache.borrow_mut().flush()
+    }
+
+    fn check_range(&self, block: u32, blocks: usize) -> Result<(), Error> {
+        if u64::from(block) + blocks as u64 > u64::from(self.partition.count) {
+            return Err(Error::OutOfRange);
+        }
+        Ok(())
+    }
+
+    /// Reads blocks of the partition, counted from its start, including those still in the cache.
+    pub fn read_partition(&self, block: u32, blocks: &mut [Block]) -> Result<(), Error> {
+        self.check_range(block, blocks.len())?;
+        self.cache.borrow_mut().read(block, blocks)
+    }
+
+    /// Writes blocks of the partition, counted from its start, into the cache.
+    pub fn write_partition(&self, block: u32, blocks: &[Block]) -> Result<(), Error> {
+        self.check_range(block, blocks.len())?;
+        let mut cache = self.cache.borrow_mut();
+        for (offset, data) in blocks.iter().enumerate() {
+            cache.put(block + offset as u32, &data.contents)?;
         }
         Ok(())
     }
@@ -233,7 +420,7 @@ impl<'a> PartitionDevice<'a> {
             && u16_at(22) == 0
             && fat_sectors != 0
             && total != 0
-            && total <= self.partition().count
+            && total <= self.partition.count
             && used < u64::from(total)
             && (total - used as u32) / cluster_sectors >= MIN_FAT32_CLUSTERS
             && u16_at(42) == 0
@@ -243,15 +430,20 @@ impl<'a> PartitionDevice<'a> {
     /// Makes an empty FAT32 file system over the whole partition, erasing what it held. The
     /// boot sector is written last, so an interrupted format leaves no volume that
     /// [`probe`](Self::probe) accepts. `label` is padded with spaces, as in the boot sector.
+    /// Flushes the cache first, and leaves it empty.
     ///
     /// Writes the reserved sectors, both FATs and the root directory's cluster: under 1 MiB
     /// for an 8 GiB partition.
     pub fn format(&self, volume_id: u32, label: &[u8; 11]) -> Result<Geometry, Error> {
-        let geometry = Geometry::for_sectors(self.partition().count)?;
+        let geometry = Geometry::for_sectors(self.partition.count)?;
         let root = geometry.data_start + (ROOT_CLUSTER - 2) * geometry.cluster_sectors;
-        // Boot sector first, cleared, so that a stale one is gone before anything else.
-        self.zero_partition(0, geometry.data_start)?;
-        self.zero_partition(root, geometry.cluster_sectors)?;
+        {
+            let mut cache = self.cache.borrow_mut();
+            cache.flush()?;
+            // Boot sector first, cleared, so that a stale one is gone before anything else.
+            cache.zero(0, geometry.data_start)?;
+            cache.zero(root, geometry.cluster_sectors)?;
+        }
 
         // fatgen103 p.18: entry 0 holds the media byte, entry 1 the end of chain mark; entry 2,
         // the root directory, is a chain of one cluster.
@@ -265,13 +457,15 @@ impl<'a> PartitionDevice<'a> {
         for copy in 0..FATS {
             self.write_partition(RESERVED_SECTORS + copy * geometry.fat_sectors, core::slice::from_ref(&fat))?;
         }
-
         let fsinfo = fsinfo(geometry.clusters - 1, ROOT_CLUSTER + 1);
         self.write_partition(FSINFO_SECTOR, core::slice::from_ref(&fsinfo))?;
         self.write_partition(BACKUP_SECTOR + FSINFO_SECTOR, core::slice::from_ref(&fsinfo))?;
-        let boot = boot_sector(&geometry, self.partition().start, volume_id, label);
+        let boot = boot_sector(&geometry, self.partition.start, volume_id, label);
         self.write_partition(BACKUP_SECTOR, core::slice::from_ref(&boot))?;
+        // Everything else reaches the card before the boot sector.
+        self.flush()?;
         self.write_partition(0, core::slice::from_ref(&boot))?;
+        self.flush()?;
         Ok(geometry)
     }
 
@@ -281,9 +475,16 @@ impl<'a> PartitionDevice<'a> {
         let entry = &mut block.contents[MBR_ENTRY..MBR_ENTRY + 16];
         entry[4] = TYPE_FAT32_LBA;
         entry[8..12].copy_from_slice(&1u32.to_le_bytes());
-        entry[12..16].copy_from_slice(&self.partition().count.to_le_bytes());
+        entry[12..16].copy_from_slice(&self.partition.count.to_le_bytes());
         block.contents[SIGNATURE_OFFSET..].copy_from_slice(&SIGNATURE);
         block
+    }
+}
+
+impl Drop for PartitionDevice<'_> {
+    fn drop(&mut self) {
+        // Nowhere to report a failure: callers that care flush first.
+        let _ = self.cache.get_mut().flush();
     }
 }
 
@@ -314,7 +515,7 @@ impl BlockDevice for PartitionDevice<'_> {
     }
 
     fn num_blocks(&self) -> Result<BlockCount, Error> {
-        Ok(BlockCount(self.partition().count + 1))
+        Ok(BlockCount(self.partition.count + 1))
     }
 }
 

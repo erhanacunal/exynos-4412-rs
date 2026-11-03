@@ -4,7 +4,8 @@
 //! the boots in `BOOTS.TXT`, writes a 1 MiB file and reads it back, timed and hashed, deletes
 //! it, appends a line to `LOGS/BOOT.LOG` and lists the root directory.
 //!
-//! Every write goes through an `MmcWriter` for CACHE, which refuses blocks outside it.
+//! Every write goes through an `MmcWriter` for CACHE, which refuses blocks outside it. The
+//! device caches writes; the test flushes it after each step and prints what reached the card.
 
 #![no_std]
 #![no_main]
@@ -17,7 +18,7 @@ use exynos_4412_rs::drivers::mmc::{self, Mmc};
 use exynos_4412_rs::drivers::power::{self, BootMode, PowerKeys};
 use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::fat::embedded_sdmmc::{Directory, Mode, VolumeIdx, VolumeManager};
-use exynos_4412_rs::fat::{self, FixedTime, PartitionDevice};
+use exynos_4412_rs::fat::{self, FixedTime, PartitionDevice, Stats};
 use exynos_4412_rs::{BootArgs, console, mmu, println, soc};
 
 exynos_4412_rs::entry!(main);
@@ -25,13 +26,15 @@ exynos_4412_rs::entry!(main);
 /// The partition used: CACHE.
 const TARGET: u32 = 8;
 const LABEL: &[u8; 11] = b"CACHE      ";
-const BOUNCE_BYTES: usize = 32 * 1024;
+/// The device's buffer: 8 KiB for reads and single blocks, 256 KiB for the run of writes.
+const DEVICE_BYTES: usize = fat::MIN_BUFFER - 512 + 256 * 1024;
 const CHUNK_BYTES: usize = 32 * 1024;
 const BIG_BYTES: u32 = 1024 * 1024;
 /// Guesses at the address U-Boot gave the card, which it does not report.
 const RCA_GUESSES: [u16; 2] = [1, 2];
 
 type FsError = fat::embedded_sdmmc::Error<fat::Error>;
+type Volumes = VolumeManager<PartitionDevice<'static>, FixedTime, 4, 4, 1>;
 type Root<'a> = Directory<'a, PartitionDevice<'static>, FixedTime, 4, 4, 1>;
 
 #[repr(C, align(32))]
@@ -40,7 +43,7 @@ struct Buffer<const N: usize>(UnsafeCell<[u8; N]>);
 // SAFETY: `main` is the only user, and takes the one reference to each once.
 unsafe impl<const N: usize> Sync for Buffer<N> {}
 
-static BOUNCE: Buffer<BOUNCE_BYTES> = Buffer(UnsafeCell::new([0; BOUNCE_BYTES]));
+static DEVICE: Buffer<DEVICE_BYTES> = Buffer(UnsafeCell::new([0; DEVICE_BYTES]));
 static CHUNK: Buffer<CHUNK_BYTES> = Buffer(UnsafeCell::new([0; CHUNK_BYTES]));
 
 /// Stays where the board can still be restarted from the UART or the keys.
@@ -134,8 +137,38 @@ fn count_boot(root: &Root<'_>) -> Result<u32, FsError> {
     Ok(boot)
 }
 
+/// Writes the device's cached blocks to the card.
+fn flush(volumes: &Volumes) -> Result<(), FsError> {
+    volumes.device(|device| device.flush())?;
+    Ok(())
+}
+
+fn stats(volumes: &Volumes) -> Stats {
+    volumes.device(|device| device.stats())
+}
+
+/// What the device did between two snapshots.
+fn print_stats(what: &str, before: Stats, after: Stats) {
+    println!(
+        "  device, {}: {} blocks put, {} write commands for {} blocks; {} read commands for {} blocks, {} blocks from the cache",
+        what,
+        after.blocks_put - before.blocks_put,
+        after.card_writes - before.card_writes,
+        after.blocks_written - before.blocks_written,
+        after.card_reads - before.card_reads,
+        after.blocks_read - before.blocks_read,
+        after.cached_reads - before.cached_reads
+    );
+}
+
 /// Writes `TEST.BIN`, reads it back and compares, then deletes it.
-fn big_file(root: &Root<'_>, mct: Mct, chunk: &mut [u8; CHUNK_BYTES]) -> Result<(), FsError> {
+fn big_file(
+    volumes: &Volumes,
+    root: &Root<'_>,
+    mct: Mct,
+    chunk: &mut [u8; CHUNK_BYTES],
+) -> Result<(), FsError> {
+    let before = stats(volumes);
     let file = root.open_file_in_dir("TEST.BIN", Mode::ReadWriteCreateOrTruncate)?;
     let mut written = FOLD_START;
     let begin = mct.count();
@@ -147,14 +180,17 @@ fn big_file(root: &Root<'_>, mct: Mct, chunk: &mut [u8; CHUNK_BYTES]) -> Result<
         file.write(chunk)?;
     }
     file.close()?;
+    flush(volumes)?;
     let write_us = us(mct.count() - begin);
     println!(
-        "TEST.BIN: wrote {} KiB in {} ms, {} KiB/s, hash {:#010x}",
+        "TEST.BIN: wrote {} KiB in {} ms with the flush, {} KiB/s, hash {:#010x}",
         BIG_BYTES / 1024,
         write_us / 1000,
         kib_per_s(BIG_BYTES, write_us),
         written
     );
+    print_stats("write", before, stats(volumes));
+    let before = stats(volumes);
 
     let file = root.open_file_in_dir("TEST.BIN", Mode::ReadOnly)?;
     let length = file.length();
@@ -179,6 +215,7 @@ fn big_file(root: &Root<'_>, mct: Mct, chunk: &mut [u8; CHUNK_BYTES]) -> Result<
     }
     let read_us = us(mct.count() - begin);
     file.close()?;
+    print_stats("read", before, stats(volumes));
     let good = length == BIG_BYTES && total == BIG_BYTES && read == written && first_bad.is_none();
     println!(
         "TEST.BIN: length {}, read {} KiB in {} ms, {} KiB/s, hash {:#010x}, first bad byte {:?} ({})",
@@ -246,8 +283,8 @@ fn list(root: &Root<'_>) -> Result<(), FsError> {
 
 fn run(card: Mmc, rca: u16, mct: Mct) -> Result<(), FsError> {
     // SAFETY: `run` is called once, and these are the only references to the buffers.
-    let (bounce, chunk) = unsafe { (&mut *BOUNCE.0.get(), &mut *CHUNK.0.get()) };
-    let device = PartitionDevice::new(card, rca, TARGET, bounce)?;
+    let (buffer, chunk) = unsafe { (&mut *DEVICE.0.get(), &mut *CHUNK.0.get()) };
+    let device = PartitionDevice::new(card, rca, TARGET, buffer)?;
     let partition = device.partition();
     println!(
         "CACHE (p{}): blocks {}..{}, {} MiB, type {:#04x} in the card's table",
@@ -278,16 +315,21 @@ fn run(card: Mmc, rca: u16, mct: Mct) -> Result<(), FsError> {
         }
     }
 
-    let volumes: VolumeManager<_, _, 4, 4, 1> = VolumeManager::new(device, FixedTime::default());
+    let volumes: Volumes = VolumeManager::new(device, FixedTime::default());
     let volume = volumes.open_volume(VolumeIdx(0))?;
     let root = volume.open_root_dir()?;
     let boot = count_boot(&root)?;
+    flush(&volumes)?;
     println!("BOOTS.TXT: this is boot {} with this file system", boot);
-    big_file(&root, mct, chunk)?;
+    big_file(&volumes, &root, mct, chunk)?;
     append_log(&root, boot)?;
+    flush(&volumes)?;
     list(&root)?;
     root.close()?;
     volume.close()?;
+    flush(&volumes)?;
+    let total = stats(&volumes);
+    print_stats("whole run", Stats::default(), total);
     Ok(())
 }
 

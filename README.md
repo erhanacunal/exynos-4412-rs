@@ -709,7 +709,14 @@ CACHE (p8, 445 MiB) is the one used, since nothing on this board needs what it h
   from block 1 on, and block `n` is block `n - 1` of the partition. The card's own table is not
   changed, so p8 keeps its Linux type byte there. Writes to the made-up block 0 are refused, and
   all others go through an `MmcWriter` for p8, with the limits of the eMMC section. Transfers go
-  through a 32 KiB bounce buffer, since the crate's blocks need not start on a cache line.
+  through a buffer the caller gives, since the crate's blocks need not start on a cache line.
+- **Write cache:** writes stay in the device until `PartitionDevice::flush`, or until the cache
+  is full. Consecutive blocks, the file data, gather in one run, written with one command; the
+  test gives it 256 KiB. Up to 8 other blocks, the FAT blocks of both copies and directory
+  entries, which the crate writes again for each cluster, wait in slots, and each new write of
+  one replaces the cached copy. Reads see the cached blocks. A flush writes the run before the
+  slots, so file data reaches the card before the FAT entries that point at it. The crate never
+  asks for a flush: call it after closing files, through `VolumeManager::device`.
 - **Formatter:** `embedded-sdmmc` does not format. `PartitionDevice::format` follows Microsoft's
   FAT specification (`fatgen103`): 512-byte sectors, 8 per cluster up to 8 GiB, 32 reserved
   sectors, two FATs, the FSInfo sector at 1 and a copy of the boot sector at 6. It clears the
@@ -737,8 +744,22 @@ two boots:
 | Card's table | p8 still type `0x83` | p8 still type `0x83` |
 
 Both directions are far below what the driver reaches (75 MB/s reading, 21 MB/s writing with
-DMA), because `embedded-sdmmc` moves one block per call: each written block is its own `CMD24`,
-waited on until programmed, besides the FAT and directory updates.
+DMA), because `embedded-sdmmc` moves one block per call: each written block was its own `CMD24`,
+waited on until programmed, besides the FAT and directory updates. With the write cache, on the
+third boot:
+
+| Check | Without cache | With cache |
+|---|---|---|
+| `TEST.BIN` write, 1 MiB, flush included | 1847 ms, 554 KiB/s | 85 ms, 11980 KiB/s |
+| Blocks the crate wrote, while writing it | | 3073 |
+| Write commands to the card | one per block | 12, for 2056 blocks |
+| Reads while writing | | 7 from the card, 264 from the cache |
+| `TEST.BIN` read back | 244 ms | 253 ms, same hash, no bad byte: 2304 single block reads |
+| `LOGS/BOOT.LOG` | | 24 bytes after the third boot, as expected |
+| Whole test | 2136 ms | 426 ms |
+
+Reads are now most of the time. The crate reads one block per call, and also reads the FAT
+block again for each 4 KiB cluster: 2048 data blocks and 256 FAT reads for 1 MiB.
 
 ## WiFi
 
