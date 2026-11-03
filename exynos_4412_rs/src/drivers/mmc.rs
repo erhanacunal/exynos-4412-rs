@@ -18,8 +18,14 @@
 //!
 //! # Transfer
 //!
-//! The CPU reads the controller's FIFO by polling. No DMA and no interrupts, so caches need no
-//! maintenance.
+//! Two ways, both polled, without interrupts:
+//!
+//! - [`Mmc::read_blocks`]: the CPU reads the controller's FIFO. Caches need no maintenance.
+//! - [`Mmc::read_blocks_dma`]: the controller's own DMA engine, the IDMAC, writes DRAM from a
+//!   chain of descriptors. The buffer is dropped from the caches before and after
+//!   ([`mmu::discard_dcache_range`], [`mmu::invalidate_dcache_range`]), so it must be whole cache
+//!   lines in DRAM. Every return, error or not, stops the engine first, so nothing writes the
+//!   buffer once the borrow ends.
 //!
 //! Register offsets and fields are verified against Linux 5.15.198
 //! `drivers/mmc/host/dw_mmc.h`, cited as `dw_mmc.h:<line>`, and command numbers against
@@ -35,8 +41,10 @@ use tock_registers::interfaces::{Readable, Writeable};
 use tock_registers::register_structs;
 use tock_registers::registers::{ReadOnly, ReadWrite};
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use super::cmu::Cmu;
-use crate::soc;
+use crate::{mmu, soc};
 
 register_structs! {
     Registers {
@@ -69,7 +77,7 @@ register_structs! {
         /// dw_mmc.h:298.
         (0x048 => status: ReadOnly<u32>),
         /// dw_mmc.h:299.
-        (0x04C => fifoth: ReadOnly<u32>),
+        (0x04C => fifoth: ReadWrite<u32>),
         (0x050 => _reserved4),
         /// dw_mmc.h:307.
         (0x06C => verid: ReadOnly<u32>),
@@ -78,7 +86,18 @@ register_structs! {
         (0x074 => _reserved5),
         /// dw_mmc.h:311.
         (0x080 => bmod: ReadWrite<u32>),
-        (0x084 => _reserved6),
+        /// dw_mmc.h:312: any write makes the IDMAC read the descriptors again.
+        (0x084 => pldmnd: ReadWrite<u32>),
+        /// dw_mmc.h:313: the first descriptor.
+        (0x088 => dbaddr: ReadWrite<u32>),
+        /// dw_mmc.h:314.
+        (0x08C => idsts: ReadWrite<u32>),
+        /// dw_mmc.h:315.
+        (0x090 => idinten: ReadWrite<u32>),
+        /// dw_mmc.h:316: the descriptor the IDMAC is at.
+        (0x094 => dscaddr: ReadOnly<u32>),
+        /// dw_mmc.h:317: the buffer address it is at.
+        (0x098 => bufaddr: ReadOnly<u32>),
         /// `dw_mmc-exynos.h:11`.
         (0x09C => clksel: ReadOnly<u32>),
         (0x0A0 => @END),
@@ -94,12 +113,54 @@ const CTRL_USE_IDMAC: u32 = 1 << 25;
 const CTRL_DMA_ENABLE: u32 = 1 << 5;
 /// dw_mmc.h:354.
 const CTRL_INT_ENABLE: u32 = 1 << 4;
+/// dw_mmc.h:355.
+const CTRL_DMA_RESET: u32 = 1 << 2;
 /// dw_mmc.h:356.
 const CTRL_FIFO_RESET: u32 = 1 << 1;
 /// dw_mmc.h:360.
 const CLKENA_ENABLE: u32 = 1 << 0;
 /// dw_mmc.h:434.
 const BMOD_IDMAC_ENABLE: u32 = 1 << 7;
+/// dw_mmc.h:435: fixed bursts, as Linux sets.
+const BMOD_FIXED_BURST: u32 = 1 << 1;
+/// dw_mmc.h:436.
+const BMOD_SWRESET: u32 = 1 << 0;
+
+/// dw_mmc.h:426-432, the IDMAC's status: abnormal summary, normal summary, card error summary,
+/// descriptor unavailable, fatal bus error, receive done, transmit done.
+const IDSTS_AI: u32 = 1 << 9;
+const IDSTS_NI: u32 = 1 << 8;
+const IDSTS_CES: u32 = 1 << 5;
+const IDSTS_DU: u32 = 1 << 4;
+const IDSTS_FBE: u32 = 1 << 2;
+const IDSTS_RI: u32 = 1 << 1;
+const IDSTS_TI: u32 = 1 << 0;
+/// `dw_mmc.c:58-61` `IDMAC_INT_CLR`.
+const IDSTS_ALL: u32 = IDSTS_AI | IDSTS_NI | IDSTS_CES | IDSTS_DU | IDSTS_FBE | IDSTS_RI | IDSTS_TI;
+const IDSTS_ERRORS: u32 = IDSTS_CES | IDSTS_DU | IDSTS_FBE;
+
+/// `dw_mmc.c:86-103` `struct idmac_desc`, 32-bit addresses: control word bits.
+const DES0_DIC: u32 = 1 << 1;
+const DES0_LD: u32 = 1 << 2;
+const DES0_FD: u32 = 1 << 3;
+const DES0_CH: u32 = 1 << 4;
+const DES0_OWN: u32 = 1 << 31;
+/// `dw_mmc.c:106` `DW_MCI_DESC_DATA_LENGTH`: what one chained descriptor moves.
+const DESCRIPTOR_BYTES: usize = 0x1000;
+/// Descriptors in the chain. Linux has one page of them (`dw_mmc.c:63`), 256.
+const DESCRIPTORS: usize = 256;
+/// The most one command moves; longer reads take several.
+const DMA_CHUNK_BYTES: usize = DESCRIPTORS * DESCRIPTOR_BYTES;
+const DESCRIPTOR_WORDS: usize = 4;
+
+/// dw_mmc.h:421 `SDMMC_GET_TRANS_MODE`, 0 being dw_mmc.h:417 `DMA_INTERFACE_IDMA`.
+const HCON_TRANS_MODE_SHIFT: u32 = 16;
+const HCON_TRANS_MODE_MASK: u32 = 0x3;
+/// dw_mmc.h:424 `SDMMC_GET_ADDR_CONFIG`: 1 for 64-bit descriptors, which this does not build.
+const HCON_ADDR_64: u32 = 1 << 27;
+
+/// `exynos4412.dtsi`, `mshc_0`: `fifo-depth = <0x80>`, in FIFO words.
+const FIFO_DEPTH: u32 = 0x80;
 
 /// dw_mmc.h:372.
 const INT_EBE: u32 = 1 << 15;
@@ -230,6 +291,70 @@ pub enum Error {
     Data(u32),
     /// Nothing happened within the time limit. Holds the raw interrupt status.
     Timeout(u32),
+    /// The controller has no IDMAC, or one with 64-bit descriptors. Holds `HCON`.
+    NoIdmac(u32),
+    /// A DMA buffer that does not start on a cache line or is not in DRAM.
+    BadBuffer,
+    /// The IDMAC stopped on an error, or did not finish in time.
+    Dma(DmaState),
+}
+
+/// Where a DMA read stood when it failed, as raw registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaState {
+    /// `RINTSTS`.
+    pub rintsts: u32,
+    /// `IDSTS`.
+    pub idsts: u32,
+    /// `STATUS`: bits 29:17 count the words left in the FIFO.
+    pub status: u32,
+    /// `DSCADDR`: the descriptor the IDMAC was at.
+    pub dscaddr: u32,
+    /// `BUFADDR`: the address it was writing.
+    pub bufaddr: u32,
+    /// The descriptor chain's start, to compare with `dscaddr`.
+    pub dbaddr: u32,
+}
+
+fn dma_state() -> DmaState {
+    let regs = regs();
+    DmaState {
+        rintsts: regs.rintsts.get(),
+        idsts: regs.idsts.get(),
+        status: regs.status.get(),
+        dscaddr: regs.dscaddr.get(),
+        bufaddr: regs.bufaddr.get(),
+        dbaddr: regs.dbaddr.get(),
+    }
+}
+
+/// The descriptor chain. Only [`Mmc::read_blocks_dma`] touches it, one call at a time.
+#[repr(C, align(32))]
+struct Descriptors([AtomicU32; DESCRIPTORS * DESCRIPTOR_WORDS]);
+
+static DESCRIPTORS_RING: Descriptors =
+    Descriptors([const { AtomicU32::new(0) }; DESCRIPTORS * DESCRIPTOR_WORDS]);
+
+/// `FIFOTH` for 512-byte blocks: `dw_mmc.c` `dw_mci_adjust_fifoth`. The burst is the largest
+/// of 1 to 256 words that divides both a block and the free half of the FIFO, and the receive
+/// watermark is one less than it.
+const fn fifoth_for_blocks(fifo_width: u32) -> u32 {
+    const SIZES: [u32; 8] = [1, 4, 8, 16, 32, 64, 128, 256];
+    let block_words = BLOCK_SIZE as u32 / fifo_width;
+    let tx_wmark = FIFO_DEPTH / 2;
+    let tx_free = FIFO_DEPTH - tx_wmark;
+    let mut index = SIZES.len() - 1;
+    let (mut msize, mut rx_wmark) = (0, 1);
+    while index > 0 {
+        if block_words.is_multiple_of(SIZES[index]) && tx_free.is_multiple_of(SIZES[index]) {
+            msize = index as u32;
+            rx_wmark = SIZES[index] - 1;
+            break;
+        }
+        index -= 1;
+    }
+    // dw_mmc.h:413 `SDMMC_SET_FIFOTH`.
+    (msize & 0x7) << 28 | (rx_wmark & 0xFFF) << 16 | (tx_wmark & 0xFFF)
 }
 
 /// What [`Mmc::read_ext_csd`] finds.
@@ -286,6 +411,7 @@ pub struct ControllerState {
 pub struct Mmc {
     fifo: usize,
     fifo_64: bool,
+    dma_fifoth: u32,
 }
 
 /// The controller's state, or `None` if its gate is closed, when reading it could hang.
@@ -335,7 +461,23 @@ impl Mmc {
         regs.bmod.set(regs.bmod.get() & !BMOD_IDMAC_ENABLE);
 
         let offset = if regs.verid.get() & 0xFFFF < VERID_240A { FIFO_OFFSET } else { FIFO_240A_OFFSET };
-        Ok(Self { fifo: soc::MSHC_BASE + offset, fifo_64: hdata == HDATA_64 })
+        let fifo_64 = hdata == HDATA_64;
+        Ok(Self {
+            fifo: soc::MSHC_BASE + offset,
+            fifo_64,
+            dma_fifoth: fifoth_for_blocks(if fifo_64 { 8 } else { 4 }),
+        })
+    }
+
+    /// The `FIFOTH` value DMA reads set: burst size and watermarks.
+    pub const fn dma_fifoth(&self) -> u32 {
+        self.dma_fifoth
+    }
+
+    /// Sets another `FIFOTH` for DMA reads, to compare settings. `mmc_test` uses it.
+    #[doc(hidden)]
+    pub const fn set_dma_fifoth(&mut self, value: u32) {
+        self.dma_fifoth = value;
     }
 
     /// Whether the FIFO is 64 bits wide, rather than 32.
@@ -417,13 +559,7 @@ impl Mmc {
 
     fn transfer(&self, command: Command, argument: u32, buffer: &mut [u8]) -> Result<(), Error> {
         let regs = regs();
-        let mut polls = 0;
-        while regs.status.get() & STATUS_BUSY != 0 {
-            polls += 1;
-            if polls == POLL_LIMIT {
-                return Err(Error::Timeout(regs.rintsts.get()));
-            }
-        }
+        wait_not_busy()?;
         self.reset_fifo()?;
         regs.blksiz.set(BLOCK_SIZE as u32);
         regs.bytcnt.set(buffer.len() as u32);
@@ -431,7 +567,7 @@ impl Mmc {
         self.command(command, argument)?;
 
         let mut done = 0;
-        polls = 0;
+        let mut polls = 0;
         loop {
             let status = regs.rintsts.get();
             if status & DATA_ERRORS != 0 {
@@ -453,28 +589,122 @@ impl Mmc {
             }
         }
 
-        // The automatic stop has its own completion.
         if command == Command::ReadMultipleBlock {
-            polls = 0;
-            while regs.rintsts.get() & INT_ACD == 0 {
-                polls += 1;
-                if polls == POLL_LIMIT {
-                    return Err(Error::Timeout(regs.rintsts.get()));
-                }
-            }
+            wait_auto_stop()?;
         }
         Ok(())
     }
 
     fn reset_fifo(&self) -> Result<(), Error> {
+        reset_ctrl(CTRL_FIFO_RESET)
+    }
+
+    /// Reads whole blocks into `buffer`, from block `lba` of the user area, as
+    /// [`read_blocks`](Self::read_blocks) does, but through the IDMAC. `buffer` must start on a
+    /// cache line ([`mmu::DCACHE_LINE`]) and lie in DRAM, where addresses are physical ones.
+    /// Reads of more than 1 MiB take one command per MiB.
+    pub fn read_blocks_dma(&self, lba: u32, buffer: &mut [u8]) -> Result<(), Error> {
+        if buffer.is_empty() || !buffer.len().is_multiple_of(BLOCK_SIZE) || buffer.len() > u32::MAX as usize {
+            return Err(Error::BadLength);
+        }
+        let start = buffer.as_ptr() as usize;
+        let in_dram = start >= soc::DRAM_BASE && start + buffer.len() <= soc::DRAM_BASE + soc::DRAM_SIZE;
+        if !start.is_multiple_of(mmu::DCACHE_LINE) || !in_dram {
+            return Err(Error::BadBuffer);
+        }
+        let hcon = regs().hcon.get();
+        if (hcon >> HCON_TRANS_MODE_SHIFT) & HCON_TRANS_MODE_MASK != 0 || hcon & HCON_ADDR_64 != 0 {
+            return Err(Error::NoIdmac(hcon));
+        }
+        let mut lba = lba;
+        for chunk in buffer.chunks_mut(DMA_CHUNK_BYTES) {
+            let result = self.transfer_dma(lba, chunk);
+            // Whatever happened, the engine is stopped by now, and the CPU must read DRAM.
+            mmu::invalidate_dcache_range(chunk.as_ptr() as usize, chunk.len());
+            result?;
+            lba += (chunk.len() / BLOCK_SIZE) as u32;
+        }
+        Ok(())
+    }
+
+    /// One command's worth: at most [`DMA_CHUNK_BYTES`]. In the order of Linux 5.15.198
+    /// `dw_mci_submit_data_dma` and `dw_mci_idmac_start_dma`: the data registers, `FIFOTH`, the
+    /// DMA interface, the descriptors, the IDMAC, then the command. Stops the IDMAC on every
+    /// return.
+    fn transfer_dma(&self, lba: u32, chunk: &mut [u8]) -> Result<(), Error> {
         let regs = regs();
-        regs.ctrl.set(regs.ctrl.get() | CTRL_FIFO_RESET);
+        wait_not_busy()?;
+        self.reset_fifo()?;
+        regs.blksiz.set(BLOCK_SIZE as u32);
+        regs.bytcnt.set(chunk.len() as u32);
+        regs.fifoth.set(self.dma_fifoth);
+
+        let start = chunk.as_ptr() as usize;
+        let count = chunk.len().div_ceil(DESCRIPTOR_BYTES);
+        for index in 0..count {
+            let bytes = (chunk.len() - index * DESCRIPTOR_BYTES).min(DESCRIPTOR_BYTES);
+            let last = index == count - 1;
+            let mut control = DES0_OWN;
+            if index == 0 {
+                control |= DES0_FD;
+            }
+            // `dw_mci_prepare_desc32`: all but the last are chained, without their interrupt.
+            control |= if last { DES0_LD } else { DES0_CH | DES0_DIC };
+            let words = &DESCRIPTORS_RING.0[index * DESCRIPTOR_WORDS..][..DESCRIPTOR_WORDS];
+            words[0].store(control, Ordering::Relaxed);
+            words[1].store(bytes as u32, Ordering::Relaxed);
+            words[2].store((start + index * DESCRIPTOR_BYTES) as u32, Ordering::Relaxed);
+            words[3].store(words[DESCRIPTOR_WORDS..].as_ptr() as u32, Ordering::Relaxed);
+        }
+        let ring = DESCRIPTORS_RING.0.as_ptr() as usize;
+        let ring_bytes = (count * DESCRIPTOR_WORDS * 4).next_multiple_of(mmu::DCACHE_LINE);
+        mmu::clean_dcache_range(ring, ring_bytes);
+        // No dirty line of the buffer may be written over what the IDMAC writes.
+        mmu::discard_dcache_range(start, chunk.len());
+
+        let result = self.run_dma(lba, chunk.len(), ring);
+        stop_dma();
+        result
+    }
+
+    fn run_dma(&self, lba: u32, length: usize, ring: usize) -> Result<(), Error> {
+        let regs = regs();
+        regs.ctrl.set(regs.ctrl.get() | CTRL_DMA_ENABLE);
+        reset_ctrl(CTRL_DMA_RESET)?;
+        regs.bmod.set(regs.bmod.get() | BMOD_SWRESET);
+        // As Linux enables them (`dw_mci_idmac_init`). With `CTRL_INT_ENABLE` off, no interrupt
+        // leaves the controller.
+        regs.idinten.set(IDSTS_NI | IDSTS_RI | IDSTS_TI);
+        regs.idsts.set(IDSTS_ALL);
+        regs.dbaddr.set(ring as u32);
+        regs.ctrl.set(regs.ctrl.get() | CTRL_USE_IDMAC);
+        regs.bmod.set(regs.bmod.get() | BMOD_IDMAC_ENABLE | BMOD_FIXED_BURST);
+        regs.pldmnd.set(1);
+
+        let command = if length == BLOCK_SIZE { Command::ReadSingleBlock } else { Command::ReadMultipleBlock };
+        self.command(command, lba)?;
+
+        // Done when the card has sent everything and the IDMAC has written it.
         let mut polls = 0;
-        while regs.ctrl.get() & CTRL_FIFO_RESET != 0 {
+        loop {
+            let status = regs.rintsts.get();
+            let dma = regs.idsts.get();
+            if status & DATA_ERRORS != 0 {
+                return Err(Error::Data(status));
+            }
+            if dma & IDSTS_ERRORS != 0 {
+                return Err(Error::Dma(dma_state()));
+            }
+            if status & INT_DATA_OVER != 0 && dma & IDSTS_RI != 0 {
+                break;
+            }
             polls += 1;
             if polls == POLL_LIMIT {
-                return Err(Error::Timeout(regs.rintsts.get()));
+                return Err(Error::Dma(dma_state()));
             }
+        }
+        if command == Command::ReadMultipleBlock {
+            wait_auto_stop()?;
         }
         Ok(())
     }
@@ -510,6 +740,59 @@ impl Mmc {
         let count = left.min(width);
         buffer[done..done + count].copy_from_slice(&word[..count]);
         done + width
+    }
+}
+
+fn wait_not_busy() -> Result<(), Error> {
+    let regs = regs();
+    let mut polls = 0;
+    while regs.status.get() & STATUS_BUSY != 0 {
+        polls += 1;
+        if polls == POLL_LIMIT {
+            return Err(Error::Timeout(regs.rintsts.get()));
+        }
+    }
+    Ok(())
+}
+
+/// The automatic stop after a multiple block read has its own completion.
+fn wait_auto_stop() -> Result<(), Error> {
+    let regs = regs();
+    let mut polls = 0;
+    while regs.rintsts.get() & INT_ACD == 0 {
+        polls += 1;
+        if polls == POLL_LIMIT {
+            return Err(Error::Timeout(regs.rintsts.get()));
+        }
+    }
+    Ok(())
+}
+
+/// Sets reset bits in `CTRL` and waits for them to clear: `dw_mci_ctrl_reset`.
+fn reset_ctrl(bits: u32) -> Result<(), Error> {
+    let regs = regs();
+    regs.ctrl.set(regs.ctrl.get() | bits);
+    let mut polls = 0;
+    while regs.ctrl.get() & bits != 0 {
+        polls += 1;
+        if polls == POLL_LIMIT {
+            return Err(Error::Timeout(regs.rintsts.get()));
+        }
+    }
+    Ok(())
+}
+
+/// Takes the controller back from the IDMAC: `dw_mci_idmac_stop_dma`, then the DMA interface
+/// off, as [`Mmc::new`] leaves it for polled reads.
+fn stop_dma() {
+    let regs = regs();
+    regs.ctrl.set((regs.ctrl.get() & !(CTRL_USE_IDMAC | CTRL_DMA_ENABLE)) | CTRL_DMA_RESET);
+    regs.bmod.set((regs.bmod.get() & !(BMOD_IDMAC_ENABLE | BMOD_FIXED_BURST)) | BMOD_SWRESET);
+    // A reset that does not finish leaves nothing better to do: the next transfer's own reset
+    // reports it.
+    let mut polls = 0;
+    while regs.ctrl.get() & CTRL_DMA_RESET != 0 && polls < POLL_LIMIT {
+        polls += 1;
     }
 }
 

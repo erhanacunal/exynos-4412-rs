@@ -402,6 +402,7 @@ not present. The bank table is the same as Linux `pinctrl-exynos-arm.c:355-414`.
   The power key gave exactly 8 edges in 4 presses. The driver has no filter; edge-driven code must do its
   own filtering. 5 ms polling showed no bounce in this test.
 - **State from U-Boot:** `gpd0-1` comes as `Output` and high, not in its PWM function. That is why the
+  Since then, `entry!` turns it off before `main`, so `gpio_test` shows it low.
   backlight blinks directly with this pin.
 
 ## I2C
@@ -506,6 +507,10 @@ polled. `display_test` shows it working.
 - **Not present:** Other windows, System MMU, display interrupts (they come through the interrupt
   combiner), brightness control (the backlight pin needs the PWM; here it is fully on or off).
 
+Every application starts with the panel off: `entry!` calls `display::panel_off` before `main`,
+which turns off the backlight, then the LVDS transmitter, both left on by U-Boot. This saves the
+battery. An application that shows something turns them on again, as `display_test` does.
+
 `Fimd::set_solid_color` shows one color from a register, without reading DRAM. It tells a panel
 problem from a framebuffer problem.
 
@@ -570,7 +575,15 @@ its MBR and the chain of extended boot records.
   it is ready, and bus width and clock stay as they are. `CMD6` would be needed to change them, and it
   writes to the card's `EXT_CSD`.
 - **Limit:** A failed read may leave the card unusable until a restart, as there is no recovery.
-- **Transfer:** Polled through the FIFO, with no DMA and no interrupts.
+- **Transfer:** Two ways, both polled, without interrupts.
+  - `read_blocks`: the CPU reads the FIFO.
+  - `read_blocks_dma`: the controller's DMA engine, the IDMAC, writes DRAM through a chain of up
+    to 256 descriptors of 4 KiB, 1 MiB per command. The order of setup is Linux's
+    (`dw_mci_submit_data_dma`, `dw_mci_idmac_start_dma`). `FIFOTH` is set the way
+    `dw_mci_adjust_fifoth` sets it, for the DTS FIFO depth of 128. The buffer must start on a
+    32-byte line in DRAM, and is discarded from the caches before the read and invalidated
+    after it. Every return, error or not, stops the IDMAC first, so it cannot write the buffer
+    after the call.
 
 Test on the board: `make img APP=mmc_test`, same flashing step. Observed:
 
@@ -583,7 +596,18 @@ Test on the board: `make img APP=mmc_test`, same flashing step. Observed:
 | `bootcmd` block `0x10040` | Start of p5, begins with `ANDROID!` |
 | Ext superblock magic | p3, p9, p10: yes. p8: no, it reads `0x3ba0` |
 | Single against multiple block reads | Same data |
-| 16 MiB from SYSTEM, read twice | Same data, about 15800 KiB/s |
+| 16 MiB from SYSTEM, read twice | Same data, about 15800 KiB/s with 1 MiB reads, 16529 KiB/s with 2 MiB reads |
+| DMA: 1, 9, 2048, 4096 blocks | Same data as polled, guard lines kept, with both Linux's `FIFOTH` `0x503f0040` (64-word bursts) and U-Boot's `0x20400040` (8-word bursts) |
+| DMA: 16 MiB from SYSTEM, read twice | Same data as polled, 74902 KiB/s (U-Boot's `FIFOTH`), 4.5 times the polled speed |
+
+In the DMA cases, each read is first done polled. Then stale bytes go over the buffer and guard
+values into a line on each side, all cleaned to DRAM. The DMA read must then give the polled
+data, and DRAM, read through `mmu::DRAM_UNCACHED`, must still hold the guard values. 9 blocks
+cross a descriptor off a 4 KiB boundary. 4096 blocks take two commands.
+
+The first version left `IDINTEN` at 0. The card finished each read (`DATA_OVER`, then `ACD`), but
+`IDSTS` never showed `RI`, and data stayed in the FIFO. With `IDINTEN` set as Linux sets it
+(`NI | RI | TI`), every case passed. Interrupts still stay off, since `CTRL_INT_ENABLE` is clear.
 
 `EXT_CSD` `BUS_WIDTH` reads 0 although the controller is in 8-bit mode, and data arrives without CRC
 errors. p10 is 28295104 blocks on the card, which ends it exactly where the extended partition ends.
@@ -838,6 +862,3 @@ A `qemu` target was not added, by project decision; testing is done on the real 
 `drivers::cmu` opens the clock gate of the FIMD's System MMU, which stays off. Whether a closed gate
 would block the FIMD's reads is not verified.
 
-
-The UART4 address is not in the Linux 5.15 DTS. Its source is the vendor kernel (`/home/developer/willow`,
-3.0.101, details in `soc.rs`). Comparing it against the board's user manual would be good.

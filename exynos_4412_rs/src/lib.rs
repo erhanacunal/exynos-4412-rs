@@ -74,6 +74,10 @@ pub struct BootArgs {
 ///
 /// The function must have the signature `fn(BootArgs) -> !`; anything else fails
 /// to compile. Omitting `entry!` fails to link, on the symbol `__exynos_main`.
+///
+/// Before `main`, it turns the panel's backlight and LVDS transmitter off
+/// ([`drivers::display::panel_off`]), which U-Boot leaves on: an application that uses the
+/// display turns them on again.
 #[macro_export]
 macro_rules! entry {
     ($main:path) => {
@@ -81,6 +85,7 @@ macro_rules! entry {
             #[unsafe(no_mangle)]
             extern "C" fn __exynos_main(r0: u32, r1: u32, r2: u32, load_addr: u32) -> ! {
                 let main: fn($crate::BootArgs) -> ! = $main;
+                $crate::drivers::display::panel_off();
                 main($crate::BootArgs { r0, r1, r2, load_addr })
             }
         };

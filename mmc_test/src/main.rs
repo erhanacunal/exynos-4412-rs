@@ -2,8 +2,9 @@
 //!
 //! Reports what U-Boot left, reads `EXT_CSD`, and parses the partition table, comparing it with
 //! the table known for this board. Then checks a few partitions' first blocks, and that
-//! repeated reads agree and how fast they are. Prints no partition contents, except the first
-//! bytes of the boot partition and magic numbers.
+//! repeated reads agree and how fast they are. Then the same through DMA: each read must match
+//! the polled one, and leave the memory around the buffer untouched. Prints no partition
+//! contents, except the first bytes of the boot partition and magic numbers.
 
 #![no_std]
 #![no_main]
@@ -51,20 +52,31 @@ const EXT_MAGIC: u16 = 0xEF53;
 const RCA_GUESSES: [u16; 2] = [1, 2];
 /// Blocks for comparing single and multiple block reads.
 const COMPARE_BLOCKS: usize = 8;
-const BLOCKS_PER_READ: usize = 2048;
-const READS: u32 = 16;
+const BLOCKS_PER_READ: usize = 4096;
+const READS: u32 = 8;
 /// Where the speed test reads: the start of SYSTEM.
 const SPEED_LBA: u32 = 1028160;
 const CHUNK_BYTES: usize = BLOCKS_PER_READ * BLOCK_SIZE;
 
+/// Room around the DMA test's buffers: a line for the offset and a guard line on each side.
+const GUARD_BYTES: usize = mmu::DCACHE_LINE;
+const ROOM_BYTES: usize = CHUNK_BYTES + 4 * GUARD_BYTES;
+/// DMA test cases: blocks, and lines from the start of the room to the first guard line. One
+/// block; nine, crossing a descriptor, off a 4 KiB boundary; one full chain, 1 MiB; and two
+/// chains, so two commands.
+const DMA_CASES: [(usize, usize); 4] = [(1, 0), (9, 1), (2048, 0), (4096, 1)];
+const GUARD_FILL: u8 = 0xA5;
+/// Written over a buffer before DMA, and cleaned to DRAM, so a read that did not happen shows.
+const STALE_FILL: u8 = 0x5A;
+
 /// Read buffer, too large for the stack.
 #[repr(align(32))]
-struct Chunk(UnsafeCell<[u8; CHUNK_BYTES]>);
+struct Chunk(UnsafeCell<[u8; ROOM_BYTES]>);
 
 // SAFETY: `main` is the only user, and takes the one reference to it once.
 unsafe impl Sync for Chunk {}
 
-static CHUNK: Chunk = Chunk(UnsafeCell::new([0; CHUNK_BYTES]));
+static CHUNK: Chunk = Chunk(UnsafeCell::new([0; ROOM_BYTES]));
 
 struct Device(Mmc);
 
@@ -161,7 +173,7 @@ fn check_boot(card: Mmc) {
             core::str::from_utf8(&block[..ANDROID_MAGIC.len()]).unwrap_or("not text"),
             if block.starts_with(ANDROID_MAGIC) { "OK" } else { "MISMATCH" },
         ),
-        Err(error) => println!("Block {:#x} ERROR {:?}", BOOTCMD_LBA, error),
+        Err(error) => println!("Block {:#x} ERROR {:x?}", BOOTCMD_LBA, error),
     }
 }
 
@@ -181,7 +193,7 @@ fn check_filesystems(card: Mmc, partitions: &[Partition]) {
                     if magic == EXT_MAGIC { "ext" } else { "not ext" },
                 );
             }
-            Err(error) => println!("p{} ERROR {:?}", index, error),
+            Err(error) => println!("p{} ERROR {:x?}", index, error),
         }
     }
 }
@@ -193,12 +205,12 @@ fn check_single_against_multiple(card: Mmc, buffer: &mut [u8]) {
     for index in 0..COMPARE_BLOCKS {
         let block = &mut one_by_one[index * BLOCK_SIZE..][..BLOCK_SIZE];
         if let Err(error) = card.read_blocks(SPEED_LBA + index as u32, block) {
-            println!("Single block read ERROR {:?}", error);
+            println!("Single block read ERROR {:x?}", error);
             return;
         }
     }
     if let Err(error) = card.read_blocks(SPEED_LBA, together) {
-        println!("Multiple block read ERROR {:?}", error);
+        println!("Multiple block read ERROR {:x?}", error);
         return;
     }
     println!(
@@ -212,17 +224,24 @@ fn fold(buffer: &[u8]) -> u32 {
     buffer.iter().fold(0x811C_9DC5, |hash: u32, byte| (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193))
 }
 
-/// Reads a stretch twice, measuring speed. The two passes must agree.
-fn check_speed(mct: Mct, card: Mmc, buffer: &mut [u8]) {
+/// Reads a stretch twice with `read`, measuring speed. The two passes must agree. Returns their
+/// hash, or `None` after an error.
+fn check_speed(
+    mct: Mct,
+    card: Mmc,
+    name: &str,
+    read: fn(&Mmc, u32, &mut [u8]) -> Result<(), mmc::Error>,
+    buffer: &mut [u8],
+) -> Option<u32> {
     let mut hashes = [0u32; 2];
     for (pass, hash) in hashes.iter_mut().enumerate() {
         let mut time = 0;
         for round in 0..READS {
             let start = mct.count();
             let lba = SPEED_LBA + round * BLOCKS_PER_READ as u32;
-            if let Err(error) = card.read_blocks(lba, buffer) {
-                println!("Pass {} read at block {} ERROR {:?}", pass + 1, lba, error);
-                return;
+            if let Err(error) = read(&card, lba, buffer) {
+                println!("{} pass {} read at block {} ERROR {:x?}", name, pass + 1, lba, error);
+                return None;
             }
             time += mct.count() - start;
             *hash = hash.wrapping_mul(31).wrapping_add(fold(buffer));
@@ -230,7 +249,8 @@ fn check_speed(mct: Mct, card: Mmc, buffer: &mut [u8]) {
         let bytes = u64::from(READS) * CHUNK_BYTES as u64;
         let us = time / (u64::from(soc::MCT_CLOCK_HZ) / 1_000_000);
         println!(
-            "Pass {}: {} MiB in {} us, {} KiB/s, hash {:#010x}",
+            "{} pass {}: {} MiB in {} us, {} KiB/s, hash {:#010x}",
+            name,
             pass + 1,
             bytes / (1024 * 1024),
             us,
@@ -238,7 +258,58 @@ fn check_speed(mct: Mct, card: Mmc, buffer: &mut [u8]) {
             *hash,
         );
     }
-    println!("Both passes: {}", if hashes[0] == hashes[1] { "OK" } else { "MISMATCH" });
+    println!("{} both passes: {}", name, if hashes[0] == hashes[1] { "OK" } else { "MISMATCH" });
+    Some(hashes[0])
+}
+
+/// How many bytes of `bytes` DRAM holds as `value`, read past the caches.
+fn dram_matching(bytes: &[u8], value: u8) -> usize {
+    let start = mmu::uncached(bytes.as_ptr() as usize).expect("buffer outside the uncached view");
+    (0..bytes.len())
+        // SAFETY: `uncached` maps a live static's address to the same DRAM, readable. Reading
+        // changes nothing in the caches or in DRAM.
+        .filter(|index| unsafe { core::ptr::read_volatile((start as *const u8).add(*index)) } == value)
+        .count()
+}
+
+/// Each case: a polled read, then stale bytes over the buffer and guard values around it, all
+/// cleaned to DRAM, then the DMA read. It must give the polled data, and DRAM must still hold
+/// the guard values.
+fn check_dma_cases(card: Mmc, room: &mut [u8]) {
+    println!("DMA FIFOTH {:#010x}", card.dma_fifoth());
+    for (blocks, offset_lines) in DMA_CASES {
+        let length = blocks * BLOCK_SIZE;
+        let guard_start = offset_lines * mmu::DCACHE_LINE;
+        let (before, rest) = room[guard_start..].split_at_mut(GUARD_BYTES);
+        let (buffer, rest) = rest.split_at_mut(length);
+        let after = &mut rest[..GUARD_BYTES];
+
+        if let Err(error) = card.read_blocks(SPEED_LBA, buffer) {
+            println!("DMA case {} blocks: polled read ERROR {:x?}", blocks, error);
+            return;
+        }
+        let polled = fold(buffer);
+        buffer.fill(STALE_FILL);
+        before.fill(GUARD_FILL);
+        after.fill(GUARD_FILL);
+        mmu::clean_dcache_range(before.as_ptr() as usize, 2 * GUARD_BYTES + length);
+
+        if let Err(error) = card.read_blocks_dma(SPEED_LBA, buffer) {
+            println!("DMA case {} blocks: ERROR {:x?}", blocks, error);
+            continue;
+        }
+        let same = fold(buffer) == polled;
+        let guards = dram_matching(before, GUARD_FILL) + dram_matching(after, GUARD_FILL);
+        println!(
+            "DMA {} blocks at {:#x}: same as polled {}, guard bytes kept {} of {}: {}",
+            blocks,
+            buffer.as_ptr() as usize,
+            same,
+            guards,
+            2 * GUARD_BYTES,
+            if same && guards == 2 * GUARD_BYTES { "OK" } else { "MISMATCH" },
+        );
+    }
 }
 
 fn main(_args: BootArgs) -> ! {
@@ -254,7 +325,7 @@ fn main(_args: BootArgs) -> ! {
     let card = match Mmc::new() {
         Ok(card) => card,
         Err(error) => {
-            println!("Controller ERROR {:?}", error);
+            println!("Controller ERROR {:x?}", error);
             idle(mct);
         }
     };
@@ -265,7 +336,7 @@ fn main(_args: BootArgs) -> ! {
     let ext_csd = match card.read_ext_csd() {
         Ok(ext_csd) => ext_csd,
         Err(error) => {
-            println!("EXT_CSD ERROR {:?}", error);
+            println!("EXT_CSD ERROR {:x?}", error);
             idle(mct);
         }
     };
@@ -288,7 +359,7 @@ fn main(_args: BootArgs) -> ! {
     let found = match partition::scan(&Device(card), &mut partitions) {
         Ok(found) => found,
         Err(error) => {
-            println!("Partition table ERROR {:?}", error);
+            println!("Partition table ERROR {:x?}", error);
             let mut block = [0; BLOCK_SIZE];
             if card.read_blocks(0, &mut block).is_ok() {
                 print!("Block 0 ends with:");
@@ -307,9 +378,23 @@ fn main(_args: BootArgs) -> ! {
     check_filesystems(card, partitions);
 
     // SAFETY: the only reference to this buffer, taken once: see `Chunk`.
-    let buffer: &mut [u8] = unsafe { &mut *CHUNK.0.get() };
-    check_single_against_multiple(card, buffer);
-    check_speed(mct, card, buffer);
+    let room: &mut [u8] = unsafe { &mut *CHUNK.0.get() };
+    check_single_against_multiple(card, room);
+    let buffer = &mut room[..CHUNK_BYTES];
+    let polled = check_speed(mct, card, "Polled", Mmc::read_blocks, buffer);
+    // U-Boot's own DMA reads ran with its `FIFOTH`: 8-word bursts.
+    let u_boot_fifoth = mmc::controller_state().map(|state| state.fifoth);
+    check_dma_cases(card, room);
+    let mut card = card;
+    if let Some(value) = u_boot_fifoth {
+        card.set_dma_fifoth(value);
+        check_dma_cases(card, room);
+    }
+    let buffer = &mut room[..CHUNK_BYTES];
+    let dma = check_speed(mct, card, "DMA", Mmc::read_blocks_dma, buffer);
+    if let (Some(polled), Some(dma)) = (polled, dma) {
+        println!("DMA and polled passes: {}", if polled == dma { "OK" } else { "MISMATCH" });
+    }
 
     idle(mct);
 }

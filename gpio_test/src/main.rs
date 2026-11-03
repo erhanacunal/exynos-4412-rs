@@ -93,8 +93,10 @@ fn read_only() {
         let found = pin.function();
         println!("{}: {:?} ({})", name, found, verdict(found == function));
     }
+    // `entry!` has already turned the backlight off, so gpd0-1 shows that rather than U-Boot's
+    // setting.
     for (name, pin) in [("gpd0-1 PWM1", BACKLIGHT_PWM), ("power", POWER), ("vol+", VOLUME_UP), ("vol-", VOLUME_DOWN)] {
-        println!("{}: from U-Boot {:?}, {:?}, level {}", name, pin.function(), pin.pull(), u8::from(pin.read()));
+        println!("{}: at start {:?}, {:?}, level {}", name, pin.function(), pin.pull(), u8::from(pin.read()));
     }
 }
 

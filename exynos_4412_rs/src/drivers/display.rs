@@ -269,6 +269,14 @@ pub fn set_backlight(on: bool) {
     BACKLIGHT.set_output(on);
 }
 
+/// Turns the backlight off, then the LVDS transmitter: the reverse of the order they go on.
+/// U-Boot leaves both on after its logo. [`entry!`](crate::entry) calls this before `main`, as
+/// the backlight drains the battery; an application that shows something turns them on itself.
+pub fn panel_off() {
+    set_backlight(false);
+    set_lvds(false);
+}
+
 /// Packs a color for a [`Framebuffer`].
 pub const fn rgb(red: u8, green: u8, blue: u8) -> u32 {
     (red as u32) << 16 | (green as u32) << 8 | blue as u32
