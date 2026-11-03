@@ -16,6 +16,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
 - `mmc_test/`: eMMC read test, partition table, polled and DMA reads, no writes
+- `mmc_write_test/`: eMMC write test: writes the last 2 MiB of CACHE and restores them
 - `ext4_test/`: reads the ext4 file systems on the eMMC with the `ext4-view` crate, no writes
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
@@ -565,13 +566,28 @@ hardware press of the power key is not needed. `power_test` tries each.
 Tested on the board with the charger connected (`Charger: DC yes, USB no`). `PS_HOLD_CONTROL` reads
 `0x00005300` while running. Powering off with no charger was not checked from a log.
 
-## eMMC (read-only)
+## eMMC
 
-`drivers::mmc` reads the board's eMMC through the DW MMC controller `mshc_0`. `partition::scan` parses
-its MBR and the chain of extended boot records.
+`drivers::mmc` reads the board's eMMC through the DW MMC controller `mshc_0`, and writes it only
+through `MmcWriter`. `partition::scan` parses its MBR and the chain of extended boot records, and
+gives each partition the block of the record that describes it.
 
-- **Read-only by construction:** The driver can send only `CMD8`, `CMD13`, `CMD17` and `CMD18`, with
-  the controller's automatic `CMD12` as the stop. It has no write, erase or switch command.
+- **Commands:** The driver can send only `CMD8`, `CMD13`, `CMD17`, `CMD18`, `CMD24` and `CMD25`,
+  with the controller's automatic `CMD12` as the stop. It has no erase command, and no switch
+  command (`CMD6`). So the only hardware partition it can reach is the user area.
+- **Boot loaders out of reach:** `PARTITION_CONFIG` is `0x48`: the board boots from boot
+  partition 1, where the boot ROM finds BL1, BL2 and U-Boot. Without `CMD6`, the driver cannot
+  select it.
+- **Writes:** `MmcWriter::new(card, rca, number)` reads the partition table from the card
+  itself. It writes only inside that partition. It refuses:
+  - the extended partition;
+  - a table with any partition below `PROTECTED_BLOCKS` (20480, the first 10 MiB: the MBR, and
+    room Samsung's layouts keep for boot loader copies);
+  - a partition with a table record inside it.
+
+  Below the writer, the driver itself refuses any write below `PROTECTED_BLOCKS`. Each write
+  waits until the card has programmed the data and is back in its transfer state. The card's
+  own write cache stays off, so the data is on the card when the call returns.
 - **U-Boot's setup is kept:** The card is not reset or initialized. U-Boot read this image from it, so
   it is ready, and bus width and clock stay as they are. `CMD6` would be needed to change them, and it
   writes to the card's `EXT_CSD`.
@@ -600,6 +616,22 @@ Test on the board: `make img APP=mmc_test`, same flashing step. Observed:
 | 16 MiB from SYSTEM, read twice | Same data, about 15800 KiB/s with 1 MiB reads, 16529 KiB/s with 2 MiB reads |
 | DMA: 1, 9, 2048, 4096 blocks | Same data as polled, guard lines kept, with both Linux's `FIFOTH` `0x503f0040` (64-word bursts) and U-Boot's `0x20400040` (8-word bursts) |
 | DMA: 16 MiB from SYSTEM, read twice | Same data as polled, 74902 KiB/s (U-Boot's `FIFOTH`), 4.5 times the polled speed |
+
+Write test: `make img APP=mmc_write_test`, same flashing step. It reads the first 10 MiB, showing
+only which blocks are not zero. It copies the last 2 MiB of CACHE (p8), twice to be sure of the
+copy. It checks that the writer refuses what it must. It writes 1, 9 and 4096 blocks of a pattern
+there, reads each back through DMA and polled, and writes the copy back at the end, also after
+a failure. Observed:
+
+| Check | Result |
+|---|---|
+| First 10 MiB of the user area | Only block 0 (the MBR) and blocks 3447..3449 are not zero: no boot loader there, which fits their being in boot partition 1 |
+| Table records | The MBR, and EBRs at 65536, 86016, 106496, 116790, 1028096, 2461696: all outside the partitions |
+| Refusals | All six refused before reaching the card: the extended partition, a partition not in the table, past the end, across the end, a buffer off a cache line, part of a block |
+| 1 block | Written in 11.7 ms, read back right through DMA and polled |
+| 9 blocks, off a 4 KiB boundary | 0.7 ms, about 6 MB/s, read back right |
+| 4096 blocks, two commands | 97.5 ms, about 21 MB/s, read back right |
+| Restore | 106 ms; the region reads back with the copy's hash |
 
 In the DMA cases, each read is first done polled. Then stale bytes go over the buffer and guard
 values into a line on each side, all cleaned to DRAM. The DMA read must then give the polled

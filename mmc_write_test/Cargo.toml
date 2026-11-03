@@ -1,0 +1,9 @@
+[package]
+name = "mmc_write_test"
+version = "0.1.0"
+edition = "2024"
+description = "eMMC write test for exynos_4412_rs: writes only the end of CACHE, and restores it"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }

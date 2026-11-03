@@ -1,11 +1,26 @@
-//! Read-only access to the board's eMMC, through the DW MMC controller `mshc_0`.
+//! Access to the board's eMMC, through the DW MMC controller `mshc_0`: reads, and writes only
+//! through [`MmcWriter`], which keeps them away from what boots the board.
 //!
-//! # Read-only by construction
+//! # Commands
 //!
 //! This driver can send only these commands, all listed in its private `Command` type: `CMD8` (read
-//! `EXT_CSD`), `CMD13` (read status), `CMD17` and `CMD18` (read blocks, the latter with the
-//! controller's automatic `CMD12` to stop). There is no write, erase or switch command anywhere
-//! in it, and the controller's write-direction bit has no constant here.
+//! `EXT_CSD`), `CMD13` (read status), `CMD17` and `CMD18` (read blocks), `CMD24` and `CMD25`
+//! (write blocks). The multiple block ones end with the controller's automatic `CMD12`. There
+//! is no erase command, and no switch command (`CMD6`), so the user area is the only hardware
+//! partition this driver can reach.
+//!
+//! # What writes cannot reach
+//!
+//! The board boots from the eMMC's first boot partition: `PARTITION_CONFIG` reads `0x48`, boot
+//! enabled from boot partition 1, with acknowledge. That is where the boot ROM finds BL1, BL2 and
+//! U-Boot, and without `CMD6` this driver cannot select it. In the user area, writes are refused,
+//! by checks that do not depend on the caller:
+//!
+//! - in the first [`PROTECTED_BLOCKS`] blocks, before the first partition: the MBR, and room that
+//!   Samsung's layouts keep for copies of the boot loaders;
+//! - outside the one partition an [`MmcWriter`] was made for, from the table it reads itself;
+//! - on any block of the partition table: the MBR and every extended boot record;
+//! - in the extended partition itself, which only holds the logical ones and their records.
 //!
 //! # U-Boot's setup
 //!
@@ -26,6 +41,10 @@
 //!   ([`mmu::discard_dcache_range`], [`mmu::invalidate_dcache_range`]), so it must be whole cache
 //!   lines in DRAM. Every return, error or not, stops the engine first, so nothing writes the
 //!   buffer once the borrow ends.
+//! - [`MmcWriter::write`]: the IDMAC reads DRAM, cleaned from the caches first
+//!   ([`mmu::clean_dcache_range`]). Each write waits until the card has finished programming
+//!   and is back in its transfer state, so data is on the card when it returns: the card's own
+//!   write cache stays off, as nothing here turns it on.
 //!
 //! Register offsets and fields are verified against Linux 5.15.198
 //! `drivers/mmc/host/dw_mmc.h`, cited as `dw_mmc.h:<line>`, and command numbers against
@@ -44,6 +63,7 @@ use tock_registers::registers::{ReadOnly, ReadWrite};
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::cmu::Cmu;
+use crate::partition::{self, BlockRead, Partition};
 use crate::{mmu, soc};
 
 register_structs! {
@@ -201,6 +221,8 @@ const CMD_USE_HOLD_REG: u32 = 1 << 29;
 const CMD_PRV_DAT_WAIT: u32 = 1 << 13;
 /// dw_mmc.h:400: the controller sends `CMD12` itself after the last block.
 const CMD_SEND_STOP: u32 = 1 << 12;
+/// dw_mmc.h:402: the data goes to the card.
+const CMD_DAT_WR: u32 = 1 << 10;
 /// dw_mmc.h:403.
 const CMD_DAT_EXP: u32 = 1 << 9;
 /// dw_mmc.h:404.
@@ -229,6 +251,15 @@ const FIFO_240A_OFFSET: usize = 0x200;
 /// mmc.h:148 `R1_CURRENT_STATE`.
 const R1_STATE_SHIFT: u32 = 9;
 const R1_STATE_MASK: u32 = 0xF;
+/// mmc.h:158 `R1_STATE_TRAN`.
+const R1_STATE_TRAN: u32 = 4;
+/// mmc.h:149 `R1_READY_FOR_DATA`.
+const R1_READY_FOR_DATA: u32 = 1 << 8;
+
+/// Blocks at the start of the user area that are never written: 10 MiB, up to where the first
+/// partition, PARAM, starts on this board. [`MmcWriter::new`] also refuses a table whose first
+/// partition starts before this.
+pub const PROTECTED_BLOCKS: u32 = 20480;
 /// mmc.h:128-143: the error bits of an R1 response, 31 `OUT_OF_RANGE` to 16 `CID_CSD_OVERWRITE`,
 /// leaving out 25 `CARD_IS_LOCKED`, which reports a state.
 const R1_ERRORS: u32 = 0xFDFF_0000;
@@ -258,6 +289,10 @@ enum Command {
     ReadSingleBlock,
     /// mmc.h:54 `MMC_READ_MULTIPLE_BLOCK`.
     ReadMultipleBlock,
+    /// mmc.h:63 `MMC_WRITE_BLOCK`.
+    WriteBlock,
+    /// mmc.h:64 `MMC_WRITE_MULTIPLE_BLOCK`.
+    WriteMultipleBlock,
 }
 
 impl Command {
@@ -267,6 +302,8 @@ impl Command {
             Self::SendStatus => (13, 0),
             Self::ReadSingleBlock => (17, CMD_DAT_EXP),
             Self::ReadMultipleBlock => (18, CMD_DAT_EXP | CMD_SEND_STOP),
+            Self::WriteBlock => (24, CMD_DAT_EXP | CMD_DAT_WR),
+            Self::WriteMultipleBlock => (25, CMD_DAT_EXP | CMD_DAT_WR | CMD_SEND_STOP),
         };
         index | extra | CMD_START | CMD_USE_HOLD_REG | CMD_PRV_DAT_WAIT | CMD_RESP_EXP | CMD_RESP_CRC
     }
@@ -297,6 +334,31 @@ pub enum Error {
     BadBuffer,
     /// The IDMAC stopped on an error, or did not finish in time.
     Dma(DmaState),
+    /// A write that would reach a protected block. Holds the block.
+    Protected(u32),
+    /// After a write, the card did not come back to its transfer state. Holds its last status.
+    NotReady(u32),
+}
+
+/// Why an [`MmcWriter`] was not made, or refused a write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// The card or the controller failed.
+    Card(Error),
+    /// Reading the partition table failed.
+    Table(partition::Error<Error>),
+    /// The table has no partition of this number.
+    NoPartition(u32),
+    /// The extended partition holds only the logical ones and their records.
+    Extended,
+    /// The table puts a partition, or this one, before [`PROTECTED_BLOCKS`]. Holds the start.
+    TableTooLow(u32),
+    /// A table record lies inside the partition. Holds the record's block.
+    RecordInside(u32),
+    /// The card is not in its transfer state. Holds its status.
+    NotTransfer(u32),
+    /// A write past the end of the partition.
+    OutOfRange,
 }
 
 /// Where a DMA read stood when it failed, as raw registers.
@@ -604,21 +666,12 @@ impl Mmc {
     /// cache line ([`mmu::DCACHE_LINE`]) and lie in DRAM, where addresses are physical ones.
     /// Reads of more than 1 MiB take one command per MiB.
     pub fn read_blocks_dma(&self, lba: u32, buffer: &mut [u8]) -> Result<(), Error> {
-        if buffer.is_empty() || !buffer.len().is_multiple_of(BLOCK_SIZE) || buffer.len() > u32::MAX as usize {
-            return Err(Error::BadLength);
-        }
-        let start = buffer.as_ptr() as usize;
-        let in_dram = start >= soc::DRAM_BASE && start + buffer.len() <= soc::DRAM_BASE + soc::DRAM_SIZE;
-        if !start.is_multiple_of(mmu::DCACHE_LINE) || !in_dram {
-            return Err(Error::BadBuffer);
-        }
-        let hcon = regs().hcon.get();
-        if (hcon >> HCON_TRANS_MODE_SHIFT) & HCON_TRANS_MODE_MASK != 0 || hcon & HCON_ADDR_64 != 0 {
-            return Err(Error::NoIdmac(hcon));
-        }
+        check_dma_buffer(buffer)?;
         let mut lba = lba;
         for chunk in buffer.chunks_mut(DMA_CHUNK_BYTES) {
-            let result = self.transfer_dma(lba, chunk);
+            // Before the IDMAC writes: no dirty line of the buffer may be written over it.
+            mmu::discard_dcache_range(chunk.as_ptr() as usize, chunk.len());
+            let result = self.transfer_dma(lba, chunk.as_ptr() as usize, chunk.len(), Direction::Read);
             // Whatever happened, the engine is stopped by now, and the CPU must read DRAM.
             mmu::invalidate_dcache_range(chunk.as_ptr() as usize, chunk.len());
             result?;
@@ -627,22 +680,53 @@ impl Mmc {
         Ok(())
     }
 
-    /// One command's worth: at most [`DMA_CHUNK_BYTES`]. In the order of Linux 5.15.198
-    /// `dw_mci_submit_data_dma` and `dw_mci_idmac_start_dma`: the data registers, `FIFOTH`, the
-    /// DMA interface, the descriptors, the IDMAC, then the command. Stops the IDMAC on every
-    /// return.
-    fn transfer_dma(&self, lba: u32, chunk: &mut [u8]) -> Result<(), Error> {
+    /// Writes whole blocks from `data` from block `lba` on. Only [`MmcWriter`] calls it, after
+    /// its own checks; this one refuses the protected start of the user area by itself too.
+    fn write_blocks_dma(&self, lba: u32, data: &[u8], rca: u16) -> Result<(), Error> {
+        check_dma_buffer(data)?;
+        if lba < PROTECTED_BLOCKS {
+            return Err(Error::Protected(lba));
+        }
+        let mut lba = lba;
+        for chunk in data.chunks(DMA_CHUNK_BYTES) {
+            // The IDMAC reads DRAM: what the CPU wrote must be there.
+            mmu::clean_dcache_range(chunk.as_ptr() as usize, chunk.len());
+            self.transfer_dma(lba, chunk.as_ptr() as usize, chunk.len(), Direction::Write)?;
+            self.wait_programmed(rca)?;
+            lba += (chunk.len() / BLOCK_SIZE) as u32;
+        }
+        Ok(())
+    }
+
+    /// After a write: the card holds `DAT0` low while it programs, then must be back in its
+    /// transfer state, ready for data, as Linux's `mmc_blk_card_busy` waits for.
+    fn wait_programmed(&self, rca: u16) -> Result<(), Error> {
+        wait_not_busy()?;
+        let mut status = 0;
+        for _ in 0..POLL_LIMIT / 1000 {
+            status = self.read_status(rca)?;
+            if status & R1_READY_FOR_DATA != 0 && card_state(status) == R1_STATE_TRAN {
+                return Ok(());
+            }
+        }
+        Err(Error::NotReady(status))
+    }
+
+    /// One command's worth: at most [`DMA_CHUNK_BYTES`] at `start`, cache maintenance done by
+    /// the caller. In the order of Linux 5.15.198 `dw_mci_submit_data_dma` and
+    /// `dw_mci_idmac_start_dma`: the data registers, `FIFOTH`, the DMA interface, the
+    /// descriptors, the IDMAC, then the command. Stops the IDMAC on every return.
+    fn transfer_dma(&self, lba: u32, start: usize, length: usize, direction: Direction) -> Result<(), Error> {
         let regs = regs();
         wait_not_busy()?;
         self.reset_fifo()?;
         regs.blksiz.set(BLOCK_SIZE as u32);
-        regs.bytcnt.set(chunk.len() as u32);
+        regs.bytcnt.set(length as u32);
         regs.fifoth.set(self.dma_fifoth);
 
-        let start = chunk.as_ptr() as usize;
-        let count = chunk.len().div_ceil(DESCRIPTOR_BYTES);
+        let count = length.div_ceil(DESCRIPTOR_BYTES);
         for index in 0..count {
-            let bytes = (chunk.len() - index * DESCRIPTOR_BYTES).min(DESCRIPTOR_BYTES);
+            let bytes = (length - index * DESCRIPTOR_BYTES).min(DESCRIPTOR_BYTES);
             let last = index == count - 1;
             let mut control = DES0_OWN;
             if index == 0 {
@@ -659,15 +743,13 @@ impl Mmc {
         let ring = DESCRIPTORS_RING.0.as_ptr() as usize;
         let ring_bytes = (count * DESCRIPTOR_WORDS * 4).next_multiple_of(mmu::DCACHE_LINE);
         mmu::clean_dcache_range(ring, ring_bytes);
-        // No dirty line of the buffer may be written over what the IDMAC writes.
-        mmu::discard_dcache_range(start, chunk.len());
 
-        let result = self.run_dma(lba, chunk.len(), ring);
+        let result = self.run_dma(lba, length, ring, direction);
         stop_dma();
         result
     }
 
-    fn run_dma(&self, lba: u32, length: usize, ring: usize) -> Result<(), Error> {
+    fn run_dma(&self, lba: u32, length: usize, ring: usize, direction: Direction) -> Result<(), Error> {
         let regs = regs();
         regs.ctrl.set(regs.ctrl.get() | CTRL_DMA_ENABLE);
         reset_ctrl(CTRL_DMA_RESET)?;
@@ -681,10 +763,17 @@ impl Mmc {
         regs.bmod.set(regs.bmod.get() | BMOD_IDMAC_ENABLE | BMOD_FIXED_BURST);
         regs.pldmnd.set(1);
 
-        let command = if length == BLOCK_SIZE { Command::ReadSingleBlock } else { Command::ReadMultipleBlock };
+        let single = length == BLOCK_SIZE;
+        let (command, dma_done) = match direction {
+            Direction::Read if single => (Command::ReadSingleBlock, IDSTS_RI),
+            Direction::Read => (Command::ReadMultipleBlock, IDSTS_RI),
+            Direction::Write if single => (Command::WriteBlock, IDSTS_TI),
+            Direction::Write => (Command::WriteMultipleBlock, IDSTS_TI),
+        };
         self.command(command, lba)?;
 
-        // Done when the card has sent everything and the IDMAC has written it.
+        // Done when the data has crossed: the controller's transfer is over, and the IDMAC has
+        // finished its side of it.
         let mut polls = 0;
         loop {
             let status = regs.rintsts.get();
@@ -695,7 +784,7 @@ impl Mmc {
             if dma & IDSTS_ERRORS != 0 {
                 return Err(Error::Dma(dma_state()));
             }
-            if status & INT_DATA_OVER != 0 && dma & IDSTS_RI != 0 {
+            if status & INT_DATA_OVER != 0 && dma & dma_done != 0 {
                 break;
             }
             polls += 1;
@@ -703,7 +792,7 @@ impl Mmc {
                 return Err(Error::Dma(dma_state()));
             }
         }
-        if command == Command::ReadMultipleBlock {
+        if !single {
             wait_auto_stop()?;
         }
         Ok(())
@@ -740,6 +829,107 @@ impl Mmc {
         let count = left.min(width);
         buffer[done..done + count].copy_from_slice(&word[..count]);
         done + width
+    }
+}
+
+/// Which way a DMA transfer goes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// From the card to DRAM.
+    Read,
+    /// From DRAM to the card.
+    Write,
+}
+
+/// A DMA buffer must be whole blocks, start on a cache line and lie in DRAM, where addresses
+/// are physical ones, and the controller must have a 32-bit IDMAC.
+fn check_dma_buffer(buffer: &[u8]) -> Result<(), Error> {
+    if buffer.is_empty() || !buffer.len().is_multiple_of(BLOCK_SIZE) || buffer.len() > u32::MAX as usize {
+        return Err(Error::BadLength);
+    }
+    let start = buffer.as_ptr() as usize;
+    let in_dram = start >= soc::DRAM_BASE && start + buffer.len() <= soc::DRAM_BASE + soc::DRAM_SIZE;
+    if !start.is_multiple_of(mmu::DCACHE_LINE) || !in_dram {
+        return Err(Error::BadBuffer);
+    }
+    let hcon = regs().hcon.get();
+    if (hcon >> HCON_TRANS_MODE_SHIFT) & HCON_TRANS_MODE_MASK != 0 || hcon & HCON_ADDR_64 != 0 {
+        return Err(Error::NoIdmac(hcon));
+    }
+    Ok(())
+}
+
+/// The partition table reader for [`MmcWriter::new`]: single blocks, polled.
+struct TableReader(Mmc);
+
+impl BlockRead for TableReader {
+    type Error = Error;
+
+    fn read_block(&self, lba: u32, buffer: &mut [u8; BLOCK_SIZE]) -> Result<(), Error> {
+        self.0.read_blocks(lba, buffer)
+    }
+}
+
+/// Partitions [`MmcWriter::new`] reads at most: this board has 10.
+const MAX_PARTITIONS: usize = 32;
+
+/// Writes to one partition of the user area, and nowhere else.
+///
+/// It reads the partition table from the card itself, so the bounds do not come from the
+/// caller. See the module documentation for what it refuses.
+#[derive(Clone, Copy, Debug)]
+pub struct MmcWriter {
+    card: Mmc,
+    rca: u16,
+    partition: Partition,
+}
+
+impl MmcWriter {
+    /// A writer for partition `number`, on the card at address `rca`, which must be in its
+    /// transfer state ([`Mmc::read_status`] finds the address).
+    pub fn new(card: Mmc, rca: u16, number: u32) -> Result<Self, WriteError> {
+        let status = card.read_status(rca).map_err(WriteError::Card)?;
+        if card_state(status) != R1_STATE_TRAN {
+            return Err(WriteError::NotTransfer(status));
+        }
+        let mut table = [Partition::default(); MAX_PARTITIONS];
+        let found = partition::scan(&TableReader(card), &mut table).map_err(WriteError::Table)?;
+        let table = &table[..found];
+        if let Some(low) = table.iter().map(|partition| partition.start).find(|start| *start < PROTECTED_BLOCKS) {
+            return Err(WriteError::TableTooLow(low));
+        }
+        let partition =
+            *table.iter().find(|partition| partition.number == number).ok_or(WriteError::NoPartition(number))?;
+        if partition.is_extended() {
+            return Err(WriteError::Extended);
+        }
+        let end = u64::from(partition.start) + u64::from(partition.count);
+        // Every record, primary or logical, must be outside: block 0 is below the protected
+        // limit already, and each extended boot record sits before its logical partition.
+        if let Some(record) = table
+            .iter()
+            .map(|other| other.record)
+            .find(|record| u64::from(*record) >= u64::from(partition.start) && u64::from(*record) < end)
+        {
+            return Err(WriteError::RecordInside(record));
+        }
+        Ok(Self { card, rca, partition })
+    }
+
+    /// The partition it writes, as the table on the card gives it.
+    pub const fn partition(&self) -> Partition {
+        self.partition
+    }
+
+    /// Writes whole blocks from `data`, from block `block` of the partition on, counted from
+    /// its start. `data` must start on a cache line ([`mmu::DCACHE_LINE`]) and lie in DRAM.
+    /// Returns once the card has programmed them.
+    pub fn write(&self, block: u32, data: &[u8]) -> Result<(), WriteError> {
+        let blocks = (data.len() / BLOCK_SIZE) as u64;
+        if u64::from(block) + blocks > u64::from(self.partition.count) {
+            return Err(WriteError::OutOfRange);
+        }
+        self.card.write_blocks_dma(self.partition.start + block, data, self.rca).map_err(WriteError::Card)
     }
 }
 

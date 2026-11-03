@@ -23,13 +23,13 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use ext4_view::{Ext4, Ext4Error, Ext4Read, PathBuf};
 use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::drivers::mmc::{self, BLOCK_SIZE, Mmc};
 use exynos_4412_rs::drivers::power::{self, BootMode, PowerKeys};
 use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::partition::{self, BlockRead, Partition};
 use exynos_4412_rs::{BootArgs, console, mmu, println, soc};
-use ext4_view::{Ext4, Ext4Error, Ext4Read, PathBuf};
 use linked_list_allocator::LockedHeap;
 
 exynos_4412_rs::entry!(main);
@@ -72,14 +72,31 @@ struct Plan {
 }
 
 const FILE_SYSTEMS: [Plan; 3] = [
-    Plan { number: 3, name: "EFS", list_root: false, walk: false, info: None, read_from: None },
-    Plan { number: 9, name: "SYSTEM", list_root: true, walk: true, info: None, read_from: None },
+    Plan {
+        number: 3,
+        name: "EFS",
+        list_root: false,
+        walk: false,
+        info: None,
+        read_from: None,
+    },
+    Plan {
+        number: 9,
+        name: "SYSTEM",
+        list_root: true,
+        walk: true,
+        info: None,
+        read_from: None,
+    },
     Plan {
         number: 10,
         name: "USERDATA",
         list_root: true,
         walk: true,
-        info: Some(("/etc/os-release", &["PRETTY_NAME=", "BUILD_ID=", "VERSION_ID="])),
+        info: Some((
+            "/etc/os-release",
+            &["PRETTY_NAME=", "BUILD_ID=", "VERSION_ID="],
+        )),
         read_from: Some("/usr"),
     },
 ];
@@ -105,7 +122,9 @@ enum ReadError {
 impl fmt::Display for ReadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::OutOfRange { start, length } => write!(f, "{} bytes at {} are past the partition", length, start),
+            Self::OutOfRange { start, length } => {
+                write!(f, "{} bytes at {} are past the partition", length, start)
+            }
             Self::Card(error) => write!(f, "card read failed: {:x?}", error),
         }
     }
@@ -155,14 +174,18 @@ impl PartitionReader {
             self.used[slot] = self.clock;
             return Ok(slot);
         }
-        let slot = (0..CHUNKS).min_by_key(|slot| (self.tags[*slot].is_some(), self.used[*slot])).expect("slots");
+        let slot = (0..CHUNKS)
+            .min_by_key(|slot| (self.tags[*slot].is_some(), self.used[*slot]))
+            .expect("slots");
         // Forget the slot first: a failed read leaves it empty, not holding stale data.
         self.tags[slot] = None;
         let offset = u64::from(index) * CHUNK_BYTES as u64;
         // The last chunk may be cut short by the end of the partition, on a block boundary.
         let length = (self.size() - offset).min(CHUNK_BYTES as u64) as usize;
         let lba = self.start + (offset / BLOCK_SIZE as u64) as u32;
-        self.card.read_blocks_dma(lba, &mut self.chunks[slot].0[..length]).map_err(ReadError::Card)?;
+        self.card
+            .read_blocks_dma(lba, &mut self.chunks[slot].0[..length])
+            .map_err(ReadError::Card)?;
         CARD_READS.fetch_add(1, Ordering::Relaxed);
         self.tags[slot] = Some(index);
         self.used[slot] = self.clock;
@@ -170,8 +193,14 @@ impl PartitionReader {
     }
 
     fn read_into(&mut self, start_byte: u64, dst: &mut [u8]) -> Result<(), ReadError> {
-        if start_byte.checked_add(dst.len() as u64).is_none_or(|end| end > self.size()) {
-            return Err(ReadError::OutOfRange { start: start_byte, length: dst.len() });
+        if start_byte
+            .checked_add(dst.len() as u64)
+            .is_none_or(|end| end > self.size())
+        {
+            return Err(ReadError::OutOfRange {
+                start: start_byte,
+                length: dst.len(),
+            });
         }
         let mut done = 0;
         while done < dst.len() {
@@ -233,7 +262,9 @@ fn us(mct_counts: u64) -> u64 {
 }
 
 fn fold(bytes: &[u8]) -> u32 {
-    bytes.iter().fold(0x811C_9DC5, |hash: u32, byte| (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193))
+    bytes.iter().fold(0x811C_9DC5, |hash: u32, byte| {
+        (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+    })
 }
 
 fn heap_used() -> usize {
@@ -261,7 +292,11 @@ fn report_read_stats(what: &str) {
 
 /// Label, UUID and the root's entries, with their names if `list`.
 fn report_root(fs: &Ext4, list: bool) -> Result<(), Ext4Error> {
-    println!("  label {:?}, UUID {}", fs.label().to_str().unwrap_or("not UTF-8"), fs.uuid());
+    println!(
+        "  label {:?}, UUID {}",
+        fs.label().to_str().unwrap_or("not UTF-8"),
+        fs.uuid()
+    );
     let mut count = 0;
     for entry in fs.read_dir("/")? {
         let entry = entry?;
@@ -272,7 +307,13 @@ fn report_root(fs: &Ext4, list: bool) -> Result<(), Ext4Error> {
         count += 1;
         if list {
             let kind = entry.file_type()?;
-            let suffix = if kind.is_dir() { "/" } else if kind.is_symlink() { " ->" } else { "" };
+            let suffix = if kind.is_dir() {
+                "/"
+            } else if kind.is_symlink() {
+                " ->"
+            } else {
+                ""
+            };
             println!("    {}{}", name.display(), suffix);
         }
     }
@@ -283,7 +324,10 @@ fn report_root(fs: &Ext4, list: bool) -> Result<(), Ext4Error> {
 fn report_info(fs: &Ext4, path: &str, keys: &[&str]) -> Result<(), Ext4Error> {
     let text = fs.read_to_string(path)?;
     println!("  {}: {} bytes", path, text.len());
-    for line in text.lines().filter(|line| keys.iter().any(|key| line.starts_with(key))) {
+    for line in text
+        .lines()
+        .filter(|line| keys.iter().any(|key| line.starts_with(key)))
+    {
         println!("    {}", line);
     }
     Ok(())
@@ -303,7 +347,10 @@ struct Walk {
 /// Visits every entry under `top`, without following symbolic links. Keeps the largest regular
 /// file under [`LARGEST_LIMIT`].
 fn walk(fs: &Ext4, top: &str) -> Result<Walk, Ext4Error> {
-    let mut found = Walk { directories: 1, ..Walk::default() };
+    let mut found = Walk {
+        directories: 1,
+        ..Walk::default()
+    };
     let mut pending: Vec<PathBuf> = Vec::new();
     // `top` is one of this file's constants.
     pending.push(PathBuf::try_from(top).expect("a valid path"));
@@ -324,7 +371,10 @@ fn walk(fs: &Ext4, top: &str) -> Result<Walk, Ext4Error> {
                 found.files += 1;
                 let length = entry.metadata()?.len();
                 found.bytes += length;
-                let larger = found.largest.as_ref().is_none_or(|(_, best)| length > *best);
+                let larger = found
+                    .largest
+                    .as_ref()
+                    .is_none_or(|(_, best)| length > *best);
                 if length <= LARGEST_LIMIT && larger {
                     found.largest = Some((entry.path(), length));
                 }
@@ -379,7 +429,14 @@ fn report_largest(mct: Mct, fs: &Ext4, top: &str) -> Result<(), Ext4Error> {
         );
         report_read_stats("read");
     }
-    println!("  both passes: {}", if hashes[0] == hashes[1] { "OK" } else { "MISMATCH" });
+    println!(
+        "  both passes: {}",
+        if hashes[0] == hashes[1] {
+            "OK"
+        } else {
+            "MISMATCH"
+        }
+    );
     Ok(())
 }
 
@@ -437,11 +494,19 @@ fn main(_args: BootArgs) -> ! {
     let partitions = &partitions[..found];
 
     for plan in &FILE_SYSTEMS {
-        let Some(partition) = partitions.iter().find(|partition| partition.number == plan.number) else {
+        let Some(partition) = partitions
+            .iter()
+            .find(|partition| partition.number == plan.number)
+        else {
             println!("p{} {}: not in the table", plan.number, plan.name);
             continue;
         };
-        println!("p{} {}: {} MiB", plan.number, plan.name, partition.count / 2048);
+        println!(
+            "p{} {}: {} MiB",
+            plan.number,
+            plan.name,
+            partition.count / 2048
+        );
         reset_read_stats();
         let begin = mct.count();
         let fs = match Ext4::load(Box::new(PartitionReader::new(card, mct, partition))) {
@@ -451,7 +516,11 @@ fn main(_args: BootArgs) -> ! {
                 continue;
             }
         };
-        println!("  loaded in {} us, heap {} KiB in use", us(mct.count() - begin), heap_used() / 1024);
+        println!(
+            "  loaded in {} us, heap {} KiB in use",
+            us(mct.count() - begin),
+            heap_used() / 1024
+        );
         report_read_stats("load");
         if let Err(error) = report(mct, &fs, plan) {
             println!("  ERROR {:?}", error);

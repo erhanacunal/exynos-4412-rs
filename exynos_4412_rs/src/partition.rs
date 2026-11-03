@@ -46,6 +46,9 @@ pub struct Partition {
     pub start: u32,
     /// Number of blocks.
     pub count: u32,
+    /// The block of the table that describes it: 0, the MBR, for a primary partition, or its
+    /// extended boot record for a logical one.
+    pub record: u32,
 }
 
 impl Partition {
@@ -96,7 +99,7 @@ pub fn scan<D: BlockRead>(device: &D, partitions: &mut [Partition]) -> Result<us
         if kind == 0 || count == 0 {
             continue;
         }
-        let partition = Partition { number: slot as u32 + 1, kind, start, count };
+        let partition = Partition { number: slot as u32 + 1, kind, start, count, record: 0 };
         if partition.is_extended() && extended.is_none() {
             extended = Some(start);
         }
@@ -114,7 +117,7 @@ pub fn scan<D: BlockRead>(device: &D, partitions: &mut [Partition]) -> Result<us
         read_table(device, record, &mut block)?;
         let (kind, start, count) = entry(&block, 0);
         if kind != 0 && count != 0 {
-            let partition = Partition { number, kind, start: record + start, count };
+            let partition = Partition { number, kind, start: record + start, count, record };
             *partitions.get_mut(found).ok_or(Error::TooMany)? = partition;
             found += 1;
         }

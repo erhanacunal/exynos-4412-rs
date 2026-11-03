@@ -158,8 +158,8 @@ fn check_table(partitions: &[Partition]) {
     }
     let same = partitions.len() == EXPECTED.len()
         && EXPECTED.iter().zip(partitions).all(|(expected, partition)| {
-            *partition
-                == Partition { number: expected.0, kind: expected.1, start: expected.2, count: expected.3 }
+            (partition.number, partition.kind, partition.start, partition.count)
+                == (expected.0, expected.1, expected.2, expected.3)
         });
     println!("Same as expected table: {}", if same { "OK" } else { "MISMATCH" });
 }
