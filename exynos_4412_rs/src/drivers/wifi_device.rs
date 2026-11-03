@@ -314,7 +314,9 @@ impl Device for WifiDevice<'_> {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ethernet;
         capabilities.max_transmission_unit = FRAME_MAX;
-        capabilities.max_burst_size = Some(1);
+        // No `max_burst_size`: the firmware queues what comes in, and this reads it a frame at a
+        // time, so there is no burst to fit. `smoltcp` would shrink every window it offers to that
+        // many frames (`iface/packet.rs:155`): `Some(1)` held uploads to 1474 bytes in flight.
         capabilities
     }
 }

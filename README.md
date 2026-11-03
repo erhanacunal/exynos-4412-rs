@@ -647,14 +647,22 @@ The first run had one connection on port 8080, and 158 of its 200 transfers were
 for the reason above; none of those that ran went wrong.
 
 - **Uploads:** Nothing was lost, and the board waited for data about half the time. The sender
-  said why (`ss -ti`): it was limited by the receive window 100 % of the time, which the board
-  offered as 1474 bytes of its 32 KiB, and it halved its segments to fit. `Interface::poll`
-  takes in every frame that is waiting before it sends the acknowledgements, and the HTTP
-  server reads only after. A burst so filled the buffer, and was acknowledged with the window
-  nearly shut. `wifi_test` now takes frames in one at a time, lets the servers read after each,
-  and sends the acknowledgements last. On the development machine, over `smoltcp`'s loopback with
-  the same buffers, the window offered went from alternating between 32768 and 648 to 32768
-  throughout. Not yet measured on the board.
+  said why (`ss -ti`): it was limited by the receive window 100 % of the time, and `tcpdump`
+  showed the board offering 1462 bytes in its `SYN-ACK` and 1474 after, of its 32 KiB. The device
+  told `smoltcp` it takes bursts of one frame (`max_burst_size`), and `smoltcp` then shrinks
+  every window it offers to one frame of data (`iface/packet.rs:155`). The device no longer says
+  so. Fed the same `SYN` on the development machine, `smoltcp` answers with 32768 instead of
+  1462. On the board after that, `soak.sh` again had all 200 transfers right, with uploads at
+  4338 to 4675 KiB/s, half above 4591, and downloads as before, half above 8649. Of the 74085 TCP
+  segments that came in, none came after a gap or again. Where an upload's 249 ms went:
+  receiving 125 ms, 736 frames at 170 us each, 166 us of it the bus read; the rest, hashing and
+  the stack, 81 ms; empty polls 41 ms. Reading a frame takes longer than writing one (114 us):
+  it takes two `CMD53`s, the first for the header.
+- **Frames before acknowledgements:** `wifi_test` also takes frames in one at a time, lets the
+  servers read after each, and sends the acknowledgements last. `Interface::poll` takes in all
+  that is waiting first, so a burst would be acknowledged before the server read it, with the
+  window nearly shut: over `smoltcp`'s loopback with the same buffers, the window offered went
+  from alternating between 32768 and 648 to 32768 throughout.
 - **Where the time goes:** When `/data` is all acknowledged, the log splits the time since the
   request into sending frames, receiving them, polling the chip for nothing, and the rest (the
   stack, HTTP and the console). It gives the frames each way, the time each took, how much of

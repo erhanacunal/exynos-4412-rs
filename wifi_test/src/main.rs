@@ -483,8 +483,8 @@ impl Station<'_> {
         let now = self.now();
         // What `Interface::poll` does, with the servers between the frames that come in. The
         // acknowledgements go out after, so they offer the room that reading made. Otherwise a
-        // burst fills the receive buffer, the stack acknowledges it with a window nearly shut, and
-        // the sender holds back (seen with uploads: 1474 bytes offered of 32 KiB).
+        // burst fills the receive buffer, and the stack acknowledges it with a window nearly shut
+        // (seen over `smoltcp`'s loopback: 648 bytes offered of 32 KiB).
         self.interface.poll_maintenance(now);
         while self.interface.poll_ingress_single(now, &mut self.device, &mut self.sockets)
             != PollIngressSingleResult::None
