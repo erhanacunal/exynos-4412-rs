@@ -22,7 +22,7 @@
 //! The controller pulls [`CHG`] low while it has messages. [`Mxt::read_message`] takes one,
 //! `None` once there are none left. A polled reader reads while CHG is low. With the
 //! `embassy` feature, `Mxt::next_message` waits on CHG's interrupt instead, through an
-//! [`EintInput`](crate::embassy::eint::EintInput).
+//! [`EintInput`](crate::embassy::eint::EintInput), and awaits the I2C bytes.
 //!
 //! ```ignore
 //! mxt::power_up(pmic, mct)?;
@@ -495,12 +495,21 @@ impl Mxt {
     /// Takes one message from T5, `None` if there is none.
     pub fn read_message(&self) -> Result<Option<Message>, Error> {
         let mut bytes = [0; MESSAGE_BYTES];
-        // `atmel_mxt_ts.c:1745`: the last byte of T5 is a CRC this firmware does not send.
-        let length = usize::from(self.t5.size - 1).min(MESSAGE_BYTES);
-        read(self.i2c, self.t5.address, &mut bytes[..length])?;
+        read(self.i2c, self.t5.address, &mut bytes[..self.message_length()])?;
+        Ok(self.parse(bytes))
+    }
+
+    /// Bytes read from T5 per message. `atmel_mxt_ts.c:1745`: the last byte of T5 is a CRC
+    /// this firmware does not send.
+    fn message_length(&self) -> usize {
+        usize::from(self.t5.size - 1).min(MESSAGE_BYTES)
+    }
+
+    /// What a message read from T5 says, `None` if there was none.
+    fn parse(&self, bytes: [u8; MESSAGE_BYTES]) -> Option<Message> {
         let report_id = bytes[0];
         if report_id == NO_MESSAGE || report_id == 0 {
-            return Ok(None);
+            return None;
         }
         if self.t9.owns(report_id) {
             let mut x = u16::from(bytes[2]) << 4 | u16::from(bytes[4] >> 4);
@@ -511,49 +520,70 @@ impl Mxt {
             if self.t9_y_10bit {
                 y >>= 2;
             }
-            return Ok(Some(Message::Touch(Touch {
+            return Some(Message::Touch(Touch {
                 id: report_id - self.t9.first_report_id,
                 status: bytes[1],
                 x,
                 y,
                 area: bytes[5],
                 amplitude: bytes[6],
-            })));
+            }));
         }
         if self.t6.owns(report_id) {
             let config_crc = u32::from(bytes[2]) | u32::from(bytes[3]) << 8 | u32::from(bytes[4]) << 16;
-            return Ok(Some(Message::Status { status: bytes[1], config_crc }));
+            return Some(Message::Status { status: bytes[1], config_crc });
         }
         let kind = self.objects().iter().find(|object| object.owns(report_id)).map_or(0, |object| object.kind);
-        Ok(Some(Message::Other { kind, bytes }))
+        Some(Message::Other { kind, bytes })
     }
 
     fn write(&self, register: u16, data: &[u8]) -> Result<(), Error> {
-        const MAX_DATA: usize = 8;
-        assert!(data.len() <= MAX_DATA);
-        let mut frame = [0; 2 + MAX_DATA];
-        frame[..2].copy_from_slice(&register.to_le_bytes());
-        frame[2..2 + data.len()].copy_from_slice(data);
-        self.i2c.write(ADDRESS, &frame[..2 + data.len()])?;
+        let (frame, length) = frame(register, data);
+        self.i2c.write(ADDRESS, &frame[..length])?;
         Ok(())
     }
 }
 
 #[cfg(feature = "embassy")]
 impl Mxt {
+    /// [`read_message`](Self::read_message), each I2C byte awaited: see
+    /// [`drivers::i2c`](crate::drivers::i2c).
+    pub async fn read_message_async(&self) -> Result<Option<Message>, Error> {
+        let mut bytes = [0; MESSAGE_BYTES];
+        let length = self.message_length();
+        self.i2c.write_read_async(ADDRESS, &self.t5.address.to_le_bytes(), &mut bytes[..length]).await?;
+        Ok(self.parse(bytes))
+    }
+
     /// The next message, waiting on `chg`, made from [`CHG`], while there is none. The I2C
-    /// transfers themselves are polled, about 1.3 ms per message at [`BUS_HZ`]. A message
-    /// already waiting is returned without awaiting anything: a caller that reads one after
-    /// another while fingers move keeps its executor busy, and yields between messages to
-    /// let other tasks run.
+    /// bytes are awaited too. A message already waiting still costs its transfer, about
+    /// 1.3 ms at [`BUS_HZ`], during which other tasks run.
     pub async fn next_message(&self, chg: &crate::embassy::eint::EintInput) -> Result<Message, Error> {
         loop {
-            if let Some(message) = self.read_message()? {
+            if let Some(message) = self.read_message_async().await? {
                 return Ok(message);
             }
             chg.wait_low().await;
         }
     }
+
+    /// [`calibrate`](Self::calibrate), awaited. Use this one while async reads may run on
+    /// the same bus: see [`drivers::i2c`](crate::drivers::i2c).
+    pub async fn calibrate_async(&self) -> Result<(), Error> {
+        let (frame, length) = frame(self.t6.address + T6_CALIBRATE, &[1]);
+        self.i2c.write_async(ADDRESS, &frame[..length]).await?;
+        Ok(())
+    }
+}
+
+/// The register as two bytes, low first, then `data`, and the length of the frame.
+fn frame(register: u16, data: &[u8]) -> ([u8; 10], usize) {
+    const MAX_DATA: usize = 8;
+    assert!(data.len() <= MAX_DATA);
+    let mut frame = [0; 2 + MAX_DATA];
+    frame[..2].copy_from_slice(&register.to_le_bytes());
+    frame[2..2 + data.len()].copy_from_slice(data);
+    (frame, 2 + data.len())
 }
 
 /// `__mxt_read_reg`, `atmel_mxt_ts.c:660-698`: the register as two bytes, low first.

@@ -14,16 +14,30 @@
 //! # Limits
 //!
 //! - The controller's interrupt is on while a transfer runs, because `i2c-s3c2410.c:708`
-//!   turns it on for its polled mode too. Do not enable the bus's interrupt in the GIC.
+//!   turns it on for its polled mode too. Do not enable the bus's interrupt in the GIC: the
+//!   async transfers enable it while they wait, and disable it again.
 //! - A device holding a line low stays that way: there is no bus recovery. The call returns
 //!   an error.
 //! - Each timeout is a count of register reads, not a time: see [`POLL_LIMIT`].
 //! - `i2c_8` is left out. It is the HDMI PHY's bus, with different stop behaviour
 //!   (`i2c-s3c2410.c:328`) and `samsung,s3c2440-hdmiphy-i2c` in `exynos4.dtsi:600`.
 //!
+//! # Async transfers
+//!
+//! With the `embassy` feature, [`I2c::write_read_async`] and the calls built on it run the
+//! same transfer, but await the controller's interrupt for each byte instead of polling, so
+//! the core runs other tasks meanwhile: a byte takes 90 us at 100 kHz. The handler,
+//! [`on_interrupt`], disables the interrupt at the GIC and wakes the transfer. An async mutex
+//! per bus keeps one async transfer at a time on it. A byte that does not finish within
+//! [`BYTE_TIMEOUT`] fails the transfer with [`Error::Timeout`]. A transfer dropped part way
+//! finishes its byte, polled; a read takes one more byte, not acknowledged, so that the device
+//! stops sending; then a stop goes out, and the bus is let go.
+//!
 //! # Concurrency
 //!
 //! Use each bus from one context at a time, including interrupt handlers and other cores.
+//! The async mutex covers async transfers only: a polled call on a bus during an async
+//! transfer on it, from another task of the same core for one, breaks both.
 //! [`init`](I2c::init) also changes pins and a clock gate: see their modules.
 
 use tock_registers::interfaces::{Readable, Writeable};
@@ -122,6 +136,12 @@ pub enum Bus {
 impl Bus {
     const fn index(self) -> usize {
         self as usize
+    }
+
+    /// The controller's GIC interrupt ID: `GIC_SPI 58` to `65` of `i2c_0`..`i2c_7` in
+    /// `exynos4.dtsi:498-589`.
+    pub const fn irq(self) -> u16 {
+        32 + 58 + self as u16
     }
 
     /// The two pins of the `samsung,pins` line, and their function.
@@ -238,60 +258,80 @@ impl I2c {
     fn transfer(&self, address: u8, out: &[u8], input: &mut [u8]) -> Result<(), Error> {
         let writing = !out.is_empty() || input.is_empty();
         if writing {
-            self.start(address << 1, STAT_MASTER_TX)?;
+            self.begin_start(address << 1, STAT_MASTER_TX);
+            self.wait_byte()?;
+            self.check_ack(Error::AddressNack)?;
             for byte in out {
-                self.send(*byte)?;
+                self.begin_send(*byte);
+                self.wait_byte()?;
+                self.check_ack(Error::DataNack)?;
             }
         }
         if !input.is_empty() {
-            self.start((address << 1) | 1, STAT_MASTER_RX)?;
-            self.receive(input)?;
+            self.begin_start((address << 1) | 1, STAT_MASTER_RX);
+            self.wait_byte()?;
+            self.check_ack(Error::AddressNack)?;
+            let last = input.len() - 1;
+            for (index, byte) in input.iter_mut().enumerate() {
+                self.begin_receive(index == last);
+                self.wait_byte()?;
+                *byte = self.regs().ds.get();
+            }
+            self.end_receive();
         }
         Ok(())
     }
 
-    /// A start, or a repeated start if the bus is held after a byte. In that case the
-    /// release below is what lets the start go out (i2c-s3c2410.c:491,545-548).
-    fn start(&self, address_byte: u8, mode: u32) -> Result<(), Error> {
+    /// Sends a start, or a repeated start if the bus is held after a byte, with the address.
+    /// In the second case the release below is what lets the start go out
+    /// (i2c-s3c2410.c:491,545-548). Then wait for the byte and [`check_ack`](Self::check_ack).
+    fn begin_start(&self, address_byte: u8, mode: u32) {
         let regs = self.regs();
         regs.stat.set(mode | STAT_ENABLE);
         regs.ds.set(address_byte);
         setup_delay();
         regs.stat.set(mode | STAT_ENABLE | STAT_START_BUSY);
         self.release();
-        self.wait_byte()?;
-        if regs.stat.get() & STAT_NO_ACK != 0 {
-            return Err(Error::AddressNack);
-        }
-        Ok(())
     }
 
-    fn send(&self, byte: u8) -> Result<(), Error> {
-        let regs = self.regs();
-        regs.ds.set(byte);
+    /// Sends one byte. Then wait for it and [`check_ack`](Self::check_ack).
+    fn begin_send(&self, byte: u8) {
+        self.regs().ds.set(byte);
         setup_delay();
         self.release();
-        self.wait_byte()?;
-        if regs.stat.get() & STAT_NO_ACK != 0 {
-            return Err(Error::DataNack);
-        }
-        Ok(())
     }
 
-    /// Acknowledges every byte but the last, which tells the device to stop sending.
-    fn receive(&self, data: &mut [u8]) -> Result<(), Error> {
+    /// `error` if the byte just sent was not acknowledged.
+    fn check_ack(&self, error: Error) -> Result<(), Error> {
+        if self.regs().stat.get() & STAT_NO_ACK != 0 { Err(error) } else { Ok(()) }
+    }
+
+    /// Receives one byte, acknowledged unless it is the `last`, which tells the device to stop
+    /// sending. Then wait for it and read `ds`.
+    fn begin_receive(&self, last: bool) {
         let regs = self.regs();
-        let last = data.len() - 1;
-        for (index, byte) in data.iter_mut().enumerate() {
-            // Keep CON_PENDING set in this write, so that this does not release the bus yet.
-            let con = regs.con.get();
-            regs.con.set(if index == last { con & !CON_ACK } else { con | CON_ACK });
-            self.release();
-            self.wait_byte()?;
-            *byte = regs.ds.get();
-        }
+        // Keep CON_PENDING set in this write, so that this does not release the bus yet.
+        let con = regs.con.get();
+        regs.con.set(if last { con & !CON_ACK } else { con | CON_ACK });
+        self.release();
+    }
+
+    /// Acknowledging again, for the next transfer.
+    fn end_receive(&self) {
+        let regs = self.regs();
         regs.con.set(regs.con.get() | CON_ACK);
-        Ok(())
+    }
+
+    /// The byte is done, or arbitration was lost: `None` while it still runs.
+    fn byte_done(&self) -> Option<Result<(), Error>> {
+        let regs = self.regs();
+        if regs.con.get() & CON_PENDING == 0 {
+            return None;
+        }
+        if regs.stat.get() & STAT_ARBITRATION_LOST != 0 {
+            return Some(Err(Error::ArbitrationLost));
+        }
+        Some(Ok(()))
     }
 
     /// Clearing the start bit in the current mode, then releasing the bus, makes the stop:
@@ -314,13 +354,9 @@ impl I2c {
     }
 
     fn wait_byte(&self) -> Result<(), Error> {
-        let regs = self.regs();
         for _ in 0..POLL_LIMIT {
-            if regs.con.get() & CON_PENDING != 0 {
-                if regs.stat.get() & STAT_ARBITRATION_LOST != 0 {
-                    return Err(Error::ArbitrationLost);
-                }
-                return Ok(());
+            if let Some(result) = self.byte_done() {
+                return result;
             }
         }
         Err(Error::Timeout)
@@ -354,4 +390,163 @@ fn line_control(clock: u32, sda_delay_ns: u32) -> u32 {
     }
     let clocks = (u64::from(clock) * u64::from(sda_delay_ns)).div_ceil(1_000_000_000);
     clocks.div_ceil(LC_CLOCKS_PER_UNIT).min(LC_UNITS_MAX) as u32 | LC_FILTER
+}
+
+#[cfg(feature = "embassy")]
+pub use asynch::{BYTE_TIMEOUT, on_interrupt};
+
+#[cfg(feature = "embassy")]
+mod asynch {
+    use core::future::poll_fn;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::Poll;
+
+    use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+    use embassy_sync::mutex::Mutex;
+    use embassy_sync::waitqueue::AtomicWaker;
+    use embassy_time::{Duration, with_timeout};
+    use tock_registers::interfaces::Readable;
+
+    use super::{ADDRESS_MAX, Bus, Error, I2c, STAT_MASTER_RX, STAT_MODE_MASK, STAT_START_BUSY};
+    use crate::drivers::gic::Gic;
+
+    const BUSES: usize = 8;
+    /// Longer than any byte at the rates this driver sets, with room for a device stretching
+    /// the clock. Not measured.
+    pub const BYTE_TIMEOUT: Duration = Duration::from_millis(10);
+
+    static WAKERS: [AtomicWaker; BUSES] = [const { AtomicWaker::new() }; BUSES];
+    static LOCKS: [Mutex<CriticalSectionRawMutex, ()>; BUSES] = [const { Mutex::new(()) }; BUSES];
+    static INTERRUPTS: [AtomicU32; BUSES] = [const { AtomicU32::new(0) }; BUSES];
+    const ALL: [Bus; BUSES] = [Bus::I2c0, Bus::I2c1, Bus::I2c2, Bus::I2c3, Bus::I2c4, Bus::I2c5, Bus::I2c6, Bus::I2c7];
+
+    /// Handles the interrupt of an I2C controller, if `id` is one: disables it at the GIC,
+    /// whatever raised it, and wakes the transfer on that bus, which looks at the controller
+    /// itself. The application's `handle_irq` reaches it through `embassy::on_interrupt`.
+    pub fn on_interrupt(id: u16) -> bool {
+        let Some(bus) = ALL.iter().find(|bus| bus.irq() == id) else {
+            return false;
+        };
+        Gic::new().disable(id);
+        INTERRUPTS[bus.index()].fetch_add(1, Ordering::Relaxed);
+        WAKERS[bus.index()].wake();
+        true
+    }
+
+    /// Sends a stop if a transfer is dropped part way: see the [module documentation](super).
+    struct InFlight {
+        i2c: I2c,
+        done: bool,
+    }
+
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            let i2c = self.i2c;
+            Gic::new().disable(i2c.bus.irq());
+            if self.done {
+                return;
+            }
+            // Whatever these give: the next transfer finds the bus busy if they failed. The
+            // byte under way finishes first, polled. A device that is sending keeps sending
+            // after an acknowledged byte, and may hold SDA low where the stop needs it high:
+            // one more byte, not acknowledged, tells it to stop.
+            let _ = i2c.wait_byte();
+            if i2c.regs().stat.get() & STAT_MODE_MASK == STAT_MASTER_RX {
+                i2c.begin_receive(true);
+                let _ = i2c.wait_byte();
+                i2c.end_receive();
+            }
+            let _ = i2c.stop();
+        }
+    }
+
+    impl I2c {
+        /// Interrupts the async transfers on this bus have taken, since the start.
+        pub fn interrupts(&self) -> u32 {
+            INTERRUPTS[self.bus.index()].load(Ordering::Relaxed)
+        }
+
+        /// The current byte, awaited on the controller's interrupt.
+        async fn byte_async(&self) -> Result<(), Error> {
+            let irq = self.bus.irq();
+            let waker = &WAKERS[self.bus.index()];
+            let wait = poll_fn(|cx| {
+                if let Some(result) = self.byte_done() {
+                    return Poll::Ready(result);
+                }
+                waker.register(cx.waker());
+                let gic = Gic::new();
+                gic.set_target(irq, 0);
+                gic.enable(irq);
+                // A byte done since the look above raises the interrupt: the controller's
+                // line stays high until the bus is released.
+                Poll::Pending
+            });
+            let result = with_timeout(BYTE_TIMEOUT, wait).await.unwrap_or(Err(Error::Timeout));
+            Gic::new().disable(irq);
+            result
+        }
+
+        /// [`write_read`](Self::write_read), awaiting each byte: see the [module
+        /// documentation](super). Waits first for other async transfers on this bus.
+        pub async fn write_read_async(&self, address: u8, out: &[u8], input: &mut [u8]) -> Result<(), Error> {
+            assert!(address <= ADDRESS_MAX);
+            let _lock = LOCKS[self.bus.index()].lock().await;
+            if self.regs().stat.get() & STAT_START_BUSY != 0 {
+                return Err(Error::BusBusy);
+            }
+            self.release();
+            let mut flight = InFlight { i2c: *self, done: false };
+            let result = self.transfer_async(address, out, input).await;
+            flight.done = true;
+            let stop = self.stop();
+            result.and(stop)
+        }
+
+        /// [`write`](Self::write), awaiting each byte.
+        pub async fn write_async(&self, address: u8, data: &[u8]) -> Result<(), Error> {
+            self.write_read_async(address, data, &mut []).await
+        }
+
+        /// [`read`](Self::read), awaiting each byte.
+        pub async fn read_async(&self, address: u8, data: &mut [u8]) -> Result<(), Error> {
+            if data.is_empty() {
+                return Ok(());
+            }
+            self.write_read_async(address, &[], data).await
+        }
+
+        /// [`probe`](Self::probe), awaiting each byte.
+        pub async fn probe_async(&self, address: u8) -> Result<(), Error> {
+            self.write_read_async(address, &[], &mut []).await
+        }
+
+        /// The steps of `transfer`, each byte awaited.
+        async fn transfer_async(&self, address: u8, out: &[u8], input: &mut [u8]) -> Result<(), Error> {
+            let writing = !out.is_empty() || input.is_empty();
+            if writing {
+                self.begin_start(address << 1, super::STAT_MASTER_TX);
+                self.byte_async().await?;
+                self.check_ack(Error::AddressNack)?;
+                for byte in out {
+                    self.begin_send(*byte);
+                    self.byte_async().await?;
+                    self.check_ack(Error::DataNack)?;
+                }
+            }
+            if !input.is_empty() {
+                self.begin_start((address << 1) | 1, super::STAT_MASTER_RX);
+                self.byte_async().await?;
+                self.check_ack(Error::AddressNack)?;
+                let last = input.len() - 1;
+                for (index, byte) in input.iter_mut().enumerate() {
+                    self.begin_receive(index == last);
+                    self.byte_async().await?;
+                    *byte = self.regs().ds.get();
+                }
+                self.end_receive();
+            }
+            Ok(())
+        }
+    }
 }

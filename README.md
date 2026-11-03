@@ -635,8 +635,22 @@ offset of about 3 px. Several fingers at once have not been tried.
 | Ticker while fingers moved | 2925 to 4696 ticks in 5 s, latest up to 66 ms late |
 
 The ticker lost about as many ticks as the milliseconds spent reading. With fingers moving, CHG stays
-low, so the task read message after message without awaiting. It now yields after each message. The
-reading itself still holds the core, 1.3 ms at a time, because the I2C transfers are polled.
+low, so the task read message after message without awaiting, each read polled. The reads now await
+each I2C byte. The test also checks the async I2C transfers against the polled ones, and prints finger
+lines only after `v`. Observed:
+
+| Check | Result |
+|---|---|
+| PMIC device ID, `i2c_0` at 400 kHz, 100 reads | Polled 107 us each, async 115 us, 4 interrupts each; all equal |
+| Touch information block, `i2c_5` at 100 kHz, 100 reads | Polled 1056 us each, async 1060 us, 11 interrupts each (one per byte); all equal; ticker 106 ticks in 106 ms |
+| Async probe of `0x30`, nothing there | `AddressNack`; the next read `Ok` |
+| Object table read, 198 bytes, cut by a timeout after 3 ms | Timed out; the next one `Ok`, equal to a polled read |
+| Fingers moving, up to 1404 messages in 5 s | Ticker 4965-4968 ticks in 5 s, latest 23-28 us late; 0 read errors, 0 wake-ups with none |
+
+With nothing to do the ticker gets 4965 ticks in 5 s, the same as with fingers moving now: each tick
+takes a little over 1 ms. In the first 5 s it was once 120 ms late, from the check lines above, sent
+polled in that period. An awaited byte costs about 2 us more than a polled one, the interrupt and the
+wake-up.
 
 ## Restart and power off
 
@@ -907,9 +921,15 @@ through `embassy-sync` channels, signals and mutexes, which the critical section
   interrupt, level-triggered. The interrupt stays masked except during a wait, and the handler
   masks it again, so a level that lasts interrupts once. A wait first clears what an earlier
   level left pending, so it can end with the level gone: the caller checks the device, and
-  waits again if it has nothing. `Mxt::next_message` waits on CHG this way; its I2C reads stay
-  polled.
-- **Not yet present:** async I2C, async sending, and preemptive threads.
+  waits again if it has nothing. `Mxt::next_message` waits on CHG this way, and awaits its I2C
+  bytes.
+- **I2C:** `I2c::write_read_async` and the calls built on it run the polled driver's steps, but
+  await the controller's interrupt (GIC IDs 90-97) after each byte. The handler disables it at
+  the GIC and wakes the transfer. An async mutex per bus keeps one async transfer at a time; a
+  byte not done in 10 ms is a timeout. A transfer dropped part way finishes its byte, reads one
+  more without acknowledging it if it was reading, and sends a stop. A polled call on a bus
+  during an async transfer on it breaks both.
+- **Not yet present:** async sending, and preemptive threads.
 
 Test on the board: `make img APP=async_test`, same flashing step. Observed:
 

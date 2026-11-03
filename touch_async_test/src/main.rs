@@ -1,34 +1,42 @@
-//! Async touch test: the mXT1664S read with `await`, on the interrupt of its CHG line, while
-//! a task ticks every 1 ms on the same core.
+//! Async touch test: the mXT1664S read with `await`, on the interrupt of its CHG line and on
+//! the I2C controller's interrupt for each byte, while a task ticks every 1 ms on the same
+//! core.
 //!
-//! After the power-up, the touch task first reads CHG's data bit with the pin in its
-//! interrupt function, empties the controller's messages, and reads the bit again. Then it
-//! waits for messages and draws every touch on the panel, mapped with the five-point fit
-//! `touch_test` measured on this board.
+//! First the async I2C transfers are checked against the polled ones: 100 reads of the
+//! PMIC's device ID on `i2c_0` and of the controller's information block on `i2c_5`, each
+//! way; an async probe of an address nobody answers; and a read of the object table cut
+//! part way by a timeout, then read again and compared with a polled read.
+//!
+//! Then the touch task reads CHG's data bit with the pin in its interrupt function, empties
+//! the controller's messages, and reads the bit again. After that it waits for messages and
+//! draws every touch on the panel, mapped with the five-point fit `touch_test` measured on
+//! this board.
 //!
 //! Every 5 s, if anything changed, a line gives the messages read, the CHG interrupts, the
-//! wake-ups that found no message, and the ticker: how many ticks, and the latest one.
-//! With nothing touching, the interrupts must stay still. Keys on the UART: `x` clear,
-//! `k` controller calibrate command (nothing may touch the screen), `r` restart,
+//! wake-ups that found no message, the time the reads took and the I2C interrupts, and the
+//! ticker: how many ticks, and the latest one. The tick held back by sending that line, which
+//! is polled, is left out. With nothing touching, the interrupts must stay still. Keys on the
+//! UART: `v` print each finger's press and release (polled too, so the ticker suffers),
+//! `x` clear, `k` controller calibrate command (nothing may touch the screen), `r` restart,
 //! `f` fastboot.
 //!
-//! The controller gets only what `drivers::mxt` writes: see `touch_test`.
+//! The controller gets only what `drivers::mxt` writes: see `touch_test`. Of the PMIC, only
+//! the device ID is read.
 
 #![no_std]
 #![no_main]
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_futures::select::{Either, select};
-use embassy_futures::yield_now;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use exynos_4412_rs::drivers::display::{self, Fimd, Framebuffer, LTN101AL03, LVDS_SETTLE_MS, Timing, rgb};
 use exynos_4412_rs::drivers::gic::Gic;
 use exynos_4412_rs::drivers::gpio::Pull;
-use exynos_4412_rs::drivers::i2c::{Bus, I2c};
+use exynos_4412_rs::drivers::i2c::{self, Bus, I2c};
 use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::drivers::max77686::Max77686;
 use exynos_4412_rs::drivers::mxt::{self, Message, Mxt};
@@ -82,6 +90,8 @@ static READ_ERRORS: AtomicU32 = AtomicU32::new(0);
 /// Time spent reading messages over I2C, in µs: the executor runs nothing else meanwhile.
 static READ_US: AtomicU32 = AtomicU32::new(0);
 static CLEAR: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// Whether each finger's press and release is printed.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
 
 #[unsafe(no_mangle)]
 extern "C" fn handle_irq(_frame: &mut ExceptionFrame) {
@@ -128,10 +138,11 @@ fn clear(screen: &mut Framebuffer) {
     screen.flush();
 }
 
-/// One message read, timed, and counted.
-fn read_one(mxt: &Mxt) -> Option<Message> {
+/// One message read, timed, and counted. The time is how long the transfer took, during
+/// which other tasks ran.
+async fn read_one(mxt: &Mxt) -> Option<Message> {
     let begin = Instant::now();
-    let result = mxt.read_message();
+    let result = mxt.read_message_async().await;
     READ_US.fetch_add(begin.elapsed().as_micros() as u32, Ordering::Relaxed);
     match result {
         Ok(Some(message)) => {
@@ -147,11 +158,109 @@ fn read_one(mxt: &Mxt) -> Option<Message> {
     }
 }
 
+/// `exynos4412-mehmet.dts`, `max77686: pmic@9`, and its device ID register.
+const PMIC: u8 = 0x09;
+const PMIC_DEVICE_ID: u8 = 0x00;
+/// Nothing answers here on `i2c_5`. Only the address goes out.
+const ABSENT: u8 = 0x30;
+const CHECK_READS: u32 = 100;
+/// Cuts a read of the object table, about 18 ms, part way.
+const CUT_AFTER: Duration = Duration::from_micros(3000);
+
+/// `CHECK_READS` reads of `register` from `address`, polled, then async with the ticker
+/// counted: whether all gave the same bytes, and the time of each way.
+async fn compare(name: &str, i2c: I2c, address: u8, register: &[u8], length: usize) {
+    let mut first = [0u8; 16];
+    let first = &mut first[..length];
+    if let Err(error) = i2c.write_read(address, register, first) {
+        println!("{}: polled read ERROR {:?}", name, error);
+        return;
+    }
+    let mut again = [0u8; 16];
+    let again = &mut again[..length];
+    let (mut same, mut errors) = (0, 0);
+    let begin = Instant::now();
+    for _ in 0..CHECK_READS {
+        match i2c.write_read(address, register, again) {
+            Ok(()) if again == first => same += 1,
+            Ok(()) => {}
+            Err(_) => errors += 1,
+        }
+    }
+    let polled = begin.elapsed().as_micros();
+    let interrupts = i2c.interrupts();
+    let ticks = TICKS.load(Ordering::Relaxed);
+    let begin = Instant::now();
+    let (mut same_async, mut errors_async) = (0, 0);
+    for _ in 0..CHECK_READS {
+        match i2c.write_read_async(address, register, again).await {
+            Ok(()) if again == first => same_async += 1,
+            Ok(()) => {}
+            Err(_) => errors_async += 1,
+        }
+    }
+    let awaited = begin.elapsed().as_micros();
+    let ticks = TICKS.load(Ordering::Relaxed) - ticks;
+    println!(
+        "{}: {:02x?}; {} reads polled {} us each, {} same, {} errors; async {} us each, {} same, {} errors, {} interrupts, ticker {} ticks in {} ms ({})",
+        name,
+        first,
+        CHECK_READS,
+        polled / u64::from(CHECK_READS),
+        same,
+        errors,
+        awaited / u64::from(CHECK_READS),
+        same_async,
+        errors_async,
+        i2c.interrupts() - interrupts,
+        ticks,
+        awaited / 1000,
+        if same == CHECK_READS && same_async == CHECK_READS { "OK" } else { "MISMATCH" }
+    );
+}
+
+/// The async I2C transfers against the polled ones, then an address nobody answers, then a
+/// read dropped part way and one after it.
+async fn i2c_checks(mxt: &Mxt) {
+    let pmic = I2c::new(Bus::I2c0);
+    let touch = I2c::new(Bus::I2c5);
+    compare("PMIC device ID, i2c_0 at 400 kHz", pmic, PMIC, &[PMIC_DEVICE_ID], 1).await;
+    compare("Touch information block, i2c_5 at 100 kHz", touch, mxt::ADDRESS, &[0, 0], 7).await;
+
+    let absent = touch.probe_async(ABSENT).await;
+    let after = mxt.read_message_async().await.map(|_| ());
+    println!(
+        "Async probe of {:#04x}: {:?}; a read after it: {:?} ({})",
+        ABSENT,
+        absent,
+        after,
+        if absent == Err(i2c::Error::AddressNack) && after.is_ok() { "OK" } else { "MISMATCH" }
+    );
+
+    let mut table = [0u8; 200];
+    let length = usize::from(mxt.info().objects) * 6;
+    let cut = with_timeout(CUT_AFTER, touch.write_read_async(mxt::ADDRESS, &7u16.to_le_bytes(), &mut table[..length])).await;
+    let mut whole = [0u8; 200];
+    let again = touch.write_read_async(mxt::ADDRESS, &7u16.to_le_bytes(), &mut whole[..length]).await;
+    let mut polled = [0u8; 200];
+    let reference = touch.write_read(mxt::ADDRESS, &7u16.to_le_bytes(), &mut polled[..length]);
+    println!(
+        "Object table read cut after {} us: {}; the next one: {:?}, {} bytes, same as polled: {} ({})",
+        CUT_AFTER.as_micros(),
+        if cut.is_err() { "timed out" } else { "finished" },
+        again,
+        length,
+        whole == polled,
+        if cut.is_err() && again.is_ok() && reference.is_ok() && whole == polled { "OK" } else { "MISMATCH" }
+    );
+}
+
 #[embassy_executor::task]
 async fn touch_task(mxt: Mxt, chg: EintInput, mut screen: Framebuffer) {
+    i2c_checks(&mxt).await;
     let before = chg.pin().read();
     let mut drained = 0;
-    while let Some(message) = read_one(&mxt) {
+    while let Some(message) = read_one(&mxt).await {
         drained += 1;
         if let Message::Status { status, config_crc } = message {
             println!("T6 status {:#04x}, config CRC {:#08x}", status, config_crc);
@@ -168,18 +277,16 @@ async fn touch_task(mxt: Mxt, chg: EintInput, mut screen: Framebuffer) {
             "does not follow the line, or no message was waiting"
         }
     );
-    println!("Draw on the screen. Keys: x clear, k controller calibrate command, r restart, f fastboot.");
+    println!("Draw on the screen. Keys: v finger lines on/off, x clear, k controller calibrate command, r restart, f fastboot.");
 
     let mut down = [false; FINGERS.len()];
     let mut positions = [0u32; FINGERS.len()];
     loop {
-        // What `Mxt::next_message` does, with the wake-ups that find nothing counted.
-        // While messages keep coming, CHG never goes high and the loop below never awaits:
-        // other tasks get their turn here, between messages.
-        yield_now().await;
+        // What `Mxt::next_message` does, with the wake-ups that find nothing counted. Each
+        // read awaits its I2C bytes, so other tasks run while messages keep coming.
         let mut woken = false;
         let message = loop {
-            if let Some(message) = read_one(&mxt) {
+            if let Some(message) = read_one(&mxt).await {
                 break Some(message);
             }
             if woken {
@@ -206,11 +313,15 @@ async fn touch_task(mxt: Mxt, chg: EintInput, mut screen: Framebuffer) {
                     if !down[id] {
                         down[id] = true;
                         positions[id] = 0;
-                        println!("Finger {} down at ({}, {})", id, at.x, at.y);
+                        if VERBOSE.load(Ordering::Relaxed) {
+                            println!("Finger {} down at ({}, {})", id, at.x, at.y);
+                        }
                     }
                 } else if down[id] {
                     down[id] = false;
-                    println!("Finger {} up at ({}, {}) after {} positions", id, at.x, at.y, positions[id]);
+                    if VERBOSE.load(Ordering::Relaxed) {
+                        println!("Finger {} up at ({}, {}) after {} positions", id, at.x, at.y, positions[id]);
+                    }
                 }
             }
             Message::Status { status, config_crc } => {
@@ -223,8 +334,8 @@ async fn touch_task(mxt: Mxt, chg: EintInput, mut screen: Framebuffer) {
 
 /// Every [`REPORT_PERIOD`], the counts of the period, if a message or an interrupt came.
 #[embassy_executor::task]
-async fn report_task(chg: EintInput) {
-    let (mut messages, mut interrupts, mut empty, mut ticks, mut read_us) = (0, 0, 0, 0, 0);
+async fn report_task(chg: EintInput, i2c: I2c) {
+    let (mut messages, mut interrupts, mut empty, mut ticks, mut read_us, mut bytes) = (0, 0, 0, 0, 0, 0);
     MAX_LATE_US.store(0, Ordering::Relaxed);
     loop {
         Timer::after(REPORT_PERIOD).await;
@@ -234,22 +345,27 @@ async fn report_task(chg: EintInput) {
             EMPTY_WAKES.load(Ordering::Relaxed),
             TICKS.load(Ordering::Relaxed),
             READ_US.load(Ordering::Relaxed),
+            i2c.interrupts(),
         );
         let late = MAX_LATE_US.swap(0, Ordering::Relaxed);
         if now.0 != messages || now.1 != interrupts {
             println!(
-                "{} s: {} messages, {} CHG interrupts, {} wake-ups with none; {} ms reading; ticker {} ticks, latest {} us late; {} read errors in all",
+                "{} s: {} messages, {} CHG interrupts, {} wake-ups with none; {} ms in reads, {} I2C interrupts; ticker {} ticks, latest {} us late; {} read errors in all",
                 REPORT_PERIOD.as_secs(),
                 now.0 - messages,
                 now.1 - interrupts,
                 now.2 - empty,
                 (now.4 - read_us) / 1000,
+                now.5 - bytes,
                 now.3 - ticks,
                 late,
                 READ_ERRORS.load(Ordering::Relaxed)
             );
+            // The line above is sent polled, and holds the ticker back: that tick is left out.
+            Timer::after(Duration::from_millis(2)).await;
+            MAX_LATE_US.store(0, Ordering::Relaxed);
         }
-        (messages, interrupts, empty, ticks, read_us) = now;
+        (messages, interrupts, empty, ticks, read_us, bytes) = now;
     }
 }
 
@@ -271,12 +387,16 @@ async fn console_task(mxt: Mxt) {
             b'r' => power::restart(BootMode::Normal),
             b'f' => power::restart(BootMode::Fastboot),
             b'x' => CLEAR.signal(()),
-            b'k' => match mxt.calibrate() {
+            b'v' => {
+                let verbose = !VERBOSE.fetch_xor(true, Ordering::Relaxed);
+                println!("Finger lines {}", if verbose { "on: each is sent polled, and holds the ticker back" } else { "off" });
+            }
+            b'k' => match mxt.calibrate_async().await {
                 Ok(()) => println!("Calibrate command sent: hands off the screen"),
                 Err(error) => println!("Calibrate ERROR {:?}", error),
             },
             b'\r' | b'\n' => println!(),
-            _ => println!("Keys: x clear, k controller calibrate command, r restart, f fastboot"),
+            _ => println!("Keys: v finger lines, x clear, k controller calibrate command, r restart, f fastboot"),
         }
     }
 }
@@ -347,7 +467,7 @@ fn main(_args: BootArgs) -> ! {
     embassy::run(|spawner| {
         spawner.spawn(ticker().unwrap());
         spawner.spawn(keys_task().unwrap());
-        spawner.spawn(report_task(chg).unwrap());
+        spawner.spawn(report_task(chg, I2c::new(Bus::I2c5)).unwrap());
         spawner.spawn(console_task(mxt.clone()).unwrap());
         spawner.spawn(touch_task(mxt, chg, screen).unwrap());
     })

@@ -9,6 +9,8 @@
 //! - [`run`], which starts an executor on the calling core;
 //! - [`uart::UartRx`], receiving on a UART with `await`;
 //! - [`eint::EintInput`], waiting for a level on a GPX pin with `await`;
+//! - async I2C transfers: `I2c::write_read_async` and the like, in
+//!   [`drivers::i2c`](crate::drivers::i2c);
 //! - async eMMC transfers: `Mmc::read_blocks_async` and `MmcWriter::write_async`, in
 //!   [`drivers::mmc`](crate::drivers::mmc).
 //!
@@ -165,11 +167,14 @@ pub fn init() {
 
 /// Handles interrupt `id` if it is this module's, returning whether it was: the MCT's, those
 /// of the UARTs that [`uart::UartRx`] reads, those of the pins of [`eint::EintInput`], and
-/// the eMMC controller's for its async transfers. The application's `handle_irq` calls it
+/// those of the I2C and eMMC controllers for their async transfers. The application's `handle_irq` calls it
 /// after acknowledging the interrupt, and ends it after.
 pub fn on_interrupt(id: u16) -> bool {
     if id != soc::MCT_G0_IRQ {
-        return uart::on_interrupt(id) || eint::on_interrupt(id) || crate::drivers::mmc::on_interrupt(id);
+        return uart::on_interrupt(id)
+            || eint::on_interrupt(id)
+            || crate::drivers::i2c::on_interrupt(id)
+            || crate::drivers::mmc::on_interrupt(id);
     }
     Mct::new().clear_interrupt();
     critical_section::with(|cs| service_queue(&mut DRIVER.queue.borrow_ref_mut(cs)));
