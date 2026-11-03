@@ -1,0 +1,9 @@
+[package]
+name = "fat_test"
+version = "0.1.0"
+edition = "2024"
+description = "FAT32 test for exynos_4412_rs: formats CACHE if needed, then writes, reads and lists files"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["fat"] }

@@ -37,6 +37,8 @@ pub mod cpu;
 pub mod crypto;
 pub mod drivers;
 pub mod exceptions;
+#[cfg(feature = "fat")]
+pub mod fat;
 pub mod firmware;
 pub mod mmu;
 pub mod nvram;

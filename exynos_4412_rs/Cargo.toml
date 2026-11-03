@@ -9,7 +9,10 @@ license = "MIT"
 default = ["panic-handler"]
 # Print file:line and the message on the console, then halt.
 panic-handler = []
+# FAT32 on an eMMC partition, through embedded-sdmmc: the `fat` module.
+fat = ["dep:embedded-sdmmc"]
 
 [dependencies]
 smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4", "socket-icmp", "auto-icmp-echo-reply"] }
+embedded-sdmmc = { version = "0.10", default-features = false, optional = true }
 tock-registers = { version = "0.10.1", default-features = false, features = ["register_types"] }

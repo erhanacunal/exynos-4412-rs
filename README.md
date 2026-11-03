@@ -18,6 +18,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `mmc_test/`: eMMC read test, partition table, polled and DMA reads, no writes
 - `mmc_write_test/`: eMMC write test: writes the last 2 MiB of CACHE and restores them
 - `ext4_test/`: reads the ext4 file systems on the eMMC with the `ext4-view` crate, no writes
+- `fat_test/`: FAT32 on CACHE with the `embedded-sdmmc` crate: formats it if needed, writes, reads and lists files
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 
@@ -696,6 +697,48 @@ With the reader's 6 MiB cache:
 | Each load | | about 3 ms more, zeroing the 6 MiB cache |
 
 The walk still asks the reader for 1.5 GiB, now mostly copies out of the cache.
+
+## FAT32 on CACHE
+
+The library's `fat` module, behind the `fat` feature, puts a FAT32 file system on one eMMC
+partition through the [`embedded-sdmmc`](https://crates.io/crates/embedded-sdmmc) crate.
+CACHE (p8, 445 MiB) is the one used, since nothing on this board needs what it held.
+
+- **Device:** `PartitionDevice` is the crate's `BlockDevice`. It shows the partition as a whole
+  disk: block 0 is a master boot record made up in memory, listing one FAT32 (`0x0C`) partition
+  from block 1 on, and block `n` is block `n - 1` of the partition. The card's own table is not
+  changed, so p8 keeps its Linux type byte there. Writes to the made-up block 0 are refused, and
+  all others go through an `MmcWriter` for p8, with the limits of the eMMC section. Transfers go
+  through a 32 KiB bounce buffer, since the crate's blocks need not start on a cache line.
+- **Formatter:** `embedded-sdmmc` does not format. `PartitionDevice::format` follows Microsoft's
+  FAT specification (`fatgen103`): 512-byte sectors, 8 per cluster up to 8 GiB, 32 reserved
+  sectors, two FATs, the FSInfo sector at 1 and a copy of the boot sector at 6. It clears the
+  reserved sectors, both FATs and the root cluster, and writes the boot sector last. For CACHE:
+  890 sectors per FAT, 113685 clusters of 4 KiB.
+- **Probe:** `PartitionDevice::probe` checks the boot sector itself before the crate reads it,
+  so that another file system is not taken for FAT. Only a FAT32 boot sector whose geometry fits
+  the partition passes.
+- **Names:** the crate makes 8.3 names only. It has no clock here: `FixedTime` stamps every file
+  2026-01-01 00:00.
+
+Test on the board: `make img APP=fat_test`, same flashing step. The first run formats CACHE.
+Each run then counts itself in `BOOTS.TXT`, writes `TEST.BIN` (1 MiB), reads it back, timed and
+hashed, and deletes it, appends a line to `LOGS/BOOT.LOG` and lists the root. Observed, over
+two boots:
+
+| Check | First boot | Second boot |
+|---|---|---|
+| Probe | No FAT32 (p8 held ext4): formatted in 64 ms, probe passes after | FAT32 found |
+| `BOOTS.TXT` | boot 1 | boot 2 |
+| `TEST.BIN` write, 1 MiB | 2992 ms, 342 KiB/s | 1847 ms, 554 KiB/s |
+| `TEST.BIN` read back | 245 ms, 4.1 MB/s, same hash, no bad byte | 244 ms, 4.1 MB/s, same hash, no bad byte |
+| `TEST.BIN` delete | OK | OK |
+| `LOGS/BOOT.LOG` | made, 8 bytes | 16 bytes, as expected |
+| Card's table | p8 still type `0x83` | p8 still type `0x83` |
+
+Both directions are far below what the driver reaches (75 MB/s reading, 21 MB/s writing with
+DMA), because `embedded-sdmmc` moves one block per call: each written block is its own `CMD24`,
+waited on until programmed, besides the FAT and directory updates.
 
 ## WiFi
 

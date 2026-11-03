@@ -30,7 +30,8 @@ name. Everywhere else in this repository, Linux is used only as a source of regi
 
 Crates this builds with are listed in `Cargo.lock`, under their own licenses. The network stack,
 `smoltcp`, is under 0BSD. `ext4_test` uses `ext4-view` (MIT or Apache-2.0) to read ext4 and
-`linked_list_allocator` (MIT or Apache-2.0) for its heap.
+`linked_list_allocator` (MIT or Apache-2.0) for its heap. The `fat` feature uses `embedded-sdmmc`
+(MIT or Apache-2.0) for FAT32.
 
 ## Firmware
 
