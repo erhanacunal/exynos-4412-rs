@@ -37,8 +37,8 @@ exynos_4412_rs::entry!(main);
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-/// The heap: `ext4-view` keeps its caches and what it reads there.
-const HEAP_BYTES: usize = 8 << 20;
+/// The heap: the reader's cache, `ext4-view`'s own, and what it reads.
+const HEAP_BYTES: usize = 12 << 20;
 
 #[repr(C, align(32))]
 struct Heap(UnsafeCell<[u8; HEAP_BYTES]>);
@@ -48,12 +48,14 @@ unsafe impl Sync for Heap {}
 
 static HEAP: Heap = Heap(UnsafeCell::new([0; HEAP_BYTES]));
 
-/// What one DMA read through the bounce buffer moves at most.
-const BOUNCE_BYTES: usize = 64 * 1024;
+/// The reader's cache: chunks of the partition, as large as what `ext4-view` asks for at a time
+/// (its `block_cache.rs`, 8 blocks of 4 KiB), and on cache lines, so DMA fills them directly.
+const CHUNK_BYTES: usize = 32 * 1024;
+/// 6 MiB. `ext4-view`'s own cache holds 256 KiB, and drops what the next directory needs again.
+const CHUNKS: usize = 192;
 
-/// The bounce buffer, on a cache line as DMA needs.
 #[repr(C, align(32))]
-struct Bounce([u8; BOUNCE_BYTES]);
+struct Chunk([u8; CHUNK_BYTES]);
 
 /// What to do with one file system.
 struct Plan {
@@ -84,10 +86,12 @@ const FILE_SYSTEMS: [Plan; 3] = [
 /// The largest file read must fit the heap twice, with room left.
 const LARGEST_LIMIT: u64 = 4 << 20;
 
-/// What the reader has done: calls, bytes, and their time in MCT counts.
+/// What the reader has done: calls, bytes, and their time in MCT counts, and the chunks it read
+/// from the card.
 static READ_CALLS: AtomicU32 = AtomicU32::new(0);
 static READ_BYTES: AtomicU64 = AtomicU64::new(0);
 static READ_TIME: AtomicU64 = AtomicU64::new(0);
+static CARD_READS: AtomicU32 = AtomicU32::new(0);
 
 /// Why the reader could not give `ext4-view` its bytes.
 #[derive(Debug)]
@@ -109,45 +113,74 @@ impl fmt::Display for ReadError {
 
 impl core::error::Error for ReadError {}
 
-/// A partition as `ext4-view` reads it: bytes from its first block on.
+/// A partition as `ext4-view` reads it: bytes from its first block on, through a cache of
+/// [`CHUNKS`] chunks, the least recently used going first.
 struct PartitionReader {
     card: Mmc,
     mct: Mct,
     start: u32,
     blocks: u32,
-    bounce: Box<Bounce>,
+    chunks: Box<[Chunk]>,
+    /// Which chunk of the partition each slot holds.
+    tags: [Option<u32>; CHUNKS],
+    /// When each slot was last used, by `clock`.
+    used: [u64; CHUNKS],
+    clock: u64,
 }
 
 impl PartitionReader {
     fn new(card: Mmc, mct: Mct, partition: &Partition) -> Self {
-        // SAFETY: all zeros is a valid `Bounce`, a byte array.
-        let bounce = unsafe { Box::<Bounce>::new_zeroed().assume_init() };
-        Self { card, mct, start: partition.start, blocks: partition.count, bounce }
+        // SAFETY: all zeros is a valid `Chunk`, a byte array.
+        let chunks = unsafe { Box::<[Chunk]>::new_zeroed_slice(CHUNKS).assume_init() };
+        Self {
+            card,
+            mct,
+            start: partition.start,
+            blocks: partition.count,
+            chunks,
+            tags: [None; CHUNKS],
+            used: [0; CHUNKS],
+            clock: 0,
+        }
+    }
+
+    fn size(&self) -> u64 {
+        u64::from(self.blocks) * BLOCK_SIZE as u64
+    }
+
+    /// The slot holding chunk `index`, read from the card if no slot does.
+    fn slot(&mut self, index: u32) -> Result<usize, ReadError> {
+        self.clock += 1;
+        if let Some(slot) = self.tags.iter().position(|tag| *tag == Some(index)) {
+            self.used[slot] = self.clock;
+            return Ok(slot);
+        }
+        let slot = (0..CHUNKS).min_by_key(|slot| (self.tags[*slot].is_some(), self.used[*slot])).expect("slots");
+        // Forget the slot first: a failed read leaves it empty, not holding stale data.
+        self.tags[slot] = None;
+        let offset = u64::from(index) * CHUNK_BYTES as u64;
+        // The last chunk may be cut short by the end of the partition, on a block boundary.
+        let length = (self.size() - offset).min(CHUNK_BYTES as u64) as usize;
+        let lba = self.start + (offset / BLOCK_SIZE as u64) as u32;
+        self.card.read_blocks_dma(lba, &mut self.chunks[slot].0[..length]).map_err(ReadError::Card)?;
+        CARD_READS.fetch_add(1, Ordering::Relaxed);
+        self.tags[slot] = Some(index);
+        self.used[slot] = self.clock;
+        Ok(slot)
     }
 
     fn read_into(&mut self, start_byte: u64, dst: &mut [u8]) -> Result<(), ReadError> {
-        let size = u64::from(self.blocks) * BLOCK_SIZE as u64;
-        if start_byte.checked_add(dst.len() as u64).is_none_or(|end| end > size) {
+        if start_byte.checked_add(dst.len() as u64).is_none_or(|end| end > self.size()) {
             return Err(ReadError::OutOfRange { start: start_byte, length: dst.len() });
         }
         let mut done = 0;
         while done < dst.len() {
             let position = start_byte + done as u64;
-            let lba = self.start + (position / BLOCK_SIZE as u64) as u32;
-            let skip = (position % BLOCK_SIZE as u64) as usize;
-            let rest = &mut dst[done..];
-            // Whole blocks into a buffer on a cache line go straight there.
-            if skip == 0 && rest.len() >= BLOCK_SIZE && (rest.as_ptr() as usize).is_multiple_of(mmu::DCACHE_LINE) {
-                let length = rest.len() / BLOCK_SIZE * BLOCK_SIZE;
-                self.card.read_blocks_dma(lba, &mut rest[..length]).map_err(ReadError::Card)?;
-                done += length;
-                continue;
-            }
-            let length = (skip + rest.len()).next_multiple_of(BLOCK_SIZE).min(BOUNCE_BYTES);
-            let bounce = &mut self.bounce.0[..length];
-            self.card.read_blocks_dma(lba, bounce).map_err(ReadError::Card)?;
-            let count = (length - skip).min(rest.len());
-            rest[..count].copy_from_slice(&bounce[skip..skip + count]);
+            let index = (position / CHUNK_BYTES as u64) as u32;
+            let skip = (position % CHUNK_BYTES as u64) as usize;
+            let slot = self.slot(index)?;
+            let count = (CHUNK_BYTES - skip).min(dst.len() - done);
+            dst[done..done + count].copy_from_slice(&self.chunks[slot].0[skip..skip + count]);
             done += count;
         }
         Ok(())
@@ -208,6 +241,7 @@ fn heap_used() -> usize {
 }
 
 fn reset_read_stats() {
+    CARD_READS.store(0, Ordering::Relaxed);
     READ_CALLS.store(0, Ordering::Relaxed);
     READ_BYTES.store(0, Ordering::Relaxed);
     READ_TIME.store(0, Ordering::Relaxed);
@@ -215,11 +249,13 @@ fn reset_read_stats() {
 
 fn report_read_stats(what: &str) {
     println!(
-        "  {}: {} reads, {} KiB, {} us in the reader",
+        "  {}: {} reads, {} KiB, {} us in the reader; {} chunks of {} KiB from the card",
         what,
         READ_CALLS.load(Ordering::Relaxed),
         READ_BYTES.load(Ordering::Relaxed) / 1024,
         us(READ_TIME.load(Ordering::Relaxed)),
+        CARD_READS.load(Ordering::Relaxed),
+        CHUNK_BYTES / 1024,
     );
 }
 

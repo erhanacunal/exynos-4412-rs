@@ -617,13 +617,13 @@ errors. p10 is 28295104 blocks on the card, which ends it exactly where the exte
 
 `ext4_test` reads the eMMC's ext4 file systems with the [`ext4-view`](https://crates.io/crates/ext4-view)
 crate, which only reads. The library stays without an allocator: the test brings its own
-8 MiB heap (`linked_list_allocator`, in `.bss`), and its image is 12 MiB, still below
+12 MiB heap (`linked_list_allocator`, in `.bss`), and its image is 15 MiB, still below
 `0x41000000` and inside `mmu::DRAM_UNCACHED`.
 
-- **Reader:** `ext4-view` asks for bytes at any offset. The test's `Ext4Read` turns that into
-  `Mmc::read_blocks_dma` calls on the partition's blocks. Whole blocks into a buffer on a cache
-  line go straight there; anything else goes through a 64 KiB bounce buffer. Reads past the end
-  of the partition are refused.
+- **Reader:** `ext4-view` asks for bytes at any offset. The test's `Ext4Read` serves them from
+  a 6 MiB cache of 32 KiB chunks, which DMA (`Mmc::read_blocks_dma`) fills directly, the least
+  recently used going first. Reads past the end of the partition are refused. The first version
+  had no cache, only a 64 KiB bounce buffer; the measurements below are from it.
 - **What is printed:** For each file system: the label, the UUID and how many entries the root
   has. Beyond that:
   - EFS (calibration data): nothing more.
@@ -652,6 +652,18 @@ time. Asking for one inode reads 32 KiB, and the next directory's inodes have us
 evicted by then, so the walk reads 1.5 GiB to look at 43000 entries. A cache below it, in the
 reader, would keep what it evicts. A file read moves 32 KiB per call too, so it reaches about
 half of the 75 MB/s that DMA reaches with 2 MiB reads.
+
+With the reader's 6 MiB cache:
+
+| Check | Without cache | With cache |
+|---|---|---|
+| USERDATA load | 182 ms, 1728 card reads | 9.8 ms, 4 chunks from the card |
+| USERDATA walk | 36.6 s, 48038 card reads (1.5 GiB) | 10.1 s, 4960 chunks (155 MiB), 5.7 s in the reader |
+| Largest file, first read | about 39 MB/s | about 37.6 MB/s, 134 chunks |
+| Largest file, second read | about 39 MB/s | about 155 MB/s, all from the cache |
+| Each load | | about 3 ms more, zeroing the 6 MiB cache |
+
+The walk still asks the reader for 1.5 GiB, now mostly copies out of the cache.
 
 ## WiFi
 
