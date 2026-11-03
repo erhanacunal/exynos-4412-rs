@@ -11,8 +11,15 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::{self, State};
 use smoltcp::wire::Ipv4Address;
 
-/// The port it listens on.
-pub const PORT: u16 = 80;
+/// What happened to a connection, for its caller.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    Nothing,
+    /// A request was answered.
+    Answered,
+    /// All of `/data` was acknowledged.
+    DataAcknowledged,
+}
 /// Bytes that `/data` sends.
 pub const DATA_BYTES: u32 = 1 << 20;
 /// Bytes of a request that are kept. Only its first line is used.
@@ -88,6 +95,7 @@ enum Phase {
 /// One connection's worth of server.
 pub struct Server {
     handle: SocketHandle,
+    port: u16,
     phase: Phase,
     /// When the current phase, or the connection, began, in ms.
     since_ms: u64,
@@ -103,10 +111,11 @@ pub struct Server {
 }
 
 impl Server {
-    /// Serves on a TCP socket of the set, which this then owns.
-    pub const fn new(handle: SocketHandle) -> Self {
+    /// Serves on `port` with a TCP socket of the set, which this then owns.
+    pub const fn new(handle: SocketHandle, port: u16) -> Self {
         Self {
             handle,
+            port,
             phase: Phase::Request,
             since_ms: 0,
             request: [0; REQUEST_MAX],
@@ -135,24 +144,27 @@ impl Server {
         self.acknowledged = false;
     }
 
-    /// Does what the connection needs now. Returns whether a request was answered.
-    pub fn service(&mut self, socket: &mut tcp::Socket, now_ms: u64, status: &Status) -> bool {
+    /// Does what the connection needs now.
+    pub fn service(&mut self, socket: &mut tcp::Socket, now_ms: u64, status: &Status) -> Event {
         if !socket.is_open() {
             // A closed socket and a nonzero port: this cannot fail.
-            let _ = socket.listen(PORT);
+            let _ = socket.listen(self.port);
             self.reset(now_ms);
-            return false;
+            return Event::Nothing;
         }
         match self.phase {
-            Phase::Request => self.read_request(socket, now_ms, status),
+            Phase::Request => {
+                if self.read_request(socket, now_ms, status) {
+                    Event::Answered
+                } else {
+                    Event::Nothing
+                }
+            }
             Phase::Sending => {
                 self.send(socket, now_ms);
-                false
+                Event::Nothing
             }
-            Phase::Linger => {
-                self.linger(socket, now_ms);
-                false
-            }
+            Phase::Linger => self.linger(socket, now_ms),
         }
     }
 
@@ -184,8 +196,8 @@ impl Server {
         let method = words.next().unwrap_or(&[]);
         let path = words.next().unwrap_or(&[]);
         match socket.remote_endpoint() {
-            Some(peer) => println!("HTTP: {} {} from {}", Ascii(method), Ascii(path), peer),
-            None => println!("HTTP: {} {}", Ascii(method), Ascii(path)),
+            Some(peer) => println!("HTTP: {} {} on port {} from {}", Ascii(method), Ascii(path), self.port, peer),
+            None => println!("HTTP: {} {} on port {}", Ascii(method), Ascii(path), self.port),
         }
 
         // A full buffer cannot take more: what does not fit is left out, and the page says less.
@@ -259,9 +271,10 @@ impl Server {
         }
     }
 
-    fn linger(&mut self, socket: &mut tcp::Socket, now_ms: u64) {
+    fn linger(&mut self, socket: &mut tcp::Socket, now_ms: u64) -> Event {
         // Unread bytes would close the window, and hold the client's close behind them.
         let _ = socket.recv(|bytes| (bytes.len(), ()));
+        let mut event = Event::Nothing;
         if !self.acknowledged && socket.send_queue() == 0 {
             self.acknowledged = true;
             self.since_ms = now_ms;
@@ -273,6 +286,7 @@ impl Server {
                     ms,
                     u64::from(self.data_total) * 1000 / 1024 / ms,
                 );
+                event = Event::DataAcknowledged;
             }
         }
         if socket.state() == State::CloseWait {
@@ -281,6 +295,7 @@ impl Server {
             // The client has not closed: the wait after closing falls on this side then.
             socket.close();
         }
+        event
     }
 }
 

@@ -8,35 +8,93 @@ use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetFrame, EthernetProtocol, Icmpv4Message, Icmpv4Packet, IpProtocol, Ipv4Packet};
 
-use super::bcm4334::{Activity, Bcm4334, Error};
+use super::bcm4334::{Activity, Bcm4334, Error, Timing};
+use super::timer::Mct;
 use crate::wpa::Supplicant;
 
 /// Bytes of the longest Ethernet frame on a network with the usual packet size, 1500 bytes.
 const FRAME_MAX: usize = 1514;
+
+/// What the device has done, to find where the time goes. Times are in MCT counts. Each only
+/// grows, so a caller measures by subtracting two readings.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    /// Frames handed to the chip.
+    pub sent: u32,
+    /// Their bytes.
+    pub sent_bytes: u64,
+    /// The time they took, waits for room included.
+    pub send_time: u64,
+    /// Reads of the chip that gave a frame to the stack.
+    pub received: u32,
+    /// Their time.
+    pub receive_time: u64,
+    /// Reads of the chip that gave nothing to the stack.
+    pub empty_polls: u32,
+    /// Their time.
+    pub empty_poll_time: u64,
+    /// Times the stack was told it cannot send, as the firmware had no room.
+    pub refused: u32,
+    /// The chip's own share of the times above.
+    pub chip: Timing,
+}
 
 /// A joined chip as `smoltcp` sees it.
 pub struct WifiDevice<'a> {
     chip: &'a mut Bcm4334,
     supplicant: &'a mut Supplicant,
     report: fn(Activity),
+    mct: Mct,
     received: [u8; FRAME_MAX],
     sent: [u8; FRAME_MAX],
     failure: Option<Error>,
     echo_requests: u32,
+    stats: Stats,
 }
 
 impl<'a> WifiDevice<'a> {
     /// Takes a chip that [`Bcm4334::connect`] has joined to a network, and the handshake state
     /// that did it. `report` hears of what happens to the connection.
-    pub const fn new(chip: &'a mut Bcm4334, supplicant: &'a mut Supplicant, report: fn(Activity)) -> Self {
+    /// `mct` times what it does: see [`stats`](Self::stats).
+    pub const fn new(chip: &'a mut Bcm4334, supplicant: &'a mut Supplicant, report: fn(Activity), mct: Mct) -> Self {
         Self {
             chip,
             supplicant,
             report,
+            mct,
             received: [0; FRAME_MAX],
             sent: [0; FRAME_MAX],
             failure: None,
             echo_requests: 0,
+            stats: Stats {
+                sent: 0,
+                sent_bytes: 0,
+                send_time: 0,
+                received: 0,
+                receive_time: 0,
+                empty_polls: 0,
+                empty_poll_time: 0,
+                refused: 0,
+                chip: Timing {
+                    frame_writes: 0,
+                    frame_reads: 0,
+                    room_waits: 0,
+                },
+            },
+        }
+    }
+
+    /// The chip, to ask it something. Its answers do not come through the stack, so a frame that
+    /// comes meanwhile is lost.
+    pub fn chip(&mut self) -> &mut Bcm4334 {
+        self.chip
+    }
+
+    /// What it has done so far.
+    pub fn stats(&self) -> Stats {
+        Stats {
+            chip: self.chip.timing(),
+            ..self.stats
         }
     }
 
@@ -88,6 +146,8 @@ pub struct TxToken<'a> {
     chip: &'a mut Bcm4334,
     buffer: &'a mut [u8; FRAME_MAX],
     failure: &'a mut Option<Error>,
+    stats: &'a mut Stats,
+    mct: Mct,
 }
 
 impl phy::TxToken for TxToken<'_> {
@@ -98,9 +158,13 @@ impl phy::TxToken for TxToken<'_> {
         // The stack asks for no more than `capabilities` allows.
         let frame = &mut self.buffer[..length];
         let result = f(frame);
+        let begin = self.mct.count();
         if let Err(error) = self.chip.send_ethernet(frame) {
             *self.failure = Some(error);
         }
+        self.stats.sent += 1;
+        self.stats.sent_bytes += length as u64;
+        self.stats.send_time += self.mct.count() - begin;
         result
     }
 }
@@ -119,8 +183,20 @@ impl Device for WifiDevice<'_> {
         if self.failure.is_some() {
             return None;
         }
-        let length = match self.chip.poll(self.supplicant, &mut self.received, self.report) {
-            Ok(length) => length?,
+        let begin = self.mct.count();
+        let polled = self.chip.poll(self.supplicant, &mut self.received, self.report);
+        let time = self.mct.count() - begin;
+        let length = match polled {
+            Ok(Some(length)) => {
+                self.stats.received += 1;
+                self.stats.receive_time += time;
+                length
+            }
+            Ok(None) => {
+                self.stats.empty_polls += 1;
+                self.stats.empty_poll_time += time;
+                return None;
+            }
             Err(error) => {
                 self.failure = Some(error);
                 return None;
@@ -134,6 +210,8 @@ impl Device for WifiDevice<'_> {
             chip: self.chip,
             buffer: &mut self.sent,
             failure: &mut self.failure,
+            stats: &mut self.stats,
+            mct: self.mct,
         };
         Some((RxToken { frame }, transmit))
     }
@@ -142,13 +220,19 @@ impl Device for WifiDevice<'_> {
         // Without room in the firmware, sending would wait for it and drop the frames that come
         // meanwhile, such as the acknowledgements of what is being sent. Saying no instead keeps
         // the stack reading: each frame read updates the room.
-        if self.failure.is_some() || !self.chip.can_send() {
+        if self.failure.is_some() {
+            return None;
+        }
+        if !self.chip.can_send() {
+            self.stats.refused += 1;
             return None;
         }
         Some(TxToken {
             chip: self.chip,
             buffer: &mut self.sent,
             failure: &mut self.failure,
+            stats: &mut self.stats,
+            mct: self.mct,
         })
     }
 

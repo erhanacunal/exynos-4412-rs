@@ -14,6 +14,7 @@ MEMORY
 }
 
 /* Frames, the table of networks, the handshake's buffers and the TCP buffers all live on the
- * stack of main. From the disassembly: join's frame is 61 KiB, main's 5 KiB, and the deepest
- * calls below them add a few more, so 128K leaves room. */
-__svc_stack_size = 128K;
+ * stack of main. From the disassembly: join's frame is 129 KiB, 64 KiB of it the buffer of the
+ * large HTTP server, main's 5 KiB, and the deepest calls below them add a few more, so 256K
+ * leaves room. */
+__svc_stack_size = 256K;

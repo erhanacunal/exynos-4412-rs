@@ -34,7 +34,7 @@ use exynos_4412_rs::drivers::max77686::Max77686;
 use exynos_4412_rs::drivers::power::{self, BootMode, PowerKeys};
 use exynos_4412_rs::drivers::sdhci::Sdhci;
 use exynos_4412_rs::drivers::timer::Mct;
-use exynos_4412_rs::drivers::wifi_device::WifiDevice;
+use exynos_4412_rs::drivers::wifi_device::{Stats, WifiDevice};
 use exynos_4412_rs::wpa::{self, Supplicant};
 use exynos_4412_rs::{BootArgs, console, mmu, print, println, soc};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
@@ -55,7 +55,11 @@ const VENDOR_BROADCOM: u16 = 0x02D0;
 /// `include/linux/mmc/sdio_ids.h:61`.
 const DEVICE_4334: u16 = 0x4334;
 /// Reads of the ID register in the reliability check.
-const ID_READS: u32 = 1000;
+const ID_READS: u32 = 10_000;
+/// The SDIO data rate. Linux ran this board at [`bcm4334::BOARD_DATA_HZ`], 16 MHz; this tries
+/// the most that default speed allows. The firmware is read back after loading, so a bus that
+/// fails at this rate shows there too.
+const SDIO_HZ: u32 = bcm4334::DEFAULT_SPEED_MAX_HZ;
 const COUNTS_PER_MS: u64 = soc::MCT_CLOCK_HZ as u64 / 1000;
 /// Networks kept from a scan.
 const MAX_NETWORKS: usize = 48;
@@ -64,6 +68,10 @@ const SCAN_TIMEOUT_MS: u64 = 20_000;
 /// The network to join.
 const SSID: Option<&str> = option_env!("WIFI_SSID");
 const PASSWORD: Option<&str> = option_env!("WIFI_PASSWORD");
+/// The band to join in, `2.4` or `5`, if not whichever access point is strongest.
+const BAND: Option<&str> = option_env!("WIFI_BAND");
+/// Channels up to this one are in the 2.4 GHz band, the rest in 5 GHz.
+const LAST_2G_CHANNEL: u8 = 14;
 /// Joining scans first, then authenticates and shakes hands. Not measured.
 const JOIN_TIMEOUT_MS: u64 = 30_000;
 /// How long the DHCP server gets to give an address. The stack asks again on its own meanwhile.
@@ -90,20 +98,49 @@ const TCP_TIMEOUT_MS: u64 = 5_000;
 const STATUS_LINE_MAX: usize = 128;
 /// The first of the ports that connections from here come from: the start of the dynamic range.
 const LOCAL_PORT_BASE: u16 = 49152;
-/// Connections the HTTP server takes at once. Browsers open more than one.
+/// Where the HTTP server listens, and the connections it takes there at once. Browsers open more
+/// than one.
+const HTTP_PORT: u16 = 80;
 const SERVERS: usize = 4;
 /// Each server's buffers. What it sends bounds the bytes in flight, so the speed of `/data`.
 const SERVER_RX: usize = 1024;
 const SERVER_TX: usize = 8192;
+/// A second port, with one connection that can have far more in flight, to compare against.
+const LARGE_PORT: u16 = 8080;
+const LARGE_TX: usize = 65536;
+/// Every server, the large one last.
+const ALL_SERVERS: usize = SERVERS + 1;
 const CLIENT_RX: usize = 2048;
 const CLIENT_TX: usize = 256;
 /// A TCP connection that hears nothing for this long is dropped.
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Sockets: one for DHCP, one for pings, one TCP client, and the servers.
-const SOCKETS: usize = 3 + SERVERS;
+const SOCKETS: usize = 3 + ALL_SERVERS;
 /// Pings each way that the ping socket can hold, and the bytes for them.
 const PING_QUEUE: usize = 4;
 const PING_BUFFER: usize = 256;
+
+/// Whether `BAND` allows joining on this channel.
+fn band_allows(channel: u8) -> bool {
+    match BAND {
+        Some("2.4") => channel <= LAST_2G_CHANNEL,
+        Some("5") => channel > LAST_2G_CHANNEL,
+        _ => true,
+    }
+}
+
+/// Prints the rate the firmware sends at, and the signal.
+fn report_link(chip: &mut Bcm4334) {
+    match (chip.tx_rate_kbps(), chip.rssi()) {
+        (Ok(rate), Ok(rssi)) => println!(
+            "Link: sending at {}.{} Mbit/s, signal {} dBm",
+            rate / 1000,
+            rate % 1000 / 100,
+            rssi,
+        ),
+        (Err(error), _) | (_, Err(error)) => println!("Link: ERROR {:?}", error),
+    }
+}
 
 fn verdict(good: bool) -> &'static str {
     if good { "OK" } else { "MISMATCH" }
@@ -206,7 +243,9 @@ fn scan(chip: &mut Bcm4334, mct: Mct, own: [u8; 6]) -> Result<(Option<Target>, [
     let status = chip.scan(SCAN_TIMEOUT_MS, |bss, rsn| {
         results += 1;
         pool = Hmac::new(&pool).sign(&[&mct.count().to_le_bytes()[..], &bss.bssid, &bss.rssi.to_le_bytes()]);
-        if SSID.is_some_and(|ssid| ssid.as_bytes() == &bss.ssid[..usize::from(bss.ssid_length)]) {
+        if SSID.is_some_and(|ssid| ssid.as_bytes() == &bss.ssid[..usize::from(bss.ssid_length)])
+            && band_allows(bss.channel)
+        {
             if !wpa::rsn_supported(rsn) || rsn.len() > wpa::RSN_MAX {
                 unsupported += 1;
             } else if target.as_ref().is_none_or(|known| bss.rssi > known.rssi) {
@@ -311,6 +350,64 @@ fn report(activity: Activity) {
     }
 }
 
+/// The device's statistics at one moment.
+#[derive(Clone, Copy, Default)]
+struct Mark {
+    stats: Stats,
+    count: u64,
+}
+
+fn us(counts: u64) -> u64 {
+    counts * 1_000_000 / u64::from(soc::MCT_CLOCK_HZ)
+}
+
+fn ms(counts: u64) -> u64 {
+    counts / COUNTS_PER_MS
+}
+
+fn each_us(counts: u64, times: u32) -> u64 {
+    us(counts) / u64::from(times.max(1))
+}
+
+/// Says where the time between two marks went. Other traffic in that time counts too.
+fn report_transfer(before: &Mark, after: &Mark) {
+    let a = &after.stats;
+    let b = &before.stats;
+    let total = after.count - before.count;
+    let send = a.send_time - b.send_time;
+    let receive = a.receive_time - b.receive_time;
+    let empty = a.empty_poll_time - b.empty_poll_time;
+    let sent = a.sent - b.sent;
+    let received = a.received - b.received;
+    let empty_polls = a.empty_polls - b.empty_polls;
+    println!(
+        "  {} ms: sending {} ms, receiving {} ms, empty polls {} ms, the rest {} ms",
+        ms(total),
+        ms(send),
+        ms(receive),
+        ms(empty),
+        ms(total.saturating_sub(send + receive + empty)),
+    );
+    println!(
+        "  Sent {} frames, {} bytes, {} us each: bus writes {} ms, {} us each; waiting for room {} ms",
+        sent,
+        a.sent_bytes - b.sent_bytes,
+        each_us(send, sent),
+        ms(a.chip.frame_writes - b.chip.frame_writes),
+        each_us(a.chip.frame_writes - b.chip.frame_writes, sent),
+        ms(a.chip.room_waits - b.chip.room_waits),
+    );
+    println!(
+        "  Received {} frames, {} us each; {} empty polls, {} us each; bus reads of any frame {} ms",
+        received,
+        each_us(receive, received),
+        empty_polls,
+        each_us(empty, empty_polls),
+        ms(a.chip.frame_reads - b.chip.frame_reads),
+    );
+    println!("  Stack told there was no room: {} times", a.refused - b.refused);
+}
+
 /// A connected station: its network stack and what it needs.
 struct Station<'a> {
     device: WifiDevice<'a>,
@@ -319,7 +416,9 @@ struct Station<'a> {
     dhcp: SocketHandle,
     ping: SocketHandle,
     client: SocketHandle,
-    servers: [http::Server; SERVERS],
+    servers: [http::Server; ALL_SERVERS],
+    /// What the device had done when each server last answered a request.
+    marks: [Mark; ALL_SERVERS],
     capabilities: DeviceCapabilities,
     mct: Mct,
     mac: [u8; 6],
@@ -548,7 +647,8 @@ impl Station<'_> {
 
         let socket = self.sockets.get_mut::<tcp::Socket>(self.client);
         socket.close();
-        let finished = self.wait_for_client(|socket| matches!(socket.state(), tcp::State::TimeWait | tcp::State::Closed))?;
+        let finished =
+            self.wait_for_client(|socket| matches!(socket.state(), tcp::State::TimeWait | tcp::State::Closed))?;
         if !finished {
             self.sockets.get_mut::<tcp::Socket>(self.client).abort();
         }
@@ -567,10 +667,25 @@ impl Station<'_> {
             pings: self.device.echo_requests(),
             requests: self.requests,
         };
-        for server in &mut self.servers {
+        for (server, mark) in self.servers.iter_mut().zip(&mut self.marks) {
             let socket = self.sockets.get_mut::<tcp::Socket>(server.handle());
-            if server.service(socket, now_ms, &status) {
-                self.requests += 1;
+            match server.service(socket, now_ms, &status) {
+                http::Event::Nothing => {}
+                http::Event::Answered => {
+                    self.requests += 1;
+                    *mark = Mark {
+                        stats: self.device.stats(),
+                        count: self.mct.count(),
+                    };
+                }
+                http::Event::DataAcknowledged => {
+                    let now = Mark {
+                        stats: self.device.stats(),
+                        count: self.mct.count(),
+                    };
+                    report_transfer(mark, &now);
+                    report_link(self.device.chip());
+                }
             }
         }
     }
@@ -580,8 +695,15 @@ impl Station<'_> {
     fn serve(&mut self) -> Result<(), Error> {
         print!("\nStaying connected, answering pings");
         match self.address {
-            Some(address) => println!(" and HTTP: http://{}/ and http://{}/data", address, address),
-            None => println!(" and HTTP on port {}", http::PORT),
+            Some(address) => println!(
+                " and HTTP: http://{}/ and http://{}/data, and with {} KiB in flight http://{}:{}/data",
+                address,
+                address,
+                LARGE_TX / 1024,
+                address,
+                LARGE_PORT,
+            ),
+            None => println!(" and HTTP on ports {} and {}", HTTP_PORT, LARGE_PORT),
         }
         println!("UART: r restart, f restart into fastboot");
         let uart = console::uart();
@@ -646,8 +768,9 @@ fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8;
     let begin = mct.count();
     chip.connect(ssid.as_bytes(), &mut supplicant, JOIN_TIMEOUT_MS, report)?;
     println!("Connected in {} ms: keys installed", (mct.count() - begin) / COUNTS_PER_MS);
+    report_link(chip);
 
-    let mut device = WifiDevice::new(chip, &mut supplicant, report);
+    let mut device = WifiDevice::new(chip, &mut supplicant, report, mct);
     let capabilities = device.capabilities();
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(own)));
     config.random_seed = u64::from_le_bytes(seed);
@@ -676,10 +799,21 @@ fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8;
 
     let mut server_rx = [[0; SERVER_RX]; SERVERS];
     let mut server_tx = [[0; SERVER_TX]; SERVERS];
-    let mut handles = [SocketHandle::default(); SERVERS];
+    let mut large_rx = [0; SERVER_RX];
+    let mut large_tx = [0; LARGE_TX];
+    let mut handles = [SocketHandle::default(); ALL_SERVERS];
     for ((handle, rx), tx) in handles.iter_mut().zip(&mut server_rx).zip(&mut server_tx) {
         *handle = sockets.add(tcp_socket(&mut rx[..], &mut tx[..]));
     }
+    handles[SERVERS] = sockets.add(tcp_socket(&mut large_rx[..], &mut large_tx[..]));
+    let mut ports = [HTTP_PORT; ALL_SERVERS];
+    ports[SERVERS] = LARGE_PORT;
+    let mut servers_at = handles.iter().zip(ports);
+    let servers = core::array::from_fn(|_| match servers_at.next() {
+        Some((&handle, port)) => http::Server::new(handle, port),
+        // Both arrays have ALL_SERVERS entries.
+        None => unreachable!(),
+    });
 
     let mut station = Station {
         device,
@@ -688,7 +822,8 @@ fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8;
         dhcp,
         ping,
         client,
-        servers: handles.map(http::Server::new),
+        servers,
+        marks: [Mark::default(); ALL_SERVERS],
         capabilities,
         mct,
         mac: own,
@@ -729,7 +864,7 @@ fn run(pmic: Max77686, mct: Mct) -> Result<(), Error> {
     bcm4334::power_on(pmic, mct)?;
 
     let host = Sdhci::new()?;
-    let (mut chip, rate) = Bcm4334::start(host, mct)?;
+    let (mut chip, rate) = Bcm4334::start(host, mct, SDIO_HZ)?;
     let card = chip.card();
     let info = card.info();
     println!("Card: OCR {:#08x}, {} functions, address {:#x}", info.ocr, info.functions, info.rca);
@@ -823,12 +958,20 @@ fn run(pmic: Max77686, mct: Mct) -> Result<(), Error> {
         println!("Built without WIFI_SSID and WIFI_PASSWORD: stopping here");
         return Ok(());
     }
+    if BAND.is_some_and(|band| band != "2.4" && band != "5") {
+        println!("WIFI_BAND is 2.4 or 5 (MISMATCH)");
+        return Ok(());
+    }
+    match BAND {
+        Some(band) => println!("Joining in the {} GHz band only", band),
+        None => println!("Joining in either band"),
+    }
     if !PASSWORD.is_some_and(|password| (8..=63).contains(&password.len())) {
         println!("A WPA passphrase has 8 to 63 characters (MISMATCH)");
         return Ok(());
     }
     let Some(target) = target else {
-        println!("The named network was not found, or asks for what this cannot do (MISMATCH)");
+        println!("The named network was not found, not in WIFI_BAND, or asks for what this cannot do (MISMATCH)");
         return Ok(());
     };
     if let Err(error) = join(&mut chip, mct, own, &target, &pool) {

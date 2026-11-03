@@ -63,7 +63,9 @@ const RAIL_SETTLE_MS: u64 = 10;
 /// Card identification rate.
 const IDENTIFY_HZ: u32 = 400_000;
 /// `exynos4412-mehmet.dts:1514` `max-frequency`, the rate at which Linux worked on this board.
-const DATA_HZ: u32 = 16_000_000;
+pub const BOARD_DATA_HZ: u32 = 16_000_000;
+/// The highest rate of an SDIO card in default speed, which needs no switch to high speed.
+pub const DEFAULT_SPEED_MAX_HZ: u32 = 25_000_000;
 
 /// The function with the backplane window and the chip's clock control.
 const FUNCTION1: u8 = 1;
@@ -287,6 +289,12 @@ const BCDC_ID_SHIFT: u32 = 16;
 const CONTROL_MESSAGE_MAX: usize = 1518;
 /// `brcmfmac/fwil.h:12`.
 pub const IOCTL_GET_VERSION: u32 = 1;
+/// `brcmfmac/fwil.h:16`: the rate of what the firmware sends, in 500 kbit/s.
+const IOCTL_GET_RATE: u32 = 12;
+/// `brcmfmac/fwil.h:59`: the access point's signal, in a `struct brcmf_scb_val_le`.
+const IOCTL_GET_RSSI: u32 = 127;
+/// `brcmfmac/fwil_types.h` `struct brcmf_scb_val_le`: a 32-bit value and an address, padded.
+const SCB_VAL_BYTES: usize = 12;
 /// `brcmfmac/fwil.h:78`.
 const IOCTL_GET_VARIABLE: u32 = 262;
 /// `brcmfmac/fwil.h:79`.
@@ -507,6 +515,8 @@ pub enum Error {
     BadFrame(u32),
     /// A frame or message that does not fit.
     BadLength,
+    /// A data rate above what default speed allows, which is all this driver uses.
+    RateTooHigh(u32),
     /// The firmware did not answer.
     NoAnswer,
     /// The firmware reports it has stopped: the mailbox value.
@@ -817,16 +827,34 @@ pub struct Bcm4334 {
     queued_events: [Option<Event>; MAX_QUEUED_EVENTS],
     /// Whether this connection has reached its access point.
     associated: bool,
+    timing: Timing,
+}
+
+/// Where the time of the data path goes, in MCT counts since the chip started. Each only grows,
+/// so a caller measures by subtracting two readings.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Timing {
+    /// Writing network frames over the bus, from the first `CMD53` to the last.
+    pub frame_writes: u64,
+    /// Reading frames over the bus, of any channel.
+    pub frame_reads: u64,
+    /// Sending a network frame that had to wait for room in the firmware first.
+    pub room_waits: u64,
 }
 
 impl Bcm4334 {
     /// Starts the card on a chip just out of reset: the bus at 1 bit and 400 kHz, then at 4 bits
-    /// and the board's data rate, with function 1 on. Returns also the rate.
-    pub fn start(host: Sdhci, mct: Mct) -> Result<(Self, u32), Error> {
+    /// and the highest rate the clock reaches that is not above `data_hz`, with function 1 on.
+    /// Returns also that rate. The card stays in default speed, so `data_hz` above
+    /// [`DEFAULT_SPEED_MAX_HZ`] is refused.
+    pub fn start(host: Sdhci, mct: Mct, data_hz: u32) -> Result<(Self, u32), Error> {
+        if data_hz > DEFAULT_SPEED_MAX_HZ {
+            return Err(Error::RateTooHigh(data_hz));
+        }
         host.set_clock(IDENTIFY_HZ)?;
         let card = Sdio::start(host, mct)?;
         card.set_bus_4bit()?;
-        let rate = host.set_clock(DATA_HZ)?;
+        let rate = host.set_clock(data_hz)?;
         card.set_block_size(FUNCTION1, FUNCTION1_BLOCK_SIZE)?;
         card.set_block_size(FUNCTION2, FUNCTION2_BLOCK_SIZE)?;
         card.enable_function(mct, FUNCTION1, FUNCTION1_READY_MS)?;
@@ -846,6 +874,11 @@ impl Bcm4334 {
             frame: [0; FRAME_SIZE],
             queued_events: [None; MAX_QUEUED_EVENTS],
             associated: false,
+            timing: Timing {
+                frame_writes: 0,
+                frame_reads: 0,
+                room_waits: 0,
+            },
         };
         Ok((chip, rate))
     }
@@ -1295,7 +1328,10 @@ impl Bcm4334 {
 
         let address = self.frame_address()?;
         let block = usize::from(FUNCTION2_BLOCK_SIZE);
-        self.card.read(FUNCTION2, address, false, block, &mut self.frame[..FIRST_READ])?;
+        let begin = self.mct.count();
+        let first = self.card.read(FUNCTION2, address, false, block, &mut self.frame[..FIRST_READ]);
+        self.timing.frame_reads += self.mct.count() - begin;
+        first?;
 
         let word = |bytes: &[u8]| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         let hardware = word(&self.frame[0..]);
@@ -1320,9 +1356,17 @@ impl Bcm4334 {
             let rest = (length - FIRST_READ).next_multiple_of(4);
             let end = FIRST_READ + rest;
             let body = self.frame.get_mut(FIRST_READ..end).ok_or(Error::BadLength)?;
-            self.card.read(FUNCTION2, address, false, block, body)?;
+            let begin = self.mct.count();
+            let rest = self.card.read(FUNCTION2, address, false, block, body);
+            self.timing.frame_reads += self.mct.count() - begin;
+            rest?;
         }
         Ok(Some((channel, offset, length)))
+    }
+
+    /// Where the time of the data path has gone so far.
+    pub const fn timing(&self) -> Timing {
+        self.timing
     }
 
     /// Whether the firmware can take another frame: what `data_ok` in `brcmfmac/sdio.c:675`
@@ -1471,6 +1515,22 @@ impl Bcm4334 {
         Ok(())
     }
 
+    /// The rate the firmware last sent at, in kbit/s: what `brcmfmac/cfg80211.c:2729` reports as
+    /// the station's transmit rate. While joined, a frame that comes during the question is lost.
+    pub fn tx_rate_kbps(&mut self) -> Result<u32, Error> {
+        let mut rate = [0; 4];
+        self.ioctl(IOCTL_GET_RATE, false, &mut rate)?;
+        Ok(u32::from_le_bytes(rate) * 500)
+    }
+
+    /// The access point's signal, in dBm, as `brcmfmac/cfg80211.c:2737` asks for it. While
+    /// joined, a frame that comes during the question is lost.
+    pub fn rssi(&mut self) -> Result<i32, Error> {
+        let mut value = [0; SCB_VAL_BYTES];
+        self.ioctl(IOCTL_GET_RSSI, false, &mut value)?;
+        Ok(i32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+    }
+
     /// Whether the firmware can do the WPA handshake itself. It is what `brcmfmac/feature.c:289`
     /// asks: a firmware that cannot refuses the variable.
     pub fn has_own_supplicant(&mut self) -> Result<bool, Error> {
@@ -1574,7 +1634,12 @@ impl Bcm4334 {
             return Err(Error::BadLength);
         }
         let begin = self.mct.count();
-        self.wait_to_send(begin, CONTROL_TIMEOUT_MS * 1000 * COUNTS_PER_US)?;
+        let waited = !self.can_send();
+        let room = self.wait_to_send(begin, CONTROL_TIMEOUT_MS * 1000 * COUNTS_PER_US);
+        if waited {
+            self.timing.room_waits += self.mct.count() - begin;
+        }
+        room?;
 
         let sequence = self.tx_sequence;
         let frame = &mut self.frame;
@@ -1591,7 +1656,10 @@ impl Bcm4334 {
 
         let address = self.frame_address()?;
         let block = usize::from(FUNCTION2_BLOCK_SIZE);
-        self.card.write(FUNCTION2, address, false, block, &self.frame[..padded])?;
+        let begin = self.mct.count();
+        let written = self.card.write(FUNCTION2, address, false, block, &self.frame[..padded]);
+        self.timing.frame_writes += self.mct.count() - begin;
+        written?;
         self.tx_sequence = sequence.wrapping_add(1);
         Ok(())
     }

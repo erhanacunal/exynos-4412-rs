@@ -562,7 +562,10 @@ handshake and `crypto` the algorithms it needs: the firmware of this board leave
 - **Firmware:** The firmware and NVRAM files are not in this repository. `wifi_test` takes them at
   build time from the directory in `WIFI_FIRMWARE_DIR`, and stops before loading without it.
 - **Clock:** This controller has no usable divider of its own, so the card clock is `sclk_mmc3`,
-  set in the CMU: 400 kHz to start, then the 16 MHz of the board's DTS.
+  set in the CMU: 400 kHz to start, then the data rate `wifi_test` asks for. The board's DTS gives
+  16 MHz, with high speed off. `wifi_test` asks for 25 MHz, the most of default speed, so the card
+  needs no switch. From 25 MHz on, the controller samples with other feedback settings
+  (`sdhci-s3c.c:290-291`).
 - **Transfer:** Polled through the buffer port, with no DMA and no interrupts.
 - **Flow control:** The firmware says in each frame it sends how many more it can take. While it
   has no room, `drivers::wifi_device` tells `smoltcp` it cannot send, so the stack keeps reading
@@ -619,6 +622,66 @@ TCP, both ways:
   no whole request in 5 s is dropped, as browsers open some ahead of time.
 - **Memory:** The buffers are on the stack: 8 KiB to send and 1 KiB to receive per server
   connection. The 8 KiB bounds the bytes in flight, and so the speed of `/data`.
+- **Second port:** Port 8080 takes one connection, with 64 KiB to send, to compare against.
+- **Where the time goes:** When `/data` is all acknowledged, the log splits the time since the
+  request into sending frames, receiving them, polling the chip for nothing, and the rest (the
+  stack, HTTP and the console). It gives the frames each way, the time each took, how much of
+  sending was bus writes and waiting for room in the firmware, and how often the stack was told
+  there was no room. Other traffic in that time counts too, so test one transfer at a time.
+
+Measured on the board, 1 MiB of `/data` to `curl` each, with the bus at 16 MHz. The access point's
+band was not recorded:
+
+| | Port 80, 8 KiB in flight | Port 8080, 64 KiB in flight |
+|---|---|---|
+| Until all acknowledged | 558 ms, 1835 KiB/s | 233 ms, 4394 KiB/s |
+| Sending frames | 192 ms, 767 frames | 190 ms, 721 frames |
+| Of that, bus writes | 189 ms, 246 us each | 187 ms, 260 us each |
+| Waiting for room in the firmware | 0 ms | 0 ms, told the stack 117 times |
+| Empty polls | 238 ms | 18 ms |
+| Receiving, and the rest | 22 and 103 ms | 5 and 17 ms |
+
+- **8 KiB:** The time with nothing to do is the wait for acknowledgements: the buffer, not the
+  bus, sets the speed.
+- **64 KiB:** 82 % of the time is bus writes. A frame of about 1532 bytes takes at least about
+  192 us on 4 bits at 16 MHz, against the 260 us measured, so the bus is busy for about 3/4 of
+  each write. The rest is the commands and the CPU at the buffer port. DMA could take only part of
+  that rest away. The clock of the bus sets the speed here.
+
+The same at 25 MHz, on channel 11 (2.4 GHz). The bus passed the same checks there: 10000 reads of
+the ID without error, and the firmware written and read back in 112 ms instead of 149:
+
+| | Port 80, 8 KiB in flight | Port 8080, 64 KiB in flight |
+|---|---|---|
+| Until all acknowledged | 563 ms, 1818 KiB/s | 231 ms, 4432 KiB/s |
+| Sending frames | 137 ms, 768 frames | 136 ms, 721 frames |
+| Of that, bus writes | 134 ms, 175 us each | 133 ms, 184 us each |
+| Waiting for room in the firmware | 0 ms | 0 ms, told the stack 272 times |
+| Empty polls | 262 ms | 52 ms |
+| Receiving, and the rest | 18 and 144 ms | 5 and 36 ms |
+
+Bus writes went down by 30 %, the speed did not move: at 25 MHz something past the bus sets it.
+Which band the 16 MHz run used is not known, so the two do not tell whether that is the radio.
+`WIFI_BAND`, `2.4` or `5`, keeps joining to one band, and the log gives the rate the firmware sends
+at and the signal, after joining and after each `/data`.
+
+The same at 25 MHz with `WIFI_BAND=5`: channel 48, the firmware sending at 150 Mbit/s, signal
+-60 to -64 dBm:
+
+| | Port 80, 8 KiB in flight | Port 8080, 64 KiB in flight |
+|---|---|---|
+| Until all acknowledged | 364 ms, 2813 KiB/s | 161 ms, 6360 KiB/s |
+| Sending frames | 138 ms, 769 frames | 136 ms, 721 frames |
+| Of that, bus writes | 134 ms, 174 us each | 133 ms, 185 us each |
+| Waiting for room in the firmware | 0 ms | 0 ms, told the stack 135 times |
+| Empty polls | 129 ms | 5 ms |
+| Receiving, and the rest | 20 and 76 ms | 6 and 13 ms |
+
+- **2.4 GHz:** The radio set the 4432 KiB/s above, not the bus.
+- **5 GHz, 64 KiB:** 84 % of the time is bus writes again: the bus sets the speed.
+- **Per frame:** A write takes about 60 us more than its bytes need on the bus, at 16 MHz
+  (260 against 192 us) and at 25 MHz (185 against 123 us) alike: the commands, and the CPU at the
+  buffer port. A faster clock shortens only the other part.
 
 From another computer on the network, for example:
 
@@ -629,7 +692,7 @@ curl -o NUL -w "%{speed_download} bytes/s\n" http://<address>/data
 
 (`-o /dev/null` instead of `-o NUL` outside Windows.)
 
-Observed on the board, on the same 5 GHz access point:
+Observed on the board; the access point's band was not recorded:
 
 | Check | Result |
 |---|---|
