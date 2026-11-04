@@ -284,20 +284,57 @@ pub const fn rgb(red: u8, green: u8, blue: u8) -> u32 {
 
 /// Pixels the FIMD reads from DRAM, in `0x00RRGGBB` form, line after line.
 ///
-/// Drawing reaches the screen only after [`flush`](Self::flush) or
-/// [`flush_rect`](Self::flush_rect): the FIMD does not see the caches. It holds a `'static`
-/// buffer because the FIMD keeps reading it, with no way for the borrow checker to know.
+/// It holds a `'static` buffer because the FIMD keeps reading it, with no way for the borrow
+/// checker to know. The CPU draws in one of two ways:
+///
+/// - Uncached, from [`new`](Self::new) when it can: through [`mmu::DRAM_UNCACHED`], the
+///   uncached view of the buffer. Each write goes to DRAM, combined with its neighbours, so
+///   [`flush`](Self::flush) and [`flush_rect`](Self::flush_rect) only wait for them, and a device
+///   that wrote the buffer needs nothing done before the CPU reads it. Filling is about six times
+///   as fast as cached and flushed (`gpu_rect_test`: 7.8 M pixels in 17 ms against 109 ms), but
+///   each read waits for DRAM: drawing that reads what it draws on, blending, wants the other.
+/// - Cached, from [`new_cached`](Self::new_cached), or when the buffer is not where the uncached
+///   view reaches: drawing reaches the screen only after a flush, the FIMD not seeing the caches.
 #[derive(Debug)]
 pub struct Framebuffer {
     pixels: &'static mut [u32],
     width: usize,
     height: usize,
+    /// The address of the uncached view of `pixels`, the CPU's way to them; 0 when cached. The
+    /// cached view then holds no dirty line of the buffer: nothing writes there.
+    uncached: usize,
 }
 
 impl Framebuffer {
-    /// Wraps a buffer of at least `width * height` pixels. `None` if it is smaller.
+    /// Wraps a buffer of at least `width * height` pixels, drawn in uncached when the buffer is
+    /// inside the first [`mmu::DRAM_UNCACHED_SIZE`] bytes of DRAM and starts and ends on whole
+    /// lines of [`mmu::DCACHE_LINE`] bytes, and the MMU is on ([`mmu::enable`]); cached
+    /// otherwise. `None` if it is smaller.
+    ///
+    /// What the caches hold of the buffer is written out first, then dropped, so what was in it
+    /// stays.
     pub fn new(pixels: &'static mut [u32], width: usize, height: usize) -> Option<Self> {
-        (pixels.len() >= width.checked_mul(height)?).then_some(Self { pixels, width, height })
+        let mut buffer = Self::new_cached(pixels, width, height)?;
+        let (start, len) = (buffer.address(), size_of_val(buffer.pixels));
+        let whole_lines = start % mmu::DCACHE_LINE == 0 && len % mmu::DCACHE_LINE == 0;
+        let reachable = mmu::is_enabled() && mmu::uncached(start + len - 1).is_some();
+        if let (true, true, Some(uncached)) = (whole_lines, reachable, mmu::uncached(start)) {
+            mmu::clean_dcache_range(start, len);
+            mmu::invalidate_dcache_range(start, len);
+            buffer.uncached = uncached;
+        }
+        Some(buffer)
+    }
+
+    /// Wraps a buffer of at least `width * height` pixels, drawn in cached. `None` if it is
+    /// smaller.
+    pub fn new_cached(pixels: &'static mut [u32], width: usize, height: usize) -> Option<Self> {
+        (pixels.len() >= width.checked_mul(height)?).then_some(Self { pixels, width, height, uncached: 0 })
+    }
+
+    /// Whether the CPU draws through the uncached view: see [`new`](Self::new).
+    pub const fn is_uncached(&self) -> bool {
+        self.uncached != 0
     }
 
     /// Pixels per line.
@@ -315,10 +352,17 @@ impl Framebuffer {
         self.pixels.as_ptr() as usize
     }
 
-    /// The pixels, line after line, as the CPU's caches have them: after a device wrote them,
+    /// The pixels, line after line. Uncached, as DRAM has them. Cached, as the CPU's caches have
+    /// them: after a device wrote them,
     /// [`mmu::invalidate_dcache_range`](crate::mmu::invalidate_dcache_range) first.
     pub fn pixels(&self) -> &[u32] {
-        &self.pixels[..self.width * self.height]
+        if self.is_uncached() {
+            // SAFETY: the uncached view of the buffer, which `new` checked it covers, as long as
+            // `self` is borrowed; nothing writes through the CPU while it is.
+            unsafe { core::slice::from_raw_parts(self.uncached as *const u32, self.width * self.height) }
+        } else {
+            &self.pixels[..self.width * self.height]
+        }
     }
 
     /// Bytes from one line to the next.
@@ -326,11 +370,37 @@ impl Framebuffer {
         self.width * size_of::<u32>()
     }
 
+    /// `count` pixels of line `row` from column `x`, the way the CPU draws them. The caller keeps
+    /// them inside the buffer.
+    fn span(&mut self, row: usize, x: usize, count: usize) -> &mut [u32] {
+        let start = row * self.width + x;
+        if self.is_uncached() {
+            // SAFETY: inside the buffer, by the caller, in its uncached view, as long as `self` is
+            // borrowed mutably. The cached view has no dirty line there (`new`), and `pixels` is
+            // not written through, so no write-back comes over these.
+            unsafe { core::slice::from_raw_parts_mut((self.uncached as *mut u32).add(start), count) }
+        } else {
+            &mut self.pixels[start..start + count]
+        }
+    }
+
     /// Sets one pixel. Ignores one outside the buffer.
     pub fn set_pixel(&mut self, x: usize, y: usize, color: u32) {
         if x < self.width && y < self.height {
-            self.pixels[y * self.width + x] = color;
+            self.span(y, x, 1)[0] = color;
         }
+    }
+
+    /// Writes `pixels` into line `y` from column `x`, clipped to the buffer. Uncached, the way to
+    /// draw what is not one color: prepared in ordinary memory, one span of a line goes in a
+    /// block copy, much faster than the same pixels one by one through
+    /// [`set_pixel`](Self::set_pixel).
+    pub fn write_span(&mut self, x: usize, y: usize, pixels: &[u32]) {
+        if y >= self.height || x >= self.width {
+            return;
+        }
+        let count = pixels.len().min(self.width - x);
+        self.span(y, x, count).copy_from_slice(&pixels[..count]);
     }
 
     /// Fills a rectangle, clipped to the buffer.
@@ -341,18 +411,25 @@ impl Framebuffer {
             return;
         }
         for row in y..bottom {
-            let start = row * self.width;
-            self.pixels[start + x..start + right].fill(color);
+            self.span(row, x, right - x).fill(color);
         }
     }
 
     /// Writes the whole buffer out to DRAM, where the FIMD reads it.
     pub fn flush(&self) {
-        mmu::clean_dcache_range(self.address(), self.stride() * self.height);
+        if self.is_uncached() {
+            wait_writes();
+        } else {
+            mmu::clean_dcache_range(self.address(), self.stride() * self.height);
+        }
     }
 
     /// Writes one rectangle out to DRAM, clipped to the buffer.
     pub fn flush_rect(&self, x: usize, y: usize, width: usize, height: usize) {
+        if self.is_uncached() {
+            wait_writes();
+            return;
+        }
         let right = x.saturating_add(width).min(self.width);
         let bottom = y.saturating_add(height).min(self.height);
         if x >= right {
@@ -363,6 +440,13 @@ impl Framebuffer {
             mmu::clean_dcache_range(start, (right - x) * size_of::<u32>());
         }
     }
+}
+
+/// Waits until the CPU's writes so far have reached memory: an uncached one may still be in the
+/// store buffer.
+fn wait_writes() {
+    // SAFETY: a barrier; it touches no memory or register.
+    unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
 }
 
 /// Registers as found, for reports. See [`Fimd::registers`].

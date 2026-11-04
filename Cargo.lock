@@ -493,6 +493,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu_rect_test"
+version = "0.1.0"
+dependencies = [
+ "exynos_4412_rs",
+]
+
+[[package]]
 name = "gpu_test"
 version = "0.1.0"
 dependencies = [

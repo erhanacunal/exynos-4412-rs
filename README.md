@@ -28,6 +28,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `wifi_async_test/`: the same chip under Embassy as an `embassy-net` device, its runner task woken by the host wake line
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
+- `gpu_rect_test/`: rectangles filled by the pixel processors with CPU-drawn edges, against the CPU alone, cached and uncached
 - `gpu_test/`: Mali-400 MP4 bring-up: its supply, power domain and clock, what its blocks say they are, their resets and interrupt lines
 - `heap_test/`: the TLSF global allocator: collections, timings, 48 MiB, then four cores and their interrupt handlers allocating at once
 - `async_test/`: Embassy on all four cores: timers, tasks, and channels between the cores
@@ -543,8 +544,14 @@ polled. `display_test` shows it working.
 - **Order:** `Fimd::power_on` (domain, clocks, stops whatever U-Boot left running),
   `configure_pins`, draw and `flush`, `Fimd::start`, `set_lvds(true)`, wait `LVDS_SETTLE_MS`,
   `set_backlight(true)`.
-- **Caches:** The FIMD reads DRAM and does not see the caches, so drawing appears only after
-  `flush` or `flush_rect`. They use `mmu::clean_dcache_range`, which cleans L1 and then L2.
+- **Caches:** The FIMD reads DRAM and does not see the caches. `Framebuffer::new` therefore draws
+  through `mmu::DRAM_UNCACHED`, the uncached view of the first 16 MiB of DRAM, when the buffer is
+  there, on whole cache lines, and the MMU is on: each write goes to DRAM, and `flush` and
+  `flush_rect` only wait for the writes (`dsb`). Reads there wait for DRAM, so drawing that
+  reads back, blending, wants `Framebuffer::new_cached`: then drawing appears only after `flush`
+  or `flush_rect`, which use `mmu::clean_dcache_range`. `is_uncached` tells which.
+- **Drawing:** `fill_rect` and `write_span` write blocks, the fast way uncached; `set_pixel` one
+  pixel at a time. `write_span` copies a span of a line prepared in ordinary memory.
 - **Clock:** `sclk_fimd0` runs from `mout_mpll_user_t`, undivided, as in the vendor kernel, and the
   FIMD divides it to the pixel clock: 800 MHz / 12 = 66.67 MHz, about 58 frames per second.
 - **Not present:** Other windows, System MMU, display interrupts (they come through the interrupt
@@ -566,8 +573,14 @@ Test on the board: `make img APP=display_test`, same flashing step. Observed:
 |---|---|
 | Buffer address in use after start | `0x40019000`, as programmed |
 | Refresh over 120 frames | 58.188 Hz, computed 58.025 Hz |
-| Full-screen flush (4 MiB) | about 5.4 ms |
-| Moving bar | 58 frames/s, slowest frame 475 us |
+| Full-screen flush (4 MiB), cached | about 5.4 ms |
+| Moving bar, cached | 58 frames/s, slowest frame 475 us |
+| Full-screen flush, uncached | 0 us |
+| Moving bar, uncached | 58 frames/s, slowest frame 86 to 102 us |
+| Eight full-height bars, uncached | 2.2 ms |
+| Gradient, 1 M pixels computed one by one, uncached | 57.7 ms through `set_pixel`, 46.3 ms through `write_span` |
+
+The gradient is bound by its arithmetic: a division per pixel, in software on the Cortex-A9.
 
 The measured refresh is 0.28% above the computed one, more than the error of the MCT rate. The
 cause is not known.
@@ -1075,6 +1088,25 @@ board, GPU at 160 MHz:
 
 Four PPs are only 1.3 times one: the frame is 4 MB of writes and nothing else, with the FIMD
 reading the same DRAM meanwhile, so the bus is the likely limit, not measured.
+
+`Rect::split_for_gpu` gives the GPU what it can fill of a rectangle and the CPU the rest. The PP
+writes whole 16 x 16 tiles and its write-back address rounds down to 8 bytes, as found on the
+board, so the GPU gets an even left edge and whole tiles inside; up to three strips are the CPU's.
+
+`make img APP=gpu_rect_test`: eleven rectangles, at odd columns and at the screen's edges, each
+checked inside and out; then 200 random ones, about 7.8 M pixels, the same ones each way. On the
+board, all eleven right:
+
+| Way | GPU at 160 MHz | GPU at 266 MHz |
+|---|---|---|
+| CPU fill and flush, cached | 108.6 ms | 108.6 ms |
+| GPU, CPU edges cached (flush, then invalidate after the GPU) | 105.0 ms | 93.6 ms |
+| GPU, CPU edges uncached | 58.3 ms | 46.9 ms |
+| CPU fill, uncached | 17.0 ms | 16.9 ms |
+
+Plain fills are the CPU's: through the uncached view it writes about 1.8 GB/s, combining writes,
+and needs no cache maintenance. Each of the GPU's 200 frames costs about 200 to 270 us. The GPU is
+for what the CPU cannot do as fast: triangles, textures, blending.
 
 ## Heap
 

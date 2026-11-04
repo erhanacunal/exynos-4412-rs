@@ -1,0 +1,9 @@
+[package]
+name = "gpu_rect_test"
+version = "0.1.0"
+edition = "2024"
+description = "Rectangles filled by the Mali-400's pixel processors: alignment, edges, speed against the CPU"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }

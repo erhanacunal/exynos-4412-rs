@@ -277,7 +277,7 @@ fn main(_args: BootArgs) -> ! {
     display::configure_pins();
     // SAFETY: the only reference to these, taken once: see `Pixels`.
     let pixels: &'static mut [u32] = unsafe { &mut *PIXELS.0.get() };
-    let mut buffer = Framebuffer::new(pixels, WIDTH, HEIGHT).expect("the buffer holds the screen");
+    let mut buffer = Framebuffer::new_cached(pixels, WIDTH, HEIGHT).expect("the buffer holds the screen");
     buffer.fill_rect(0, 0, WIDTH, HEIGHT, GREY);
     buffer.flush();
     if let Err(error) = fimd.start(&LTN101AL03, &buffer) {

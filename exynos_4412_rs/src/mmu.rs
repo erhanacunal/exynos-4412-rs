@@ -46,14 +46,20 @@ const TABLE_ENTRIES: usize = 4096;
 
 /// Where the start of DRAM shows a second time, without the caches: a read there gets what DRAM
 /// holds, whatever the caches hold for the same address. It is for checking cache maintenance,
-/// as `l2_test` does. Do not write there what the cached view also uses: the two views of one
-/// line disagree by design, and a dirty line would later be written back over the write.
+/// as `l2_test` does, and for drawing, as `Framebuffer` does. Do not write there what the cached
+/// view also uses: the two views of one line disagree by design, and a dirty line would later be
+/// written back over the write. Clean and drop the cached lines first, and leave them unwritten.
 pub const DRAM_UNCACHED: usize = 0xC000_0000;
 /// How much of DRAM it covers, from [`soc::DRAM_BASE`]: the applications' images, `.bss` and
 /// stacks are all there.
 pub const DRAM_UNCACHED_SIZE: usize = 16 << 20;
 
 const _: () = assert!(DRAM_UNCACHED >= soc::DRAM_BASE + soc::DRAM_SIZE && DRAM_UNCACHED_SIZE <= soc::DRAM_SIZE);
+
+/// Whether [`enable`] has turned the MMU on, and with it [`DRAM_UNCACHED`].
+pub fn is_enabled() -> bool {
+    cpu::read_sctlr() & SCTLR_M != 0
+}
 
 /// The uncached address of a DRAM address, if [`DRAM_UNCACHED`] covers it.
 pub const fn uncached(address: usize) -> Option<usize> {

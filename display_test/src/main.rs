@@ -213,19 +213,27 @@ fn draw_geometry(buffer: &mut Framebuffer) {
     buffer.fill_rect(width - 1 - CORNER, height - 1 - CORNER, CORNER, CORNER, YELLOW);
 }
 
+/// Pixels prepared at a time for [`Framebuffer::write_span`].
+const SPAN: usize = 256;
+
+/// Line by line, each prepared in pieces on the stack and written in with `write_span`.
 fn draw_gradient(buffer: &mut Framebuffer) {
     let (width, height) = (buffer.width(), buffer.height());
     let band = height / 4;
+    let mut span = [0u32; SPAN];
     for y in 0..height {
-        for x in 0..width {
-            let value = (x * 255 / (width - 1)) as u8;
-            let color = match y / band {
-                0 => rgb(value, 0, 0),
-                1 => rgb(0, value, 0),
-                2 => rgb(0, 0, value),
-                _ => rgb(value, value, value),
-            };
-            buffer.set_pixel(x, y, color);
+        for left in (0..width).step_by(SPAN) {
+            let count = SPAN.min(width - left);
+            for (offset, pixel) in span[..count].iter_mut().enumerate() {
+                let value = ((left + offset) * 255 / (width - 1)) as u8;
+                *pixel = match y / band {
+                    0 => rgb(value, 0, 0),
+                    1 => rgb(0, value, 0),
+                    2 => rgb(0, 0, value),
+                    _ => rgb(value, value, value),
+                };
+            }
+            buffer.write_span(left, y, &span[..count]);
         }
     }
 }
@@ -331,6 +339,7 @@ fn main(_args: BootArgs) -> ! {
         println!("Framebuffer too small");
         cpu::halt();
     };
+    println!("Framebuffer drawn {}", if buffer.is_uncached() { "uncached" } else { "cached" });
     show(mct, &mut buffer, draw_bars);
 
     let pixel_clock_hz = match fimd.start(&PANEL, &buffer) {

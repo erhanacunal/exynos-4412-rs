@@ -496,7 +496,8 @@ pub const TILE: usize = 16;
 impl PpFrame {
     /// A frame of `width` by `height` pixels that clears to `color`, 0xAARRGGBB, written to
     /// `target`, a linear buffer with lines `stride` bytes apart, 32 bits a pixel, as the FIMD
-    /// shows them. `render_state` is 64 bytes of zeros, 64-aligned: nothing is drawn with it. The
+    /// shows them. Whole tiles are written, from `target` rounded down to 8 bytes: see
+    /// [`Rect::split_for_gpu`]. Keep both inside the buffer. `render_state` is 64 bytes of zeros, 64-aligned: nothing is drawn with it. The
     /// stream comes per PP, from [`clear_stream`], in [`Mali::start_pp`]. Fields as
     /// lima_job.c:807-871 sets them.
     pub fn clear(width: usize, height: usize, color: u32, target: usize, stride: usize, render_state: usize) -> Self {
@@ -525,6 +526,52 @@ impl PpFrame {
         wb[0][2] = WB_FORMAT_B8G8R8A8;
         wb[0][5] = (stride / 8) as u32;
         Self { regs, wb }
+    }
+}
+
+/// A rectangle of pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rect {
+    /// Left column.
+    pub x: usize,
+    /// Top line.
+    pub y: usize,
+    /// Columns.
+    pub width: usize,
+    /// Lines.
+    pub height: usize,
+}
+
+/// A rectangle split between the GPU and the CPU: [`Rect::split_for_gpu`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Split {
+    /// What a PP frame may write: whole tiles from an even column.
+    pub gpu: Option<Rect>,
+    /// The rest, for the CPU: a left column, a right strip and a bottom strip.
+    pub cpu: [Option<Rect>; 3],
+}
+
+impl Rect {
+    /// Splits the rectangle into the part a PP may write without touching a pixel outside it,
+    /// and the rest. On the board a PP's write-back:
+    ///
+    /// - writes every tile whole, 16 by 16 pixels from the frame's corner, whatever the bounding
+    ///   box: a 50 by 30 frame wrote 64 by 32;
+    /// - starts at its address rounded down to 8 bytes: a corner at an odd column of 32-bit
+    ///   pixels wrote one column to its left.
+    pub fn split_for_gpu(&self) -> Split {
+        let Rect { x, y, width, height } = *self;
+        let gpu_x = x.next_multiple_of(2).min(x + width);
+        let gpu_width = (x + width - gpu_x) / TILE * TILE;
+        let gpu_height = height / TILE * TILE;
+        if gpu_width == 0 || gpu_height == 0 {
+            return Split { gpu: None, cpu: [Some(*self).filter(|rect| rect.width > 0 && rect.height > 0), None, None] };
+        }
+        let left = (gpu_x > x).then_some(Rect { x, y, width: gpu_x - x, height });
+        let right_x = gpu_x + gpu_width;
+        let right = (right_x < x + width).then_some(Rect { x: right_x, y, width: x + width - right_x, height });
+        let bottom = (gpu_height < height).then_some(Rect { x: gpu_x, y: y + gpu_height, width: gpu_width, height: height - gpu_height });
+        Split { gpu: Some(Rect { x: gpu_x, y, width: gpu_width, height: gpu_height }), cpu: [left, right, bottom] }
     }
 }
 
