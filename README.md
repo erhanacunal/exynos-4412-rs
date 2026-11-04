@@ -30,6 +30,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
 - `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom and starts it, instead of fastboot
 - `gpu_triangle_test/`: flat, shaded and textured triangles through the GP and the PPs, with shaders compiled offline by Mesa's lima compiler
+- `gpu_spin_test/`: a textured square turning on the screen, drawn by the GP and four PPs every frame
 - `gpu_rect_test/`: rectangles filled by the pixel processors with CPU-drawn edges, against the CPU alone, cached and uncached
 - `gpu_test/`: Mali-400 MP4 bring-up: its supply, power domain and clock, what its blocks say they are, their resets and interrupt lines
 - `heap_test/`: the TLSF global allocator: collections, timings, 48 MiB, then four cores and their interrupt handlers allocating at once
@@ -1196,6 +1197,26 @@ tile columns.
 The GP and the PP need a soft reset before each frame, as Linux gives them after each job:
 without one, the PP drew the shaded scene after the flat one in black, every pixel inside
 `0xFF000000`, though its render state named the new fragment shader.
+
+### Animation
+
+`gpu_spin_test` turns a textured square, two triangles, in a 320 x 320 frame in the middle of
+the screen: a turn every 6 s, its size pulsing every 2 s. The texture is 64 x 64, a white border
+round a red and green gradient on a checkerboard. The command lists, the texture and the render
+state are built once; each frame the CPU writes the six turned positions and cleans their line,
+then the GP and the PPs are reset, the GPU's L2 cleared, the GP run, and the four PPs render
+straight into the screen. The frame starts at the start of vsync and is done in half a
+millisecond, before the FIMD scans the middle lines, so the screen shows whole frames from one
+buffer. Key `v` turns the wait for vsync off.
+
+On the board, 160 MHz, means over 2 s (largest in brackets):
+
+| Vsync | Frames a second | GP | 4 PPs | Frame: resets, GP and PPs |
+|---|---|---|---|---|
+| on | 58.1, the panel's rate | 29 us (35) | 391 us (397) | 457 us (468) |
+| off | 2150 to 2176 | the same | the same | the same |
+
+The PPs write 400 KiB a frame, about 1.05 GB/s, as in the triangle test: DRAM sets the rate.
 
 ## Heap
 
