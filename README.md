@@ -1252,6 +1252,55 @@ filter at a cell's edge takes nothing else from its neighbour. On the board the 
 checkerboard are smooth, and the PPs' time, 435 to 509 us, cannot be told from nearest's: the
 four texels a pixel cost no more than the one.
 
+### Shaders: tools/shaderc
+
+Shaders are written in GLSL ES 1.00 and compiled on the PC into Rust, kept in the repository:
+building an application needs no Mesa. An application keeps them as `shaders/NAME.vert` with
+`shaders/NAME.frag` beside it, and
+
+    tools/shaderc/setup.sh              # once: libdrm and Mesa 25.3.3 under ~/.cache/exynos-shaderc
+    make shaders APP=gpu_cube_test      # shaders/*.vert and .frag -> src/shaders.rs
+
+writes one `exynos_4412_rs::gpu::Program` a pair, `pub const NAME`: the binaries, the vertex
+shader's prefetch, the attributes in the order declared, each uniform's stage and place by name,
+the vertex shader's constants, the varyings and their stride, the samplers, and the render state
+with its addresses zero. The application then looks uniforms up by name,
+`LIT.uniform("mvp", Stage::Vertex)`, rather than knowing where the compiler put them.
+
+`setup.sh` builds lima's `drm-shim`, which plays the board's Mali-400 MP4 on the PC (patched
+from the Mali-450 it plays by default), and makes the driver's dump print floats exactly. It
+takes the tarballs from buildroot's downloads when there, checked by SHA-256, and buildroot's
+host `python3` (with mako), `bison` and `flex`. `shaderc.py` runs `harness.c` under the shim with
+`LIMA_DEBUG=dump`: it draws a triangle with the pair, every uniform set to sentinel values, and
+`shaderc.py` reads the dump, finding each uniform by its sentinels. The render state is drawn
+with no depth test and no blending; those are the application's. `gpu_cube_test` takes its
+shaders from it; its binaries, uniform places and constants are those copied by hand from the
+dump before, and its render state too but for the depth test's word.
+
+Next, planned and not written yet: a runtime in `exynos_4412_rs::gpu` above the generated
+programs, so that an application draws with no addresses, caches or command lists of its own.
+Agreed shape:
+
+```rust
+let mut gpu = Gpu::start()?;                     // GPU power, MMUs, screen, a fixed pool
+let atlas = gpu.texture(128, 64, &texels, Filter::Bilinear);
+let cube = gpu.mesh(&shaders::LIT)
+    .attribute("pos", &POSITIONS)                // by name, checked against the shader
+    .attribute("uv", &UVS)
+    .attribute("normal", &NORMALS)
+    .build()?;
+loop {
+    let mut frame = gpu.frame(GREY);             // waits for vsync
+    frame.draw(&cube).uniform("mvp", &m).uniform("light", &l).texture("t", &atlas).depth_test(true);
+    gpu.show(frame)?;                            // the GP, then the four PPs
+}
+```
+
+Names and sizes are checked when a mesh or draw is made, not found wrong on the screen. Steps:
+several draws a frame (a render state, uniforms and PLBU draw each), frames on a region of up
+to 352 x 352 first (512 tiles), then the whole screen (tiles sharing polygon list blocks), the
+matrix helpers out of `gpu_cube_test` into the library, and `gpu_cube_test` rewritten on it.
+
 ## Heap
 
 The `heap` feature gives a global allocator: TLSF (the `rlsf` crate) behind a lock that masks

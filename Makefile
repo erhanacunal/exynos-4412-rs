@@ -12,7 +12,7 @@ MKBOOTIMG  ?= $(HOME)/mkbootimg/mkbootimg
 # bootcmd reads 0x4FC0 sectors of 512 bytes, one 4096-byte boot.img page may precede the image.
 MAX_SIZE   := $$(( 0x4FC0 * 512 - 4096 ))
 
-.PHONY: build bin img disasm clean
+.PHONY: build bin img disasm shaders clean
 
 build:
 	cargo build --release
@@ -37,6 +37,11 @@ disasm: build
 	@$(TOOLS)/llvm-objdump -d --no-show-raw-insn --disassemble-symbols=__exynos_boot,__exynos_relocated $(ELF) | grep -E '^[0-9a-f]+( <|:)'
 	@echo; echo "--- vector table"
 	@$(TOOLS)/llvm-objdump -d --no-show-raw-insn --disassemble-symbols=__exynos_vectors $(ELF) | sed -n '/<__exynos_vectors>:/,$$p'
+
+# The application's shaders/*.vert, each with its .frag, into $(APP)/src/shaders.rs; needs
+# tools/shaderc/setup.sh once. The result is kept in the repository: builds need none of this.
+shaders:
+	python3 tools/shaderc/shaderc.py -o $(APP)/src/shaders.rs $(wildcard $(APP)/shaders/*.vert)
 
 clean:
 	cargo clean
