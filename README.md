@@ -30,7 +30,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
 - `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom and starts it, instead of fastboot
 - `gpu_triangle_test/`: flat, shaded and textured triangles through the GP and the PPs, with shaders compiled offline by Mesa's lima compiler
-- `gpu_cube_test/`: a textured (bilinear), lit cube turning in perspective, transformed by the GP's vertex shader, depth tested by the PPs
+- `gpu_cube_test/`: two textured (bilinear), lit cubes turning in perspective, drawn with the `gpu` runtime: two draws a frame, depth tested by the PPs
 - `gpu_spin_test/`: a textured square turning on the screen, drawn by the GP and four PPs every frame
 - `gpu_rect_test/`: rectangles filled by the pixel processors with CPU-drawn edges, against the CPU alone, cached and uncached
 - `gpu_test/`: Mali-400 MP4 bring-up: its supply, power domain and clock, what its blocks say they are, their resets and interrupt lines
@@ -1219,7 +1219,7 @@ On the board, 160 MHz, means over 2 s (largest in brackets):
 
 The PPs write 400 KiB a frame, about 1.05 GB/s, as in the triangle test: DRAM sets the rate.
 
-`gpu_cube_test` turns a cube, 12 triangles, in perspective in the same frame. The CPU makes one
+`gpu_cube_test` first turned a cube (before the runtime below), 12 triangles, in perspective in the same frame. The CPU makes one
 matrix a frame, perspective times camera times the turns, and writes it into the uniforms; the
 vertex shader, Mesa's for `gl_Position = mvp * pos`, takes the 36 vertices through it. Each face
 is a cell of a 128 x 64 texture atlas, its own colour. The depth test, `Less`, is one word of the
@@ -1277,29 +1277,71 @@ with no depth test and no blending; those are the application's. `gpu_cube_test`
 shaders from it; its binaries, uniform places and constants are those copied by hand from the
 dump before, and its render state too but for the depth test's word.
 
-Next, planned and not written yet: a runtime in `exynos_4412_rs::gpu` above the generated
-programs, so that an application draws with no addresses, caches or command lists of its own.
-Agreed shape:
+### Runtime: `exynos_4412_rs::gpu`
+
+Above the generated programs, `gpu` draws with no addresses, caches or command lists in the
+application:
 
 ```rust
-let mut gpu = Gpu::start()?;                     // GPU power, MMUs, screen, a fixed pool
-let atlas = gpu.texture(128, 64, &texels, Filter::Bilinear);
+let mut gpu = Gpu::start(mct, BACKGROUND)?;      // GPU power, MMUs, screen, the pool
+let atlas = gpu.texture_with(128, 64, Filter::Bilinear, texel)?;   // texel(x, y) -> 0xAARRGGBB
 let cube = gpu.mesh(&shaders::LIT)
-    .attribute("pos", &POSITIONS)                // by name, checked against the shader
-    .attribute("uv", &UVS)
-    .attribute("normal", &NORMALS)
+    .attribute("pos", &positions)                // by name, checked against the shader
+    .attribute("uv", &uvs)
+    .attribute("normal", &normals)
     .build()?;
 loop {
-    let mut frame = gpu.frame(GREY);             // waits for vsync
-    frame.draw(&cube).uniform("mvp", &m).uniform("light", &l).texture("t", &atlas).depth_test(true);
-    gpu.show(frame)?;                            // the GP, then the four PPs
+    let mut frame = gpu.frame(Area::centered(512, 256), GREY);   // waits for vsync
+    for model in models {
+        frame.draw(&cube).uniform("mvp", &(projection * model)).uniform("light", &light)
+            .texture("t", &atlas).depth_test(true);
+    }
+    let times = frame.show()?;                   // the GP, then the four PPs
 }
 ```
 
-Names and sizes are checked when a mesh or draw is made, not found wrong on the screen. Steps:
-several draws a frame (a render state, uniforms and PLBU draw each), frames on a region of up
-to 352 x 352 first (512 tiles), then the whole screen (tiles sharing polygon list blocks), the
-matrix helpers out of `gpu_cube_test` into the library, and `gpu_cube_test` rewritten on it.
+- `Gpu::start` needs the MMU on. It powers the GPU at 160 MHz, turns the screen on uncached,
+  maps DRAM up to the end of the pool and the screen for the GPU's MMUs, and resets the GP and
+  PPs. It runs once: the pool is one static, `AlreadyStarted` the second time.
+- Textures take 0xAARRGGBB texels, as the screen does, and are converted to the GPU's RGBA8888:
+  `texture` from a slice, `texture_with` from a function of x and y, written straight into the
+  pool. CPU0's stack is 16 KiB: a texture built in a local array first overflows it into the
+  pool's end, the GPU's page tables (the first board run did, and jumped into `.bss`).
+  `set_filter` changes nearest or bilinear between frames.
+- A mesh copies its attributes, by name, and the program's binaries into the pool. A wrong
+  name, a missing attribute, unequal vertex counts or a count not a multiple of three is an
+  `Error` from `build`.
+- A frame is an `Area` of the screen, corner and size multiples of 16 and at most 512 tiles
+  (`MAX_TILES`: 512 x 256, 352 x 352...), cleared to a colour. Each draw (up to `MAX_DRAWS`, 64)
+  gets its own uniforms, render state, varyings and GP output in the frame's memory, and joins the
+  frame at the end of its statement; a draw's mistakes (an unknown or unset uniform, a wrong
+  size, a sampler without a texture) are kept and `show` returns the first. Uniforms take an
+  `f32`, `[f32; N]` or a `Mat4`, and go to whichever shader declares them: half floats for the
+  fragment shader.
+- `show` runs the frame: per draw, Mesa's command blocks (lima_draw.c) one after another in the
+  VS and PLBU lists, the semaphores ordering each draw's PLBU after its vertex shader; then the
+  four PPs, the depth buffer their tile memory, shared by the draws. It returns the GP's, the
+  PPs' and the whole frame's microseconds.
+- `gpu::Mat4` (column-major, `a * b` applies `b` first: `translation`, `scale`,
+  `rotation_x/y/z`, `perspective`, `transform_direction_back`) and `sin_cos`, `sqrt`,
+  `normalize`, `dot`: the arithmetic, without `std`.
+
+The pool is about 3 MiB in `.bss`, plus the 4 MiB screen: 2 MiB for meshes and textures
+(`LASTING_BYTES`), kept until restart, and 512 KiB for a frame's draws (`FRAME_BYTES`), reused
+each frame. All of it must be in the first 16 MiB of DRAM, where the screen has its uncached
+view. `gpu_cube_test` is written on it: one mesh drawn twice a frame, two cubes turning opposite
+ways in a 512 x 256 frame. On the board both turn, lit and depth tested, as the single cube did:
+
+| Vsync | Frames a second | GP, 2 draws | 4 PPs | Frame |
+|---|---|---|---|---|
+| on | 58.1 | 50 to 57 us (58) | 541 to 565 us (601) | 632 to 654 us (689) |
+| off | 1446 to 1540 | 51 to 57 us (58) | 534 to 568 us (590) | 623 to 665 us (681) |
+
+The second draw costs the GP about 14 us; the PPs write 512 KiB, about 0.95 GB/s, DRAM's rate
+as before. Nearest and bilinear cannot be told apart.
+
+Not yet: frames larger than 512 tiles (tiles sharing polygon list blocks), blending, indexed
+draws, more than one level of texture.
 
 ## Heap
 

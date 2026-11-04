@@ -1,8 +1,21 @@
 //! 3D on the Mali-400, above `drivers::mali`: what an application draws with.
 //!
-//! For now, the description of a shader pair, [`Program`], as `tools/shaderc` generates it from
-//! GLSL: the binaries Mesa's lima compiler made of it, and everything the driver needs to know
-//! about them to feed them, the uniforms by name among it.
+//! A shader pair is a [`Program`], as `tools/shaderc` generates it from GLSL: the binaries Mesa's
+//! lima compiler made of it, and everything needed to feed them, the uniforms by name among it.
+//!
+//! [`Gpu::start`] powers the GPU and the screen; [`Gpu::texture`] and [`Gpu::mesh`] put textures
+//! and triangles in its memory; [`Gpu::frame`] starts a frame on an [`Area`] of the screen,
+//! [`Frame::draw`] adds a mesh with its uniforms and textures, and [`Frame::show`] runs it. The
+//! memory is one fixed pool (`memory`): no heap. [`Mat4`] and the rest of `math` are the
+//! arithmetic for the uniforms.
+
+mod math;
+mod memory;
+mod runtime;
+
+pub use math::*;
+pub use memory::{FRAME_BYTES, LASTING_BYTES, MAX_DRAWS, MAX_TILES};
+pub use runtime::*;
 
 /// Which shader a uniform belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
