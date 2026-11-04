@@ -33,7 +33,10 @@ Crates this builds with are listed in `Cargo.lock`, under their own licenses. Th
 `linked_list_allocator` (MIT or Apache-2.0) for its heap. The `fat` feature uses `embedded-sdmmc`
 (MIT or Apache-2.0) for FAT32. The `embassy` feature uses `embassy-executor`, `embassy-time-driver`,
 `embassy-time-queue-utils`, `embassy-time`, `embassy-sync` and `critical-section`, and
-`async_test` and `mmc_async_test` also `embassy-futures`, all MIT or Apache-2.0.
+`async_test` and `mmc_async_test` also `embassy-futures`, all MIT or Apache-2.0. The `wifi-net`
+feature adds `embassy-net-driver-channel` and `embassy-futures`, and `wifi_async_test` uses
+`embassy-net` with its own `smoltcp`, all MIT or Apache-2.0 but `smoltcp`, 0BSD. The `heap`
+feature uses `rlsf` (MIT) for the allocator, with `const-default` (MIT or Apache-2.0).
 
 ## Firmware
 
