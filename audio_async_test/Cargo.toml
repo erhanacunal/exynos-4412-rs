@@ -1,0 +1,13 @@
+[package]
+name = "audio_async_test"
+version = "0.1.0"
+edition = "2024"
+description = "WM8758 and I2S0 through pdma0 for exynos_4412_rs: the DMA ring's halves awaited on the controller's interrupt"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["embassy"] }
+embassy-executor = "0.10"
+embassy-time = "0.5"
+embassy-sync = "0.8"
+embassy-futures = "0.1"

@@ -34,7 +34,8 @@ pub const LDO_AUDIO: (u8, u16) = (25, 3300);
 pub const POP_SUPPRESSOR: Pin = gpio::GPM1.pin(3);
 /// `exynos4412-mehmet.dts:826-831`, `gpio-mehmet.h:37`: the speaker amplifier, on when high.
 pub const SPEAKER_AMP: Pin = gpio::GPM1.pin(2);
-/// `exynos4412-mehmet.dts:137,840-844`, `gpio-mehmet.h:17`: low while a jack is in.
+/// `exynos4412-mehmet.dts:137,840-844`, `gpio-mehmet.h:17`: high while a jack is in, once
+/// the headphone outputs are on. See [`jack_in`].
 pub const JACK_DETECT: Pin = gpio::GPX1.pin(6);
 
 /// Longer than the rail needs; `pmic_test` saw the codec answer after it.
@@ -169,9 +170,18 @@ pub fn power_up(pmic: Max77686, mct: Mct) -> Result<Wm8758, Error> {
     Ok(Wm8758 { i2c })
 }
 
-/// Whether a jack is in the headphone socket.
+/// Whether a jack is in the headphone socket. Valid only after
+/// [`start_headphones`](Wm8758::start_headphones): before it the pin reads low with a jack in.
+///
+/// The vendor kernel has the pin active high (`mach-mehmet.c:2229-2230`, `det_active_high`),
+/// the mainline DTS active low (`exynos4412-mehmet.dts:137`). The board agrees with the vendor
+/// kernel: with the outputs on, it read high with a jack in and low without, the same with
+/// either pull, so the line is driven. With the outputs off and a jack in it read low, once
+/// low with every pull and once high only with the pull-up: then nothing drives it. The line
+/// seems to take its level from the headphone output, which sits at the codec's VMID only
+/// while on.
 pub fn jack_in() -> bool {
-    !JACK_DETECT.read()
+    JACK_DETECT.read()
 }
 
 fn volume_raw(db: i8) -> u16 {

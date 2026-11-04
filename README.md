@@ -16,6 +16,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `touch_async_test/`: the touch controller read with `await` on its CHG interrupt, with a 1 ms ticker on the same core
 - `audio_test/`: WM8758 codec over I2S0: a tone and WAV samples on the headphones and the speakers, the FIFO filled by the CPU
 - `audio_dma_test/`: the same through `pdma0`: a DMA ring of two halves refilled by the CPU, under I2C and CPU load
+- `audio_async_test/`: the same, the halves of the ring awaited in an Embassy task on `pdma0`'s interrupt
 - `gpio_test/`: GPIO pins and key interrupts test
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
@@ -677,7 +678,12 @@ master clock on CDCLK, and BCLK and LRCLK. 16-bit stereo I2S at 48 kHz.
   acknowledgement can be checked. `start_headphones` follows Linux's anti-pop order: bias and
   VMID first (500 ms), then the DAC, mixers and headphone outputs, muted until they are on.
   `set_speakers` adds LOUT2/ROUT2 and the speaker amplifier (`gpm1-2`). The pop suppressor
-  (`gpm1-3`) is driven high as in Linux. The jack pin (`gpx1-6`) is low while a jack is in.
+  (`gpm1-3`) is driven high as in Linux. The jack pin (`gpx1-6`) is high while a jack is in, as the vendor kernel has
+  it (`det_active_high`); the mainline DTS's `GPIO_ACTIVE_LOW` is wrong for this board. It is
+  valid only with the headphone outputs on: before `start_headphones` it read low with a jack
+  in, and in one run followed the pull-up: nothing drives it then. With the outputs on the
+  pulls change nothing, and it was right on every plug and unplug. Putting a jack in also silenced the
+  speakers with the amplifier on, so the socket seems to cut them in hardware.
 - **DMA:** `drivers::pl330` drives `pdma0` (`0x1268_0000`), an ARM PL330. `Program` assembles
   its channel instructions; `Pl330::start` hands `DMAGO` to the manager through the debug
   registers. The manager runs non-secure here (`CR0` `0x003ff075`: 8 channels, 32 requests, 32
@@ -690,9 +696,14 @@ master clock on CDCLK, and BCLK and LRCLK. 16-bit stereo I2S at 48 kHz.
     16 x 256 { FLUSHP 12; WFPS 12; LDS; STPS 12 }  SEV 1
   LPFE top
   ```
-  The events are interrupts in the controller, polled in `INTSTATUS`; the CPU refills the half
-  that ended and cleans it out of the caches. Both events pending at once means a half played
-  twice, counted as late. Two findings on the board:
+  The events are interrupts in the controller, in `INTSTATUS`; the CPU refills the half
+  that ended and cleans it out of the caches. `service` polls them; with the `embassy`
+  feature, `wait_half` awaits the next one on `pdma0`'s GIC interrupt (`pl330::PDMA0_IRQ`,
+  ID 67), after `pl330::init_interrupt`. The handler turns the interrupt off at the GIC and
+  wakes the waiters, which turn it on again while they wait, as the async eMMC does. Both
+  events pending at once means a half played twice, counted as late; the half refilled is then
+  the one the channel does not read, found from its source address, so the refills cannot stay
+  a half behind the channel. Two findings on the board:
   - `FLUSHP` before each request, as Linux does. With one at the start only, the channel ran
     at 11 times the frame rate, its beats lost in a full FIFO, and stopped after the ring.
   - `DMALPFE` needs the loop counter bit set (`0x2c`). With it clear (`0x28`) the channel
@@ -729,6 +740,40 @@ line holds the CPU for 7 ms, and the FIFO lasts 1.3 ms. Observed:
 | 100 volume writes in a row (`w`) | 59 ms of I2C; 0 late, no underrun (the CPU-filled FIFO lasts 1.3 ms) |
 | CPU busy 50 ms (`h`) | 0 late |
 | CPU busy 200 ms (`H`), longer than two halves | Counted late, each time |
+
+`make img APP=audio_async_test` plays the same from an Embassy task that awaits each half,
+with a task ticking every 1 ms on the same core. It also reports the wake-up: how far the
+channel has read into the next half when the task looks, the time from the event through the
+interrupt and the executor, in whole frames of 21 us.
+
+First run on the board, twice: clicks every 85 to 170 ms from the start, worst on the
+samples, until `H`, after which the sound was clean. The log showed 30 of 60 halves late in
+every 5 s, about 104000 `pdma0` interrupts a second, and a wait for the next half that ended
+two halves later. Cause: `service` took the events in its own order. After the 500 ms of the
+codec's start both were pending, and taking them in that order left it expecting the event of
+the half the channel had just started, a half off. It then waited for the wrong event while
+the right one, unclaimed, held the shared line high: an interrupt storm, and one wake-up per
+two halves, which refilled the half the channel had begun to read. `H` let both pile up again,
+and by chance the order came out right. Fixed: `service` follows the events that are set and,
+when both are, the channel's position; `wait_half` waits for either event. After `H` the old
+code showed 59 interrupts for 59 halves, none late.
+
+With the fix, on the board:
+
+| Check | Result |
+|---|---|
+| Halves before the executor | 1 refilled, 1 late (the codec's 500 ms); channel in half 1, half 1 next |
+| Wait cut after 10 ms | Timed out after 10023 us; the next ended 85332 us after the cut began, a half |
+| Silence, 1 s | 12 halves, 12 interrupts; 48001.03 Hz, the events timed by the task to a frame |
+| 5 s windows while playing | 47996.93-48004.15 Hz; 59 halves, 59 interrupts; 0 late, 0 resynced, 0 underruns |
+| Wake-up | 0 us in every window without load: under a frame, 21 us |
+| Ticker beside it | 19-547 us late at most |
+| Tone and the nine voices on headphones | Clean from the start, no clicks |
+| `h` 50 ms, then `H` 200 ms twice | 2 late, 0 resynced, no underrun; wake-up 29625 us at most; clean in the next window |
+| `q` | 456 interrupts in all |
+
+Lines longer than the terminal used, 182 columns with wrapping off, showed only their last
+character past column 181, which looked like lost bytes; the report is two lines since.
 
 ## Restart and power off
 
@@ -995,6 +1040,12 @@ through `embassy-sync` channels, signals and mutexes, which the critical section
   50 us with a timer. A transfer dropped part way, by a timeout for one, is let finish, polled,
   before its DMA is stopped: the driver sends no `CMD12`, so a card stopped in the middle would
   go on sending. `MmcWriter::write_async` refuses what `write` refuses.
+- **DMA events:** `Pl330::wait_event` and `wait_events` await events of `pdma0` on its
+  interrupt (GIC ID 67, to CPU0), and `DmaPlayback::wait_half` the end of either half of the
+  audio ring. All events
+  share the one interrupt, level-triggered: the handler disables it at the GIC and wakes every
+  waiter, each looks at its own event and enables it again if it still waits. A wait leaves
+  its event set, for `take_event` or `service`.
 - **GPX pins:** `embassy::eint::EintInput` waits for a level on a GPX pin, on its wake-up
   interrupt, level-triggered. The interrupt stays masked except during a wait, and the handler
   masks it again, so a level that lasts interrupts once. A wait first clears what an earlier

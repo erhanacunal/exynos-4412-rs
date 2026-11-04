@@ -1,6 +1,6 @@
 //! WM8758 and I2S0 test: a tone on the headphones, the FIFO filled by the CPU.
 //!
-//! 1. Turns on the codec's rail and checks that it answers on `i2c_1`; reads the jack pin.
+//! 1. Turns on the codec's rail and checks that it answers on `i2c_1`.
 //! 2. Runs the EPLL at 196.608 MHz and the audio subsystem's dividers, then I2S0 as clock
 //!    master, sending silence. Counts the frames it takes in 1 s against the MCT: the frame
 //!    rate, 48000 Hz if the clocks are right.
@@ -236,7 +236,6 @@ fn main(_args: BootArgs) -> ! {
         halt();
     }
     let codec = codec(Max77686::new(i2c), mct);
-    println!("Jack: {}", if wm8758::jack_in() { "in" } else { "out" });
 
     // Out before each step that could stop the board, so that the log shows where.
     console::flush();

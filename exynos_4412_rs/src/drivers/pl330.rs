@@ -10,9 +10,17 @@
 //! [`Program::end`] stops the channel; one that loops forever runs until [`Pl330::kill`].
 //!
 //! `DMASEV` in a program raises an event; with the event's bit in `INTEN`, it is an interrupt
-//! instead, which shows in `INTSTATUS` until cleared: [`Pl330::take_event`]. This driver enables
-//! the interrupt only in the controller; the GIC keeps it off unless an application turns it
-//! on, so the events are polled.
+//! instead, which shows in `INTSTATUS` until cleared: [`Pl330::take_event`]. The events of all
+//! channels share one GIC interrupt, [`PDMA0_IRQ`], level-triggered while any is set.
+//!
+//! # Waiting for an event
+//!
+//! Without the `embassy` feature, or without [`init_interrupt`], the events are polled. With
+//! them, `Pl330::wait_event` awaits one on the interrupt, as the async eMMC transfers do: the
+//! handler turns the interrupt off at the GIC, whatever raised it, and wakes every waiter; each
+//! looks at its own event, and turns the interrupt on again if it still waits. A wait does not
+//! clear its event: [`Pl330::take_event`] does, after it. An event enabled in `INTEN` that no
+//! one takes keeps the line high, and wakes the waiters each time one turns it on again.
 //!
 //! # Security
 //!
@@ -413,3 +421,95 @@ impl Pl330 {
         self.read(INTSTATUS)
     }
 }
+
+/// Awaiting events on [`PDMA0_IRQ`]: see [Waiting for an event](self#waiting-for-an-event).
+#[cfg(feature = "embassy")]
+mod asynch {
+    use core::future::poll_fn;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::Poll;
+
+    use embassy_sync::waitqueue::AtomicWaker;
+
+    use super::{PDMA0_BASE, PDMA0_IRQ, Pl330};
+    use crate::drivers::gic::Gic;
+
+    /// One waiter per event: `CR0` gives 32 on this board.
+    const EVENTS: usize = 32;
+
+    static WAKERS: [AtomicWaker; EVENTS] = [const { AtomicWaker::new() }; EVENTS];
+    static INTERRUPTS: AtomicU32 = AtomicU32::new(0);
+
+    /// Interrupts [`on_interrupt`] has taken, since the start.
+    pub fn interrupts() -> u32 {
+        INTERRUPTS.load(Ordering::Relaxed)
+    }
+
+    /// Routes `pdma0`'s interrupt to CPU0, still disabled: each wait enables it. Call it after
+    /// [`Gic::init`], before the first wait.
+    pub fn init_interrupt() {
+        let gic = Gic::new();
+        gic.disable(PDMA0_IRQ);
+        gic.set_target(PDMA0_IRQ, 0);
+    }
+
+    /// Handles `pdma0`'s interrupt, if `id` is it: turns it off at the GIC and wakes every
+    /// waiter, which looks at its event itself. The events stay set for [`Pl330::take_event`].
+    pub fn on_interrupt(id: u16) -> bool {
+        if id != PDMA0_IRQ {
+            return false;
+        }
+        Gic::new().disable(PDMA0_IRQ);
+        INTERRUPTS.fetch_add(1, Ordering::Relaxed);
+        for waker in &WAKERS {
+            waker.wake();
+        }
+        true
+    }
+
+    impl Pl330 {
+        /// Waits until `event` is set in `INTSTATUS`, at once if it is now, and leaves it set.
+        /// The event must be an interrupt ([`enable_interrupt`](Self::enable_interrupt)), and
+        /// [`init_interrupt`] called. One task waits for an event at a time; a later waiter
+        /// takes the earlier one's place, which is then not woken. Dropping the wait leaves
+        /// nothing behind but the interrupt on, which ends at the next event.
+        ///
+        /// # Panics
+        ///
+        /// On a controller other than `pdma0`, or an event above 31.
+        pub async fn wait_event(&self, event: u8) {
+            assert!(event < EVENTS as u8, "pdma0 has 32 events");
+            self.wait_events(1 << event).await;
+        }
+
+        /// Waits until any event of `mask` is set, as [`wait_event`](Self::wait_event), and
+        /// returns those set. The waiter takes the place of the lowest event's.
+        ///
+        /// # Panics
+        ///
+        /// On a controller other than `pdma0`, or an empty `mask`.
+        pub async fn wait_events(&self, mask: u32) -> u32 {
+            assert!(self.base == PDMA0_BASE, "only pdma0's interrupt is handled");
+            assert!(mask != 0, "no event to wait for");
+            let waker = &WAKERS[mask.trailing_zeros() as usize];
+            poll_fn(|cx| {
+                let set = self.events() & mask;
+                if set != 0 {
+                    return Poll::Ready(set);
+                }
+                // Registered before the interrupt is on, so that the handler finds it.
+                waker.register(cx.waker());
+                Gic::new().enable(PDMA0_IRQ);
+                // What was raised before the interrupt was on still ends the wait now.
+                match self.events() & mask {
+                    0 => Poll::Pending,
+                    set => Poll::Ready(set),
+                }
+            })
+            .await
+        }
+    }
+}
+
+#[cfg(feature = "embassy")]
+pub use asynch::{init_interrupt, interrupts, on_interrupt};

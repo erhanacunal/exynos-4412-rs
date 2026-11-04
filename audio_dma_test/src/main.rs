@@ -1,7 +1,7 @@
 //! WM8758 and I2S0 through `pdma0`: the FIFO filled by DMA from a ring of two halves, which
 //! the CPU refills.
 //!
-//! 1. The codec's rail, its I2C, the jack pin, and the clocks, as in `audio_test`.
+//! 1. The codec's rail, its I2C and the clocks, as in `audio_test`.
 //! 2. `pdma0`: its configuration, and the channel program of [`DmaPlayback`], printed.
 //! 3. Silence through the ring for 1 s, timed from one half's event to a later one: the frame
 //!    rate, 48000 Hz if the clocks are right; no FIFO underrun.
@@ -243,7 +243,6 @@ fn main(_args: BootArgs) -> ! {
         halt();
     }
     let codec = codec(Max77686::new(i2c), mct);
-    println!("Jack: {}", if wm8758::jack_in() { "in" } else { "out" });
 
     // Out before each step that could stop the board, so that the log shows where.
     console::flush();

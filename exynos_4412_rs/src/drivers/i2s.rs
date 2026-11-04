@@ -35,6 +35,17 @@
 //! raises one event after each half: the CPU then refills that half while the other plays.
 //! The ring's halves last [`DMA_HALF_FRAMES`] frames, 85 ms, so the CPU may be busy that long
 //! between two refills. A half not refilled in time plays again, and counts as late.
+//!
+//! [`DmaPlayback::service`] looks at the events and returns at once, for a polling loop. With
+//! the `embassy` feature, a task awaits the next half's event with `DmaPlayback::wait_half`
+//! first, on `pdma0`'s interrupt ([`pl330::init_interrupt`]):
+//!
+//! ```ignore
+//! loop {
+//!     playback.wait_half().await;
+//!     playback.service(|half| fill(half));
+//! }
+//! ```
 
 use core::ptr;
 
@@ -337,9 +348,16 @@ pub type DmaProgram = Program<64>;
 pub struct Serviced {
     /// Halves refilled.
     pub refilled: u32,
-    /// Of those, halves found played twice: both halves had ended when this looked.
+    /// Times both halves had ended when this looked: one of them plays again, and only the
+    /// one that ended last is refilled.
     pub late: u32,
+    /// Times the half that ended was not the one expected, and the count of halves was set
+    /// right again by it.
+    pub resynced: u32,
 }
+
+/// Both events of [`DmaPlayback`], as bits of `INTSTATUS`.
+const DMA_EVENT_MASK: u32 = 1 << DMA_EVENTS[0] | 1 << DMA_EVENTS[1];
 
 /// Playback through `pdma0`: see the [module documentation](self#dma).
 pub struct DmaPlayback {
@@ -408,22 +426,62 @@ impl DmaPlayback {
         Ok(())
     }
 
-    /// Refills each half that has played since the last call, in order, with `fill`, and
-    /// writes it out of the caches for the controller.
+    /// Refills the half that has played since the last call with `fill`, and writes it out of
+    /// the caches for the controller.
+    ///
+    /// The half to refill is the one whose event is set. If both are, both halves ended since
+    /// the last look and their order is lost: the half refilled is then the one the channel
+    /// does not read, which ended last. Nothing is assumed from earlier calls, so a call that
+    /// came late, or a first call after events piled up, cannot leave the refills a half
+    /// behind the channel.
     pub fn service(&mut self, mut fill: impl FnMut(&mut [u32; DMA_HALF_FRAMES])) -> Serviced {
         let mut done = Serviced::default();
-        while self.dma.take_event(DMA_EVENTS[self.next]) {
-            // The other half's event too: it has ended as well, and this one plays again.
-            if self.dma.events() & 1 << DMA_EVENTS[1 - self.next] != 0 {
+        loop {
+            let pending = self.dma.events() & DMA_EVENT_MASK;
+            let ended = if pending == 0 {
+                break;
+            } else if pending == DMA_EVENT_MASK {
                 done.late += 1;
-            }
-            let half = &mut self.ring.0[self.next];
+                for event in DMA_EVENTS {
+                    self.dma.take_event(event);
+                }
+                self.reading_half().map_or(self.next, |reading| 1 - reading)
+            } else {
+                let half = if pending & 1 << DMA_EVENTS[self.next] != 0 { self.next } else { 1 - self.next };
+                if half != self.next {
+                    done.resynced += 1;
+                }
+                self.dma.take_event(DMA_EVENTS[half]);
+                half
+            };
+            let half = &mut self.ring.0[ended];
             fill(half);
             crate::mmu::clean_dcache_range(half.as_ptr() as usize, size_of_val(half));
             done.refilled += 1;
-            self.next = 1 - self.next;
+            self.next = 1 - ended;
         }
         done
+    }
+
+    /// The half the channel reads now, `None` if it reads outside the ring.
+    pub fn reading_half(&self) -> Option<usize> {
+        self.position().map(|frame| frame / DMA_HALF_FRAMES)
+    }
+
+    /// Waits until a half has ended, either one, on `pdma0`'s interrupt:
+    /// [`pl330::init_interrupt`] must have been called. At once if one has ended already. Then
+    /// [`service`](Self::service) refills it. Dropping the wait is harmless.
+    ///
+    /// Waiting for both events, not only the one expected next, keeps an unexpected one from
+    /// holding the shared interrupt line high unseen.
+    #[cfg(feature = "embassy")]
+    pub async fn wait_half(&self) {
+        self.dma.wait_events(DMA_EVENT_MASK).await;
+    }
+
+    /// The half [`service`](Self::service) expects to end next, 0 or 1.
+    pub fn next_half(&self) -> usize {
+        self.next
     }
 
     /// Where the channel reads now, as a frame of the ring; `None` if outside it.

@@ -29,6 +29,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio_async_test"
+version = "0.1.0"
+dependencies = [
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-sync",
+ "embassy-time",
+ "exynos_4412_rs",
+]
+
+[[package]]
 name = "audio_dma_test"
 version = "0.1.0"
 dependencies = [

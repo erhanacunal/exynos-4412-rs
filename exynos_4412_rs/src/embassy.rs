@@ -12,7 +12,10 @@
 //! - async I2C transfers: `I2c::write_read_async` and the like, in
 //!   [`drivers::i2c`](crate::drivers::i2c);
 //! - async eMMC transfers: `Mmc::read_blocks_async` and `MmcWriter::write_async`, in
-//!   [`drivers::mmc`](crate::drivers::mmc).
+//!   [`drivers::mmc`](crate::drivers::mmc);
+//! - `pdma0`'s events awaited on its interrupt: `Pl330::wait_event` in
+//!   [`drivers::pl330`](crate::drivers::pl330), and `DmaPlayback::wait_half` in
+//!   [`drivers::i2s`](crate::drivers::i2s).
 //!
 //! The executor is `embassy-executor`'s raw one, run here: it sleeps with `WFE`, and a wake-up
 //! from any core sends `DSB` then `SEV`, which wakes all of them. An interrupt also ends a
@@ -167,14 +170,16 @@ pub fn init() {
 
 /// Handles interrupt `id` if it is this module's, returning whether it was: the MCT's, those
 /// of the UARTs that [`uart::UartRx`] reads, those of the pins of [`eint::EintInput`], and
-/// those of the I2C and eMMC controllers for their async transfers. The application's `handle_irq` calls it
-/// after acknowledging the interrupt, and ends it after.
+/// those of the I2C and eMMC controllers for their async transfers, and `pdma0`'s for its
+/// events. The application's `handle_irq` calls it after acknowledging the interrupt, and ends
+/// it after.
 pub fn on_interrupt(id: u16) -> bool {
     if id != soc::MCT_G0_IRQ {
         return uart::on_interrupt(id)
             || eint::on_interrupt(id)
             || crate::drivers::i2c::on_interrupt(id)
-            || crate::drivers::mmc::on_interrupt(id);
+            || crate::drivers::mmc::on_interrupt(id)
+            || crate::drivers::pl330::on_interrupt(id);
     }
     Mct::new().clear_interrupt();
     critical_section::with(|cs| service_queue(&mut DRIVER.queue.borrow_ref_mut(cs)));
