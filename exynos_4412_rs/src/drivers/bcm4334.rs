@@ -12,7 +12,16 @@
 //!
 //! The board needs a patch to that driver, `brcmfmac.patch`, which turns off the separate
 //! interrupt line and scatter-gather lists, and asks for 4-byte head and 512-byte list alignment.
-//! Here everything is polled and nothing uses lists.
+//! Nothing here uses lists. Transfers are polled.
+//!
+//! # Host wake
+//!
+//! The chip can raise a line of its own, [`HOST_WAKE`], while its SDIO core has something for
+//! the host: [`Bcm4334::enable_host_wake`] turns it on, as `brcmfmac/bcmsdh.c:143-154` does for
+//! its separate interrupt. The vendor kernel used it (`HW_OOB`, `OOB_INTR_ONLY` in its `bcmdhd`
+//! Makefile, level-high on `EINT(3)` in `mach-exynos/mehmet-wlan.c:305-308`); the Linux that
+//! worked on this board did not. While the line is low and [`Bcm4334::has_pending`] is false,
+//! there is nothing to read, and a caller can skip the bus read that finds that out.
 //!
 //! # Where this differs from Linux
 //!
@@ -244,6 +253,22 @@ const RAM_BANK_INFO_SIZE_MASK: u32 = 0x7F;
 const RAM_BANK_INFO_SIZE_UNIT: u32 = 8192;
 /// A size above this is not a real one: `brcmfmac/chip.c:94` `BRCMF_CHIP_MAX_MEMSIZE`.
 const RAM_MAX_SIZE: u32 = 4 * 1024 * 1024;
+
+/// The chip's host wake line, `gpx0-3`: `exynos4412-mehmet.dts:637-642,1533-1536`, and
+/// `GPIO_WLAN_HOST_WAKE` in the vendor kernel's `gpio-mehmet.h:48`. High while the chip has
+/// something for the host, once [`Bcm4334::enable_host_wake`] has run.
+pub const HOST_WAKE: Pin = gpio::GPX0.pin(3);
+/// `include/linux/mmc/sdio.h:90`: function 0's interrupt enables.
+const CCCR_INT_ENABLE: u32 = 0x04;
+/// `brcmfmac/sdio.h:39-41`: the master enable and functions 1 and 2.
+const INT_ENABLE_MASTER: u8 = 1 << 0;
+const INT_ENABLE_FUNCTION1: u8 = 1 << 1;
+const INT_ENABLE_FUNCTION2: u8 = 1 << 2;
+/// `brcmfmac/sdio.h:46-49`: Broadcom's register that sends the interrupt to the separate line.
+const CCCR_BRCM_SEPINT: u32 = 0xF2;
+const SEPINT_MASK: u8 = 1 << 0;
+const SEPINT_OUTPUT_ENABLE: u8 = 1 << 1;
+const SEPINT_ACTIVE_HIGH: u8 = 1 << 2;
 
 /// Registers of the SDIO core: `struct sdpcmd_regs`, `brcmfmac/sdio.h:212,213,219,221,222`.
 const SDIO_INT_STATUS: u32 = 0x20;
@@ -832,6 +857,8 @@ pub struct Bcm4334 {
     /// Whether this connection has reached its access point.
     associated: bool,
     timing: Timing,
+    /// Frames read from the chip, of any channel.
+    frames_read: u32,
 }
 
 /// Where the time of the data path goes, in MCT counts since the chip started. Each only grows,
@@ -881,6 +908,7 @@ impl Bcm4334 {
             frame: [0; FRAME_SIZE],
             queued_events: [None; MAX_QUEUED_EVENTS],
             associated: false,
+            frames_read: 0,
             timing: Timing {
                 frame_writes: 0,
                 frame_reads: 0,
@@ -1294,6 +1322,33 @@ impl Bcm4334 {
         Ok(())
     }
 
+    /// Has the chip drive [`HOST_WAKE`] high while its SDIO core has something for the host,
+    /// as `brcmfmac/bcmsdh.c:143-154` does, and makes the pin an input without a pull, as the
+    /// vendor kernel has it while the chip is on (`mach-exynos/mehmet-wlan.c:147`). The DTS asks
+    /// for the pull-down (`exynos4412-mehmet.dts:640`): with it the line was never seen high on
+    /// the board, without it it was. Call it after [`start_firmware`](Self::start_firmware), which
+    /// sets what the core reports.
+    pub fn enable_host_wake(&mut self) -> Result<(), Error> {
+        HOST_WAKE.set_input(Pull::None);
+        let enables = self.card.read_byte(0, CCCR_INT_ENABLE)?;
+        let enables = enables | INT_ENABLE_MASTER | INT_ENABLE_FUNCTION1 | INT_ENABLE_FUNCTION2;
+        self.card.write_byte(0, CCCR_INT_ENABLE, enables)?;
+        self.card.write_byte(0, CCCR_BRCM_SEPINT, SEPINT_MASK | SEPINT_OUTPUT_ENABLE | SEPINT_ACTIVE_HIGH)?;
+        Ok(())
+    }
+
+    /// Frames read from the chip so far, of any channel: data, events and answers.
+    pub const fn frames_read(&self) -> u32 {
+        self.frames_read
+    }
+
+    /// Whether something already known waits to be read: frames the chip announced and not
+    /// all read, or an event kept while waiting for something else. Neither raises
+    /// [`HOST_WAKE`] again.
+    pub fn has_pending(&self) -> bool {
+        self.frames_pending || self.queued_events[0].is_some()
+    }
+
     /// Raw registers, for when the firmware does not answer.
     pub fn diagnostics(&mut self) -> Result<Diagnostics, Error> {
         let sdio = self.core(CORE_SDIO)?;
@@ -1368,6 +1423,7 @@ impl Bcm4334 {
             self.timing.frame_reads += self.mct.count() - begin;
             rest?;
         }
+        self.frames_read = self.frames_read.wrapping_add(1);
         Ok(Some((channel, offset, length)))
     }
 

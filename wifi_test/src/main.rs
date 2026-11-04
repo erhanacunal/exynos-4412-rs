@@ -29,13 +29,14 @@ use exynos_4412_rs::crypto::{self, Hmac};
 use exynos_4412_rs::drivers::bcm4334::{
     self, Activity, Bcm4334, Bss, CHIP_ID_4334, Error, Event, IOCTL_GET_VERSION, STATUS_SUCCESS, Security,
 };
+use exynos_4412_rs::drivers::gpio::{Pull, Trigger};
 use exynos_4412_rs::drivers::i2c::{Bus, I2c};
 use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::drivers::max77686::Max77686;
 use exynos_4412_rs::drivers::power::{self, BootMode, PowerKeys};
 use exynos_4412_rs::drivers::sdhci::Sdhci;
 use exynos_4412_rs::drivers::timer::Mct;
-use exynos_4412_rs::drivers::wifi_device::{Stats, WifiDevice};
+use exynos_4412_rs::drivers::wifi_device::{self, HostWake, Stats, WifiDevice};
 use exynos_4412_rs::wpa::{self, Supplicant};
 use exynos_4412_rs::{BootArgs, console, mmu, print, println, soc};
 use smoltcp::iface::{
@@ -96,6 +97,14 @@ const SSID: Option<&str> = option_env!("WIFI_SSID");
 const PASSWORD: Option<&str> = option_env!("WIFI_PASSWORD");
 /// The band to join in, `2.4` or `5`, if not whichever access point is strongest.
 const BAND: Option<&str> = option_env!("WIFI_BAND");
+/// Whether the station reads the chip only when its host wake line is high: unless
+/// `WIFI_HOST_WAKE` is `0` at build time.
+const GATE_ON_HOST_WAKE: bool = match option_env!("WIFI_HOST_WAKE") {
+    Some(text) => !matches!(text.as_bytes(), b"0"),
+    None => true,
+};
+/// How often the station reports its reads of the chip while serving.
+const READS_REPORT_MS: u64 = 10_000;
 /// Channels up to this one are in the 2.4 GHz band, the rest in 5 GHz.
 const LAST_2G_CHANNEL: u8 = 14;
 /// Joining scans first, then authenticates and shakes hands. Not measured.
@@ -191,6 +200,70 @@ fn idle(mct: Mct) -> ! {
             Some(b'f') => power::restart(BootMode::Fastboot),
             _ => {}
         }
+    }
+}
+
+/// Function 0's interrupt enables and pending interrupts: `include/linux/mmc/sdio.h:90-92`.
+const CCCR_INT_ENABLE: u32 = 0x04;
+const CCCR_INT_PENDING: u32 = 0x05;
+/// Broadcom's separate interrupt register and its bits: `brcmfmac/sdio.h:46-49`.
+const CCCR_BRCM_SEPINT: u32 = 0xF2;
+
+/// The pin's level with no pull, the pull-up and the pull-down, 1 ms after each.
+fn pin_levels(mct: Mct) -> [u8; 3] {
+    let pin = bcm4334::HOST_WAKE;
+    let mut levels = [0; 3];
+    for (level, pull) in levels.iter_mut().zip([Pull::None, Pull::Up, Pull::Down]) {
+        pin.set_pull(pull);
+        let end = mct.count() + COUNTS_PER_MS;
+        while mct.count() < end {}
+        *level = u8::from(pin.read());
+    }
+    levels
+}
+
+/// Writes each setting of the separate interrupt register while the chip's interrupt status is
+/// set, and reads the pin with each pull: a pin the chip drives reads the same with all three, a
+/// pin left alone follows the pull. Returns whether the line follows the setting enabled with
+/// active high, as `enable_host_wake` writes it.
+fn probe_host_wake(chip: &mut Bcm4334, mct: Mct) -> Result<bool, Error> {
+    let card = chip.card();
+    let enables = card.read_byte(0, CCCR_INT_ENABLE).map_err(Error::Sdio)?;
+    let pending = card.read_byte(0, CCCR_INT_PENDING).map_err(Error::Sdio)?;
+    let sepint = card.read_byte(0, CCCR_BRCM_SEPINT).map_err(Error::Sdio)?;
+    println!("CCCR before: enables {:#04x}, pending {:#04x}, SEPINT {:#04x}", enables, pending, sepint);
+    card.write_byte(0, CCCR_INT_ENABLE, enables | 0x07).map_err(Error::Sdio)?;
+    let enables = card.read_byte(0, CCCR_INT_ENABLE).map_err(Error::Sdio)?;
+    let pending = card.read_byte(0, CCCR_INT_PENDING).map_err(Error::Sdio)?;
+    println!("CCCR enables now {:#04x}, pending {:#04x}", enables, pending);
+    let mut works = false;
+    // Off; mask, output and active high; mask and output, active low; output and active high
+    // without the mask.
+    for setting in [0x00u8, 0x07, 0x03, 0x06] {
+        card.write_byte(0, CCCR_BRCM_SEPINT, setting).map_err(Error::Sdio)?;
+        let back = card.read_byte(0, CCCR_BRCM_SEPINT).map_err(Error::Sdio)?;
+        let levels = pin_levels(mct);
+        let status = chip.diagnostics().map(|state| state.int_status).unwrap_or(0);
+        println!(
+            "SEPINT {:#04x}, reads {:#04x}: pin none {}, up {}, down {}; status {:#010x}",
+            setting, back, levels[0], levels[1], levels[2], status
+        );
+        if setting == 0x07 {
+            works = status != 0 && levels == [1, 1, 1];
+        }
+    }
+    card.write_byte(0, CCCR_BRCM_SEPINT, 0).map_err(Error::Sdio)?;
+    bcm4334::HOST_WAKE.set_pull(Pull::Down);
+    println!("Host wake line follows the chip: {}", verdict(works));
+    Ok(works)
+}
+
+/// The host wake line and the interrupt status it should follow.
+fn report_host_wake(chip: &mut Bcm4334, when: &str) {
+    let level = u8::from(bcm4334::HOST_WAKE.read());
+    match chip.diagnostics() {
+        Ok(state) => println!("Host wake {}: line {}, interrupt status {:#010x}", when, level, state.int_status),
+        Err(error) => println!("Host wake {}: line {}, status ERROR {:?}", when, level, error),
     }
 }
 
@@ -403,6 +476,27 @@ fn each_us(counts: u64, times: u32) -> u64 {
     us(counts) / u64::from(times.max(1))
 }
 
+/// What the host wake line saved between two readings, and what it missed.
+fn report_gate(a: &Stats, b: &Stats) {
+    println!(
+        "  Chip reads: {} with a frame, {} empty; {} skipped on the line, {} backstops, {} missed",
+        a.received - b.received,
+        a.empty_polls - b.empty_polls,
+        a.skipped - b.skipped,
+        a.backstops - b.backstops,
+        a.missed - b.missed,
+    );
+    let changes = a.line_changes - b.line_changes;
+    let frames = (a.frame_line_high - b.frame_line_high, a.frame_line_low - b.frame_line_low);
+    let empty = (a.empty_line_high - b.empty_line_high, a.empty_line_low - b.empty_line_low);
+    if changes + frames.0 + frames.1 + empty.0 + empty.1 != 0 {
+        println!(
+            "  Line at reads: frame high {} low {}; empty high {} low {}; {} changes",
+            frames.0, frames.1, empty.0, empty.1, changes,
+        );
+    }
+}
+
 /// Says where the time between two marks went. Other traffic in that time counts too.
 fn report_transfer(before: &Mark, after: &Mark) {
     let a = &after.stats;
@@ -440,6 +534,7 @@ fn report_transfer(before: &Mark, after: &Mark) {
         ms(a.chip.frame_reads - b.chip.frame_reads),
     );
     println!("  Stack told there was no room: {} times", a.refused - b.refused);
+    report_gate(a, b);
     println!(
         "  TCP data in: {} segments, {} after a gap, {} sent again",
         a.tcp_segments - b.tcp_segments,
@@ -766,8 +861,22 @@ impl Station<'_> {
         let mut keys = PowerKeys::new();
         let mut reported = self.device.echo_requests();
         self.serving = true;
+        let mut last = Mark {
+            stats: self.device.stats(),
+            count: self.mct.count(),
+        };
         loop {
             self.poll()?;
+            if self.mct.count() - last.count >= READS_REPORT_MS * COUNTS_PER_MS {
+                let now = Mark {
+                    stats: self.device.stats(),
+                    count: self.mct.count(),
+                };
+                let empty = now.stats.empty_poll_time - last.stats.empty_poll_time;
+                println!("{} s, empty reads {} ms of it:", READS_REPORT_MS / 1000, ms(empty));
+                report_gate(&now.stats, &last.stats);
+                last = now;
+            }
             self.serve_http();
             keys.service(self.mct);
             if self.device.echo_requests() != reported {
@@ -790,7 +899,8 @@ fn tcp_socket<'a>(rx: &'a mut [u8], tx: &'a mut [u8]) -> tcp::Socket<'a> {
     socket
 }
 
-fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8; 20]) -> Result<(), Error> {
+/// Joins the network, then serves it. `gate` reads the chip only when its host wake line says so.
+fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8; 20], gate: bool) -> Result<(), Error> {
     let (Some(ssid), Some(password)) = (SSID, PASSWORD) else {
         return Ok(());
     };
@@ -828,6 +938,26 @@ fn join(chip: &mut Bcm4334, mct: Mct, own: [u8; 6], target: &Target, pool: &[u8;
     report_link(chip);
 
     let mut device = WifiDevice::new(chip, &mut supplicant, report, mct);
+    // Without a pull, as `enable_host_wake` leaves it: the probe's last pull was the pull-down.
+    bcm4334::HOST_WAKE.set_pull(Pull::None);
+    match (gate, bcm4334::HOST_WAKE.eint()) {
+        (true, Some(eint)) => {
+            // A rising edge latched by the controller, kept from the GIC: the line's pulses can
+            // be shorter than the time between two looks at its level, which missed half of them.
+            eint.listen(Trigger::RisingEdge);
+            eint.mask();
+            eint.clear();
+            device.gate_on_host_wake(Some(HostWake::Pending(eint)));
+            println!(
+                "Reading the chip after a rising edge on its host wake line, or every {} ms",
+                wifi_device::BACKSTOP_US / 1000
+            );
+        }
+        _ => {
+            device.observe_host_wake(Some(bcm4334::HOST_WAKE));
+            println!("Reading the chip on every poll, noting the host wake line at each read");
+        }
+    }
     let capabilities = device.capabilities();
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(own)));
     config.random_seed = u64::from_le_bytes(seed);
@@ -1006,6 +1136,14 @@ fn run(pmic: Max77686, mct: Mct) -> Result<(), Error> {
     }
     report_diagnostics(&mut chip);
 
+    println!("\nTurning on the host wake line");
+    bcm4334::HOST_WAKE.set_input(Pull::Down);
+    report_host_wake(&mut chip, "before");
+    // Before the firmware talks, the line read low throughout: a record, not a condition.
+    probe_host_wake(&mut chip, mct)?;
+    chip.enable_host_wake()?;
+    report_host_wake(&mut chip, "after");
+
     println!("\nTalking to the firmware");
     let own = match talk(&mut chip) {
         Ok(own) => own,
@@ -1015,6 +1153,7 @@ fn run(pmic: Max77686, mct: Mct) -> Result<(), Error> {
         }
     };
     report_diagnostics(&mut chip);
+    report_host_wake(&mut chip, "after talking");
 
     println!("\nScanning");
     let (target, pool) = match scan(&mut chip, mct, own) {
@@ -1046,7 +1185,7 @@ fn run(pmic: Max77686, mct: Mct) -> Result<(), Error> {
         println!("The named network was not found, not in WIFI_BAND, or asks for what this cannot do (MISMATCH)");
         return Ok(());
     };
-    if let Err(error) = join(&mut chip, mct, own, &target, &pool) {
+    if let Err(error) = join(&mut chip, mct, own, &target, &pool, GATE_ON_HOST_WAKE) {
         report_diagnostics(&mut chip);
         return Err(error);
     }

@@ -1127,6 +1127,32 @@ handshake and `crypto` the algorithms it needs: the firmware of this board leave
   of its own (`sdhci-s3c.c:573`). From 25 MHz on, it samples with other feedback settings
   (`sdhci-s3c.c:290-291`).
 - **Transfer:** Polled through the buffer port, with no DMA and no interrupts.
+- **Host wake:** `Bcm4334::enable_host_wake` has the chip drive `gpx0-3` high while it has
+  something for the host, as the vendor kernel did (`HW_OOB`; the Linux that worked here had it
+  off). `WifiDevice::gate_on_host_wake` then reads the chip only when the line is high, or
+  something is known to wait, and once every 50 ms regardless; what that backstop read finds
+  counts as missed by the line. `wifi_test` turns it on unless built with `WIFI_HOST_WAKE=0`,
+  and reports the reads every 10 s. First run on the board, gating on the line's level: the line stayed low with the
+  interrupt status at `0x208000c0`, every frame was found by a backstop read, and a 1 MiB
+  download fell to 292 KiB/s. The probe since: the chip takes each `0xF2` setting (read back
+  equal; `0x04` at reset), function 1 has an interrupt pending, yet the pin reads 0 with every
+  setting and every pull, the pull-up included, so something drives it low. The board's NVRAM
+  has `sd_gpout=0` and `sd_oobonly=1`: the firmware signals on its GPIO 0 alone, not on DAT1.
+  Watched at every read without a pull, the line went high only on reads that found a frame,
+  never on empty ones, but on few of them. Gated on its level without a pull, 91 reads came
+  from the line and 78 from backstops: 250 KiB/s. The line seems to pulse, shorter than the
+  5 us between two looks. `wifi_test` now gates on the pin's wake-up interrupt, masked, rising
+  edge, whose pending bit the controller latches: `HostWake::Pending`. On the board:
+
+  | Check | Result |
+  |---|---|
+  | Idle, every 10 s | 200 empty reads, all backstops, 0 missed; about 2150000 polls skipped |
+  | 1 MiB on port 80 | 3020 KiB/s (3150-3531 reading every poll); 461 frames, 0 backstops, 0 missed |
+  | 10 s around it | 467 frames, 191 backstops, 0 missed |
+  | Upload | Received |
+
+  Every frame came after an edge, and no backstop found anything. Each run of frames ends with
+  one empty read, the one that finds the chip has no more.
 - **Flow control:** The firmware says in each frame it sends how many more it can take. While it
   has no room, `drivers::wifi_device` tells `smoltcp` it cannot send, so the stack keeps reading
   instead of dropping frames, such as acknowledgements, while it waits.
