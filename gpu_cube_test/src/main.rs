@@ -1,22 +1,29 @@
 //! A textured cube turning in the middle of the screen, in perspective: the CPU makes one
 //! matrix a frame, the GP's vertex shader takes the 36 vertices of the 12 triangles through it,
 //! and the four PPs render the 320 x 320 frame into the screen, the depth test hiding the far
-//! faces. Each face has its own colour, from its cell of a texture atlas.
+//! faces. Each face has its own colour, from its cell of a texture atlas, and is lit by one
+//! distant light from the upper left front: the vertex shader takes each vertex's brightness
+//! from its face's normal, a quarter ambient and three quarters diffuse, and the fragment
+//! shader scales the texel by it.
 //!
 //! The shaders are compiled offline by Mesa 25.3.3's lima compiler (MIT), run on a PC under
 //! `drm-shim` with `LIMA_DEBUG=dump`, from
 //!
 //! ```glsl
-//! uniform mat4 mvp; attribute vec4 pos; attribute vec2 uv; varying vec2 v;
-//! void main() { v = uv; gl_Position = mvp * pos; }
-//! precision mediump float; uniform sampler2D t; varying vec2 v;
-//! void main() { gl_FragColor = texture2D(t, v); }
+//! uniform mat4 mvp; uniform vec3 light; attribute vec4 pos; attribute vec2 uv;
+//! attribute vec3 normal; varying vec3 v;
+//! void main() { v = vec3(uv, 0.25 + 0.75 * max(dot(normal, light), 0.0)); gl_Position = mvp * pos; }
+//! precision mediump float; uniform sampler2D t; varying vec3 v;
+//! void main() { vec4 c = texture2D(t, v.xy); gl_FragColor = vec4(c.rgb * v.z, c.a); }
 //! ```
+//!
+//! The light is the cube's own: the CPU turns the light's direction back by the cube's turns
+//! each frame, so that the shader needs the normals as they are.
 //!
 //! with `GL_DEPTH_TEST` and `GL_LESS`. The depth buffer is the PPs' own tile memory, cleared
 //! for each tile by the frame (`PpFrame::clear`) and never written back.
 //!
-//! The first frame's positions from the GP are checked against the CPU's own transform. As in
+//! The first frame's positions and brightnesses from the GP are checked against the CPU's own. As in
 //! `gpu_spin_test`, each frame starts at vsync; a line every two seconds gives the frame rate
 //! and the GPU's microseconds.
 //!
@@ -63,6 +70,10 @@ const DISTANCE: f32 = 4.0;
 const FOCAL: f32 = 1.6;
 const NEAR: f32 = 1.0;
 const FAR: f32 = 10.0;
+/// Towards the light, in the camera's space: up, left and in front; of length 1.
+const LIGHT: [f32; 3] = [-0.408_248_3, 0.408_248_3, 0.816_496_6];
+const AMBIENT: f32 = 0.25;
+const DIFFUSE: f32 = 0.75;
 const REPORT_US: u64 = 2_000_000;
 
 /// The atlas: 4 x 2 cells of 32 x 32 texels, a face to a cell.
@@ -82,48 +93,64 @@ const FACES: [[[f32; 3]; 4]; 6] = [
     [[-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0]],
     [[1.0, -1.0, -1.0], [-1.0, -1.0, -1.0], [-1.0, 1.0, -1.0], [1.0, 1.0, -1.0]],
 ];
+/// Each face's normal, outwards.
+const NORMALS: [[f32; 3]; 6] =
+    [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, -1.0]];
 /// Where the corners are in a cell, its first line at the top.
 const CORNER_UVS: [[f32; 2]; 4] = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
 /// A face's two triangles, by corner.
 const FACE_TRIANGLES: [usize; 6] = [0, 1, 2, 0, 2, 3];
 
 /// The vertex shader: `mvp * pos` from the first four uniforms, then the viewport; the texture
-/// coordinates to `v1.xy`.
-const VERTEX_SHADER: [u32; 68] = [
-    0xb34a_d6b5, 0x0380_4ab5, 0x0007_ff80, 0x000a_d500, //
-    0xad40_3830, 0x4380_02b5, 0x0007_ff80, 0x000a_d500, //
-    0xb380_b02f, 0x4380_6ad3, 0x0007_ff80, 0x0009_5500, //
-    0xb300_3c0d, 0x4380_2ad2, 0x0247_ff80, 0x000a_4500, //
-    0xb6c1_3c10, 0x4380_aad8, 0x0247_ff80, 0x000b_5100, //
-    0xcec1_bc6d, 0x4380_e2da, 0x0247_ff80, 0x000b_5100, //
-    0xdc01_3039, 0x4380_831a, 0x0247_ff80, 0x000b_4900, //
-    0xdc01_384d, 0x4380_82f9, 0x0247_ff80, 0x000b_5100, //
-    0xde41_ba10, 0x4380_c356, 0x0147_ff80, 0x000a_4130, //
-    0xdc4c_5a56, 0x0380_0359, 0x0247_ff80, 0x000a_4110, //
-    0xdc0b_32d6, 0x0380_c291, 0x0007_ff80, 0x000a_d500, //
-    0x668b_4ed2, 0x0381_82b5, 0x027f_ff80, 0x0008_4500, //
-    0x6c01_ced2, 0x4381_82b5, 0x0277_ff80, 0x000b_5100, //
-    0x9c88_5a14, 0x0380_22d0, 0x0007_ff80, 0x000a_d500, //
-    0xb307_4e30, 0x0381_2acd, 0x0247_ff80, 0x0008_c900, //
-    0x74c8_4a36, 0x4781_62c1, 0x4647_e600, 0x0000_5100, //
-    0x64cb_42d6, 0x0381_41b2, 0x4002_6400, 0x000a_d508,
+/// coordinates and the brightness, from the normal and the light's uniform, to `v1.xyz`.
+const VERTEX_SHADER: [u32; 84] = [
+    0xb30a_d6b5, 0x0381_4ab5, 0x0007_ff80, 0x000a_d500, //
+    0xb34b_3eb5, 0x0380_ead0, 0x0007_ff80, 0x000a_d500, //
+    0xb341_c2d1, 0x4380_6ad3, 0x0007_ff80, 0x000a_d500, //
+    0xb4c1_3430, 0x4380_aad2, 0x0007_fd80, 0x0008_d500, //
+    0xb3c0_b02e, 0x4380_6ad4, 0x0247_ff80, 0x0008_c100, //
+    0xb480_3c30, 0x4380_2ada, 0x0247_ff80, 0x000b_3100, //
+    0xb6c1_3c16, 0x4380_aad9, 0x0247_fb80, 0x000b_9100, //
+    0xd6c0_380d, 0x4380_22d8, 0x0647_ea00, 0x000c_dd00, //
+    0xdc01_e6d7, 0x4381_831a, 0x0247_ff00, 0x0006_5900, //
+    0x9c01_384c, 0x4380_833b, 0x0244_cb80, 0x0008_9500, //
+    0x9c41_ba10, 0x4380_e2d7, 0x0147_ff80, 0x000d_4130, //
+    0x9c0c_5a56, 0x0780_c001, 0x0247_ff00, 0x0006_1110, //
+    0x3447_09a1, 0x4b81_00a7, 0x0247_ff80, 0x000c_dd00, //
+    0x7e8b_62d7, 0x4381_c2b5, 0x027f_ff80, 0x0001_d900, //
+    0xd6cb_32d9, 0x0381_0098, 0x0247_ff80, 0x000b_d900, //
+    0x6609_82fa, 0x4b82_02b5, 0x0277_ff80, 0x000d_d900, //
+    0x9e08_66cc, 0x0381_c25a, 0x0247_ff80, 0x000b_d900, //
+    0xb60c_4717, 0x0381_ead6, 0x0247_ff80, 0x0006_d100, //
+    0xd607_49bb, 0x4781_42b5, 0x467f_fb80, 0x000b_0500, //
+    0x74c8_5f3b, 0x4781_81b2, 0x4646_1e00, 0x0000_6108, //
+    0x9b8b_46b5, 0x0381_c2f2, 0xc007_0c80, 0x000a_d508,
 ];
-const PREFETCH: u32 = 15;
-/// `load.v 0.xy, texld 0, mov.v1 $0 ^texture, sync, stop`: `gpu_triangle_test`'s.
-const FRAGMENT_SHADER: [u32; 6] = [0x0000_11e6, 0x3f00_3c20, 0x0000_0000, 0x3900_1000, 0x0000_0e4e, 0x0000_07cf];
+const PREFETCH: u32 = 19;
+/// `load.v $0.xyz 0, mov.v1 $1.xy $0.xyxx`; `load.v $1.xyxx, texld 0, mov.v1 $1 ^texture, sync`;
+/// `load.v $2.xyz 0, mul.v0 $0.xyz $1.xyzx $2.zzzz, mov.s1 $0.w $1.w, stop`.
+const FRAGMENT_SHADER: [u32; 15] = [
+    0x0230_1084, 0x7000_3c60, 0x4000_0100, 0x0000_1f0c, //
+    0x0228_11c6, 0x0f04_0404, 0x0000_0000, 0x3900_1000, //
+    0x1000_0e4e, 0x0000_07cf, 0x0000_24a5, 0x7200_3c60, //
+    0x0aa2_0904, 0x6000_e01c, 0x0000_07c8,
+];
 /// The dump's render state, its addresses zero: words 9, 12 and 15 take the fragment
 /// shader's, the texture list's and the varyings'. Word 3 is the textured triangle's with the
-/// depth test on, compare `Less`.
+/// depth test on, compare `Less`; word 10, varying 0 a vec4.
 const RENDER_STATE: [u32; 16] = [
     0x0000_0000, 0x0000_0000, 0xfc3b_1ad2, 0x0000_0033, //
     0xffff_0000, 0xff00_0007, 0xff00_0007, 0x0000_ffff, //
-    0x0000_f807, 0x0000_0000, 0x0000_0001, 0x0000_0000, //
+    0x0000_f807, 0x0000_0000, 0x0000_0000, 0x0000_0000, //
     0x0000_0000, 0x0000_5222, 0x0000_2000, 0x0000_0000,
 ];
-/// The uniforms: the matrix, 16, then the viewport's scale and translation, 8, then the clamp.
+/// The uniforms: the matrix, 16; towards the light, 4; the viewport's scale and translation,
+/// 8; then the shader's constants, the clamp among them, as the dump had them.
 const MATRIX_UNIFORMS: usize = 16;
-const UNIFORMS: usize = MATRIX_UNIFORMS + 8 + 4;
-const CLAMP: [f32; 4] = [-32768.0, 32768.0, 0.0, 0.0];
+const LIGHT_UNIFORM: usize = MATRIX_UNIFORMS;
+const VIEWPORT_UNIFORMS: usize = LIGHT_UNIFORM + 4;
+const CONSTANTS: [f32; 8] = [0.0, DIFFUSE, AMBIENT, -32768.0, 32768.0, 0.0, 0.0, 0.0];
+const UNIFORMS: usize = VIEWPORT_UNIFORMS + 8 + CONSTANTS.len();
 /// Where the varyings follow the positions in [`Shared::gp_output`]: 16 bytes a vertex of
 /// position, rounded up to 64 (lima_draw.c:983-988).
 const VARYINGS_OFFSET: usize = (VERTICES * 16).next_multiple_of(64) / 4;
@@ -203,11 +230,17 @@ fn rotation_x(angle: f32) -> Matrix {
 
 /// The frame's matrix: the cube turned by `y` about the vertical axis, then by `x` about the
 /// horizontal, [`DISTANCE`] in front of the camera, in perspective.
-fn matrix(y: f32, x: f32) -> Matrix {
+fn matrix(y: f32, x: f32) -> (Matrix, Matrix) {
     let mut view = IDENTITY;
     view[14] = -DISTANCE;
     let model = multiply(&rotation_x(x), &rotation_y(y));
-    multiply(&perspective(FOCAL, NEAR, FAR), &multiply(&view, &model))
+    (multiply(&perspective(FOCAL, NEAR, FAR), &multiply(&view, &model)), model)
+}
+
+/// Towards the light in the cube's own space: [`LIGHT`] turned back by `model`'s turns, its
+/// transpose, as the turns are a rotation.
+fn light(model: &Matrix) -> [f32; 3] {
+    core::array::from_fn(|axis| (0..3).map(|k| model[axis * 4 + k] * LIGHT[k]).sum())
 }
 
 /// Cache-line aligned.
@@ -228,19 +261,20 @@ struct Shared {
     streams: [Lines<[u32; STREAM_WORDS]>; mali::PP_COUNT],
     block_addresses: Lines<[u32; TILES]>,
     texels: Lines<[u32; ATLAS_WIDTH * ATLAS_HEIGHT]>,
-    vertex_shader: Lines<[u32; 68]>,
-    fragment_shader: Lines<[u32; 8]>,
-    /// The matrix, rewritten each frame, then the viewport and the clamp.
+    vertex_shader: Lines<[u32; VERTEX_SHADER.len()]>,
+    fragment_shader: Lines<[u32; 16]>,
+    /// The matrix and the light, rewritten each frame, then the viewport and the constants.
     uniforms: Lines<[f32; UNIFORMS]>,
-    attributes: Lines<[u32; 4]>,
+    attributes: Lines<[u32; 6]>,
     varyings: Lines<[u32; 4]>,
     /// The cube's vertices, x, y and z.
     positions: Lines<[f32; VERTICES * 3]>,
     uvs: Lines<[f32; VERTICES * 2]>,
+    normals: Lines<[f32; VERTICES * 3]>,
     /// The PP's texture list, then the descriptor at [`DESCRIPTOR_OFFSET`].
     textures: Lines<[u32; DESCRIPTOR_OFFSET + 16]>,
     /// What the vertex shader writes: x, y, z and 1/w of each vertex, then from
-    /// [`VARYINGS_OFFSET`] its texture coordinates, 16 bytes a vertex.
+    /// [`VARYINGS_OFFSET`] its texture coordinates and brightness, 16 bytes a vertex.
     gp_output: Page<[f32; VARYINGS_OFFSET + VERTICES * 4]>,
     render_state: Lines<[u32; 16]>,
     /// The frame's own render state, for tiles without polygons: zeros.
@@ -260,13 +294,14 @@ static STORE: Store = Store(UnsafeCell::new(Shared {
     streams: [Lines([0; STREAM_WORDS]); mali::PP_COUNT],
     block_addresses: Lines([0; TILES]),
     texels: Lines([0; ATLAS_WIDTH * ATLAS_HEIGHT]),
-    vertex_shader: Lines([0; 68]),
-    fragment_shader: Lines([0; 8]),
+    vertex_shader: Lines([0; VERTEX_SHADER.len()]),
+    fragment_shader: Lines([0; 16]),
     uniforms: Lines([0.0; UNIFORMS]),
-    attributes: Lines([0; 4]),
+    attributes: Lines([0; 6]),
     varyings: Lines([0; 4]),
     positions: Lines([0.0; VERTICES * 3]),
     uvs: Lines([0.0; VERTICES * 2]),
+    normals: Lines([0.0; VERTICES * 3]),
     textures: Lines([0; DESCRIPTOR_OFFSET + 16]),
     gp_output: Page([0.0; VARYINGS_OFFSET + VERTICES * 4]),
     render_state: Lines([0; 16]),
@@ -313,6 +348,7 @@ fn prepare(shared: &mut Shared, screen: &Framebuffer) -> (GpFrame, PpFrame) {
         for (index, corner) in FACE_TRIANGLES.iter().enumerate() {
             let vertex = face * 6 + index;
             shared.positions.0[vertex * 3..vertex * 3 + 3].copy_from_slice(&corners[*corner]);
+            shared.normals.0[vertex * 3..vertex * 3 + 3].copy_from_slice(&NORMALS[face]);
             let uv = CORNER_UVS[*corner];
             shared.uvs.0[vertex * 2] = (cell[0] + uv[0]) * scale[0];
             shared.uvs.0[vertex * 2 + 1] = (cell[1] + uv[1]) * scale[1];
@@ -322,13 +358,21 @@ fn prepare(shared: &mut Shared, screen: &Framebuffer) -> (GpFrame, PpFrame) {
     shared.fragment_shader.0[..FRAGMENT_SHADER.len()].copy_from_slice(&FRAGMENT_SHADER);
     let half = SIZE as f32 / 2.0;
     // y scaled by minus half: the scene's top on the frame's first line.
-    shared.uniforms.0[MATRIX_UNIFORMS..MATRIX_UNIFORMS + 8].copy_from_slice(&[half, -half, 0.5, 0.0, half, half, 0.5, 0.0]);
-    shared.uniforms.0[MATRIX_UNIFORMS + 8..].copy_from_slice(&CLAMP);
+    shared.uniforms.0[VIEWPORT_UNIFORMS..VIEWPORT_UNIFORMS + 8].copy_from_slice(&[half, -half, 0.5, 0.0, half, half, 0.5, 0.0]);
+    shared.uniforms.0[VIEWPORT_UNIFORMS + 8..].copy_from_slice(&CONSTANTS);
     // `stride << 11 | type << 2 | (components - 1)`, type 0 float: lima_draw.c:850-855.
-    shared.attributes.0 = [address(&shared.positions), (12 << 11) | (3 - 1), address(&shared.uvs), (8 << 11) | (2 - 1)];
+    shared.attributes.0 = [
+        address(&shared.positions),
+        (12 << 11) | (3 - 1),
+        address(&shared.uvs),
+        (8 << 11) | (2 - 1),
+        address(&shared.normals),
+        (12 << 11) | (3 - 1),
+    ];
     let varyings = address(&shared.gp_output) + (VARYINGS_OFFSET * 4) as u32;
-    // The position; the texture coordinates, 16 bytes a vertex, two 32-bit components.
-    shared.varyings.0 = [address(&shared.gp_output), 0x8020, varyings, (16 << 11) | (2 - 1)];
+    // The position; the texture coordinates and brightness, 16 bytes a vertex, three 32-bit
+    // components.
+    shared.varyings.0 = [address(&shared.gp_output), 0x8020, varyings, (16 << 11) | (3 - 1)];
     let descriptor = address(&shared.textures) + (DESCRIPTOR_OFFSET * 4) as u32;
     shared.textures.0[0] = descriptor;
     shared.textures.0[DESCRIPTOR_OFFSET..]
@@ -344,8 +388,8 @@ fn prepare(shared: &mut Shared, screen: &Framebuffer) -> (GpFrame, PpFrame) {
     vs.vs_arrays_semaphore_begin();
     vs.vs_uniforms(address(&shared.uniforms), (UNIFORMS * 4) as u32);
     vs.vs_shader(address(&shared.vertex_shader), (VERTEX_SHADER.len() * 4) as u32, PREFETCH);
-    vs.vs_counts(2, 2);
-    vs.vs_attributes(address(&shared.attributes), 2);
+    vs.vs_counts(2, 3);
+    vs.vs_attributes(address(&shared.attributes), 3);
     vs.vs_varyings(address(&shared.varyings), 2);
     vs.vs_draw(VERTICES as u32);
     let vs_end = vs_start + vs.bytes();
@@ -372,9 +416,10 @@ fn prepare(shared: &mut Shared, screen: &Framebuffer) -> (GpFrame, PpFrame) {
     (gp, pp)
 }
 
-/// The frame's matrix into the uniforms, cleaned to DRAM.
-fn place(shared: &mut Shared, m: &Matrix) {
+/// The frame's matrix and light into the uniforms, cleaned to DRAM.
+fn place(shared: &mut Shared, m: &Matrix, light: &[f32; 3]) {
     shared.uniforms.0[..MATRIX_UNIFORMS].copy_from_slice(m);
+    shared.uniforms.0[LIGHT_UNIFORM..LIGHT_UNIFORM + 3].copy_from_slice(light);
     mmu::clean_dcache_range(shared.uniforms.0.as_ptr() as usize, size_of_val(&shared.uniforms));
 }
 
@@ -387,11 +432,20 @@ fn expected(shared: &Shared, m: &Matrix, vertex: usize) -> [f32; 4] {
     [clip[0] / w * half + half, -clip[1] / w * half + half, clip[2] / w * 0.5 + 0.5, 1.0 / w]
 }
 
-/// The first frame's check: every vertex the GP wrote against [`expected`].
-fn check_gp(shared: &Shared, m: &Matrix) -> bool {
+/// The brightness the vertex shader should give vertex `vertex` under the light `toward`.
+fn brightness(shared: &Shared, toward: &[f32; 3], vertex: usize) -> f32 {
+    let normal = &shared.normals.0[vertex * 3..vertex * 3 + 3];
+    AMBIENT + DIFFUSE * normal.iter().zip(toward).map(|(n, l)| n * l).sum::<f32>().max(0.0)
+}
+
+/// The first frame's check: every vertex the GP wrote against [`expected`], and its texture
+/// coordinates and brightness.
+fn check_gp(shared: &Shared, m: &Matrix, toward: &[f32; 3]) -> bool {
     mmu::invalidate_dcache_range(address(&shared.gp_output) as usize, size_of_val(&shared.gp_output));
     let mut worst = [0.0f32; 4];
     let mut first_wrong = None;
+    let (mut worst_varying, mut first_varying) = (0.0f32, None);
+    let lit = (0..VERTICES).filter(|vertex| brightness(shared, toward, *vertex) > AMBIENT).count();
     for vertex in 0..VERTICES {
         let got = &shared.gp_output.0[vertex * 4..vertex * 4 + 4];
         let want = expected(shared, m, vertex);
@@ -404,8 +458,15 @@ fn check_gp(shared: &Shared, m: &Matrix) -> bool {
         if !right && first_wrong.is_none() {
             first_wrong = Some((vertex, [got[0], got[1], got[2], got[3]], want));
         }
+        let varying = &shared.gp_output.0[VARYINGS_OFFSET + vertex * 4..VARYINGS_OFFSET + vertex * 4 + 3];
+        let want = [shared.uvs.0[vertex * 2], shared.uvs.0[vertex * 2 + 1], brightness(shared, toward, vertex)];
+        let error = varying.iter().zip(want).map(|(got, want)| (got - want).abs()).fold(0.0, f32::max);
+        worst_varying = worst_varying.max(error);
+        if error > 1e-4 && first_varying.is_none() {
+            first_varying = Some((vertex, [varying[0], varying[1], varying[2]], want));
+        }
     }
-    let good = first_wrong.is_none();
+    let good = first_wrong.is_none() && first_varying.is_none();
     println!(
         "GP positions of {} vertices: largest error x {:.4}, y {:.4}, depth {:.6}, 1/w {:.6} relative: {}",
         VERTICES,
@@ -415,8 +476,12 @@ fn check_gp(shared: &Shared, m: &Matrix) -> bool {
         worst[3],
         if good { "OK" } else { "MISMATCH" }
     );
+    println!("  texture coordinates and brightness: largest error {:.6}; {} vertices lit", worst_varying, lit);
     if let Some((vertex, got, want)) = first_wrong {
         println!("  vertex {}: {:.3?}, want {:.3?}", vertex, got, want);
+    }
+    if let Some((vertex, got, want)) = first_varying {
+        println!("  vertex {} varying: {:.3?}, want {:.3?}", vertex, got, want);
     }
     good
 }
@@ -568,8 +633,9 @@ fn spin(gpu: Mali, mct: Mct, fimd: &Fimd, shared: &mut Shared, gp: &GpFrame, pp:
         last = now;
         let y = (shown_us % TURN_Y_US) as f32 / TURN_Y_US as f32 * TAU;
         let x = (shown_us % TURN_X_US) as f32 / TURN_X_US as f32 * TAU;
-        let m = matrix(y, x);
-        place(shared, &m);
+        let (m, model) = matrix(y, x);
+        let toward = light(&model);
+        place(shared, &m, &toward);
         match draw(gpu, mct, gp, pp, shared) {
             Ok(times) => stats.add(times),
             Err(what) => {
@@ -579,7 +645,7 @@ fn spin(gpu: Mali, mct: Mct, fimd: &Fimd, shared: &mut Shared, gp: &GpFrame, pp:
         }
         if first {
             first = false;
-            check_gp(shared, &m);
+            check_gp(shared, &m, &toward);
             console::flush();
         }
         let since = (mct.count() - report_start) / COUNTS_PER_US;
@@ -592,7 +658,7 @@ fn spin(gpu: Mali, mct: Mct, fimd: &Fimd, shared: &mut Shared, gp: &GpFrame, pp:
 }
 
 fn main(_args: BootArgs) -> ! {
-    println!("\nGPU cube: 12 textured triangles in perspective, depth tested, {}x{} at {},{} on four PPs", SIZE, SIZE, LEFT, TOP);
+    println!("\nGPU cube: 12 textured, lit triangles in perspective, depth tested, {}x{} at {},{} on four PPs", SIZE, SIZE, LEFT, TOP);
     let mct = Mct::new();
     mct.start();
     mmu::enable();

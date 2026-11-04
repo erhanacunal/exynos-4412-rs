@@ -30,7 +30,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
 - `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom and starts it, instead of fastboot
 - `gpu_triangle_test/`: flat, shaded and textured triangles through the GP and the PPs, with shaders compiled offline by Mesa's lima compiler
-- `gpu_cube_test/`: a textured cube turning in perspective, transformed by the GP's vertex shader, depth tested by the PPs
+- `gpu_cube_test/`: a textured, lit cube turning in perspective, transformed by the GP's vertex shader, depth tested by the PPs
 - `gpu_spin_test/`: a textured square turning on the screen, drawn by the GP and four PPs every frame
 - `gpu_rect_test/`: rectangles filled by the pixel processors with CPU-drawn edges, against the CPU alone, cached and uncached
 - `gpu_test/`: Mali-400 MP4 bring-up: its supply, power domain and clock, what its blocks say they are, their resets and interrupt lines
@@ -1234,6 +1234,15 @@ transform, and the far faces stay hidden:
 
 The 36 vertices and the matrix cost the GP 9 us more than the square's 6; the PPs' time is the
 write-back's, as before.
+
+The cube is lit by one distant light from the upper left front: the vertex shader gives each
+vertex a brightness from its face's normal, a quarter ambient and three quarters
+`max(normal . light, 0)`, and the fragment shader scales the texel by it. The CPU turns the
+light back by the cube's turns each frame, so the normals stay the cube's own. On the board the
+first frame's texture coordinates and brightnesses are the CPU's, and the faces darken as they
+turn away. The fragment shader is now three instructions, not one, and the PPs take 435 to
+500 us (largest 543), more the more of the frame the cube covers: the PPs' shading starts to
+show beside the write-back. 1730 to 1920 frames a second without vsync, 58.1 with.
 
 ## Heap
 
