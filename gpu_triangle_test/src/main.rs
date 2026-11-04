@@ -1,7 +1,8 @@
 //! Triangles through the Mali-400: its geometry processor runs the vertex shader and the PLBU,
 //! which bins the triangle into the polygon lists of the tiles; a pixel processor then renders
-//! the tiles from those lists with the fragment shader. Two scenes: a flat orange triangle, and
-//! one whose corners are red, green and blue, the colours interpolated between them.
+//! the tiles from those lists with the fragment shader. Three scenes: a flat orange triangle,
+//! one whose corners are red, green and blue, the colours interpolated between them, and one
+//! with a 16 x 16 texture on it, sampled nearest.
 //!
 //! The shaders are compiled offline by Mesa 25.3.3's lima compiler (MIT), run on a PC under
 //! `drm-shim` with `LIMA_DEBUG=dump`, from
@@ -13,7 +14,13 @@
 //! // Shaded
 //! attribute vec4 pos; attribute vec4 col; varying vec4 v; void main() { v = col; gl_Position = pos; }
 //! precision mediump float; varying vec4 v; void main() { gl_FragColor = v; }
+//! // Textured
+//! attribute vec4 pos; attribute vec2 uv; varying vec2 v; void main() { v = uv; gl_Position = pos; }
+//! precision mediump float; uniform sampler2D t; varying vec2 v;
+//! void main() { gl_FragColor = texture2D(t, v); }
 //! ```
+//!
+//! The texture's descriptor is `mali::texture_rgba8888`'s, as Mesa packed it for the dump.
 //!
 //! The command lists are built here with `mali::Commands`, in the order Mesa's driver builds
 //! them.
@@ -25,10 +32,12 @@
 //! 1. GPU on, the GP and the PPs reset, their MMUs paging over DRAM.
 //! 2. For each scene, a 64 x 64 frame of 4 x 4 tiles into a buffer of its own. The GP: both
 //!    lists end, without an error; the positions the shader wrote are the viewport's transform
-//!    of the three vertices, and the colours it passed on are the vertices' own; the polygon list
+//!    of the three vertices, and the colours or texture coordinates it passed on are the
+//!    vertices' own; the polygon list
 //!    blocks of the tiles the triangle covers list it. A pattern marks what the GP left alone.
-//!    Then PP0: every pixel checked against the triangle, the clear grey outside; those within a
-//!    pixel of an edge are counted apart. The target is filled with the pattern before each
+//!    Then the PPs: every pixel checked against the triangle, the clear grey outside; those
+//!    within a pixel of an edge, and the textured ones within a tenth of a texel of a texel's
+//!    edge, are counted apart. The target is filled with the pattern before each
 //!    frame, so what is checked is the frame's.
 //! 3. If all hold: the screen on, and each scene drawn 256 x 256 on it, side by side, checked
 //!    the same; one PP and four timed.
@@ -78,6 +87,32 @@ const TOLERANCE: f32 = 2.0;
 const VERTICES: [f32; 6] = [-0.75, -0.75, 0.75, -0.75, 0.0, 0.75];
 /// The shaded triangle's corners: red, green, blue, opaque.
 const COLORS: [f32; 12] = [1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0];
+/// The textured triangle's corners in the texture: its last line's ends, and its first line's
+/// middle at the apex, so that the texture's first line is on top.
+const UVS: [f32; 6] = [0.0, 1.0, 1.0, 1.0, 0.5, 0.0];
+/// Texels on a side of the texture.
+const TEXELS: usize = 16;
+/// Of a texel, how near its edge the texture coordinates of a pixel leave it unchecked.
+const TEXEL_MARGIN: f32 = 0.1;
+
+/// The texture's texel at column `x`, line `y`, as the screen's pixels are: alpha, red, green,
+/// blue from the top byte. Red grows to the right, green down, and blue is a checkerboard of
+/// 4 x 4 texel squares.
+fn texel(x: usize, y: usize) -> u32 {
+    let blue = if (x ^ y) & 4 != 0 { 0xFF } else { 0 };
+    0xFF00_0000 | ((x as u32 * 17) << 16) | ((y as u32 * 17) << 8) | blue
+}
+
+/// What the scene's fragments take.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// A uniform colour.
+    Flat,
+    /// The colour varying.
+    Shaded,
+    /// The texture, at the texture coordinate varying.
+    Textured,
+}
 
 /// A pair of shaders from Mesa, and what Mesa's driver put around them.
 struct Shaders {
@@ -88,10 +123,10 @@ struct Shaders {
     prefetch: u32,
     fragment: &'static [u32],
     /// The render state of the dump, its addresses zero: word 9 takes the fragment shader's,
-    /// with the length of its first instruction (lima_draw.c:752-753); words 11 and 15 those of
-    /// the uniforms and the varyings, when there are.
+    /// with the length of its first instruction (lima_draw.c:752-753); words 11, 12 and 15
+    /// those of the uniforms, the textures and the varyings, when there are.
     render_state: [u32; 16],
-    shaded: bool,
+    kind: Kind,
 }
 
 /// The flat scene. The vertex shader: a reciprocal of `w`, a clamp to the constants, the
@@ -117,7 +152,7 @@ const FLAT: Shaders = Shaders {
         0x0000_f807, 0x0000_0000, 0x0000_0000, 0x0000_0003, //
         0x0000_0000, 0x0000_1280, 0x0001_2000, 0x0000_0000,
     ],
-    shaded: false,
+    kind: Kind::Flat,
 };
 
 /// The shaded scene. The vertex shader also moves the colour attribute to the varying,
@@ -143,7 +178,34 @@ const SHADED: Shaders = Shaders {
         0x0000_f807, 0x0000_0000, 0x0000_0000, 0x0000_0000, //
         0x0000_0000, 0x0000_1202, 0x0000_2000, 0x0000_0000,
     ],
-    shaded: true,
+    kind: Kind::Shaded,
+};
+
+/// The textured scene. The vertex shader moves the texture coordinate attribute to the
+/// varying, `v1.xy`. The fragment shader: `load.v 0.xy, texld 0, mov.v1 $0 ^texture, sync,
+/// stop`. Its render state: varying 0 a vec2 (word 10), one sampler (word 13).
+const TEXTURED: Shaders = Shaders {
+    name: "textured",
+    vertex: &[
+        0xad4a_d463, 0x4380_02b5, 0x0147_ff80, 0x000a_8d30, //
+        0xad41_da56, 0x4380_02b5, 0x0007_ff80, 0x000a_d510, //
+        0xad4a_d6b5, 0x0380_02b5, 0x0007_ff80, 0x000a_d500, //
+        0x668a_d6b5, 0x0380_82b5, 0x003f_ff80, 0x000a_d500, //
+        0x6c0a_d6b5, 0x0380_82b5, 0x0037_ff80, 0x000a_d500, //
+        0xb408_0a01, 0x4380_0ab5, 0x0007_ff80, 0x000a_d500, //
+        0xb307_4e00, 0x4380_2acd, 0x0247_ff80, 0x0008_4900, //
+        0x74c8_4a36, 0x4780_62c0, 0x4647_f080, 0x0000_d100, //
+        0x64cb_42d6, 0x0380_41b2, 0x4002_6400, 0x000a_d508,
+    ],
+    prefetch: 7,
+    fragment: &[0x0000_11e6, 0x3f00_3c20, 0x0000_0000, 0x3900_1000, 0x0000_0e4e, 0x0000_07cf],
+    render_state: [
+        0x0000_0000, 0x0000_0000, 0xfc3b_1ad2, 0x0000_003e, //
+        0xffff_0000, 0xff00_0007, 0xff00_0007, 0x0000_ffff, //
+        0x0000_f807, 0x0000_0000, 0x0000_0001, 0x0000_0000, //
+        0x0000_0000, 0x0000_5222, 0x0000_2000, 0x0000_0000,
+    ],
+    kind: Kind::Textured,
 };
 
 /// The flat colour uniform, orange, in half floats: 1.0, 0.5, 0.0, 1.0.
@@ -155,6 +217,9 @@ const CLAMP: [f32; 4] = [-32768.0, 32768.0, 0.0, 0.0];
 /// Where the varyings follow the positions in [`Shared::gp_output`], as Mesa lays them out:
 /// 16 bytes a vertex of position, rounded up to 64 (lima_draw.c:983-988).
 const VARYINGS_OFFSET: usize = 16;
+
+/// Words of the texture list before its descriptor: `lima_tex_list_size`, 64 bytes.
+const DESCRIPTOR_OFFSET: usize = 16;
 
 /// Cache-line aligned, so that the GP's outputs can be dropped from the caches alone.
 #[derive(Clone, Copy)]
@@ -176,15 +241,21 @@ struct Shared {
     streams: [Lines<[u32; STREAM_WORDS]>; mali::PP_COUNT],
     block_addresses: Lines<[u32; MAX_TILES]>,
     vertex_shader: Lines<[u32; 36]>,
-    fragment_shader: Lines<[u32; 4]>,
+    fragment_shader: Lines<[u32; 8]>,
     /// The viewport's scale and translation (lima_draw.c:877-882), then [`CLAMP`].
     uniforms: Lines<[f32; 12]>,
     attributes: Lines<[u32; 4]>,
     varyings: Lines<[u32; 4]>,
     vertices: Lines<[f32; 6]>,
     colors: Lines<[f32; 12]>,
+    uvs: Lines<[f32; 6]>,
+    /// The texture, red in each texel's first byte: [`texel`]'s, its bytes in `GL_RGBA` order.
+    texels: Lines<[u32; TEXELS * TEXELS]>,
+    /// The PP's texture list, the address of each descriptor, then the one descriptor at
+    /// [`DESCRIPTOR_OFFSET`], as Mesa lays them out (lima_texture.c:280-293).
+    textures: Lines<[u32; DESCRIPTOR_OFFSET + 16]>,
     /// What the vertex shader writes: x, y, z and 1/w of each vertex, then from
-    /// [`VARYINGS_OFFSET`] its colour, 16 bytes a vertex.
+    /// [`VARYINGS_OFFSET`] its colour or texture coordinates, 16 bytes a vertex.
     gp_output: Page<[f32; 32]>,
     render_state: Lines<[u32; 16]>,
     /// The frame's own render state, for tiles without polygons: zeros.
@@ -207,12 +278,15 @@ static STORE: Store = Store(UnsafeCell::new(Shared {
     streams: [Lines([0; STREAM_WORDS]); mali::PP_COUNT],
     block_addresses: Lines([0; MAX_TILES]),
     vertex_shader: Lines([0; 36]),
-    fragment_shader: Lines([0; 4]),
+    fragment_shader: Lines([0; 8]),
     uniforms: Lines([0.0; 12]),
     attributes: Lines([0; 4]),
     varyings: Lines([0; 4]),
     vertices: Lines([0.0; 6]),
     colors: Lines([0.0; 12]),
+    uvs: Lines([0.0; 6]),
+    texels: Lines([0; TEXELS * TEXELS]),
+    textures: Lines([0; DESCRIPTOR_OFFSET + 16]),
     gp_output: Page([0.0; 32]),
     render_state: Lines([0; 16]),
     frame_state: Lines([0; 16]),
@@ -272,21 +346,35 @@ fn prepare(shared: &mut Shared, scene: &Shaders, size: usize) -> GpFrame {
     shared.uniforms.0[8..].copy_from_slice(&CLAMP);
     shared.vertices.0 = VERTICES;
     shared.colors.0 = COLORS;
+    shared.uvs.0 = UVS;
+    for (index, slot) in shared.texels.0.iter_mut().enumerate() {
+        let [alpha, red, green, blue] = texel(index % TEXELS, index / TEXELS).to_be_bytes();
+        *slot = u32::from_le_bytes([red, green, blue, alpha]);
+    }
+    let descriptor = address(&shared.textures) + (DESCRIPTOR_OFFSET * 4) as u32;
+    shared.textures.0[0] = descriptor;
+    shared.textures.0[DESCRIPTOR_OFFSET..]
+        .copy_from_slice(&mali::texture_rgba8888(address(&shared.texels), TEXELS as u32, TEXELS as u32));
+    // The second attribute and its varying: the colour, or the texture coordinates.
+    let (second, components) = if scene.kind == Kind::Textured { (address(&shared.uvs), 2) } else { (address(&shared.colors), 4) };
     // `stride << 11 | type << 2 | (components - 1)`, type 0 float: lima_draw.c:850-855.
-    shared.attributes.0 = [address(&shared.vertices), (8 << 11) | (2 - 1), address(&shared.colors), (16 << 11) | (4 - 1)];
+    shared.attributes.0 = [address(&shared.vertices), (8 << 11) | (2 - 1), second, ((components * 4) << 11) | (components - 1)];
     let varyings = address(&shared.gp_output) + (VARYINGS_OFFSET * 4) as u32;
-    // The position; the colour, 16 bytes a vertex, four 32-bit components: lima_draw.c:1006-1020.
-    shared.varyings.0 = [address(&shared.gp_output), 0x8020, varyings, (16 << 11) | (4 - 1)];
+    // The position; the varying, 16 bytes a vertex, of 32-bit components: lima_draw.c:1006-1020.
+    shared.varyings.0 = [address(&shared.gp_output), 0x8020, varyings, (16 << 11) | (components - 1)];
     shared.color.0 = COLOR;
     shared.color_address.0 = [address(&shared.color)];
     shared.render_state.0 = scene.render_state;
     shared.render_state.0[9] = address(&shared.fragment_shader) | (scene.fragment[0] & 0x1F);
-    if scene.shaded {
-        shared.render_state.0[15] = varyings;
-    } else {
-        shared.render_state.0[11] |= address(&shared.color_address);
+    match scene.kind {
+        Kind::Flat => shared.render_state.0[11] |= address(&shared.color_address),
+        Kind::Shaded => shared.render_state.0[15] = varyings,
+        Kind::Textured => {
+            shared.render_state.0[12] = address(&shared.textures);
+            shared.render_state.0[15] = varyings;
+        }
     }
-    let (attributes, outputs) = if scene.shaded { (2, 2) } else { (1, 1) };
+    let (attributes, outputs) = if scene.kind == Kind::Flat { (1, 1) } else { (2, 2) };
 
     // lima_draw.c:287-334.
     let vs_start = address(&shared.vs_list);
@@ -366,6 +454,12 @@ fn shade(size: usize, x: f32, y: f32) -> [f32; 3] {
     core::array::from_fn(|channel| (0..3).map(|corner| w[corner] * COLORS[corner * 4 + channel]).sum::<f32>() * 255.0)
 }
 
+/// The interpolated texture coordinates at a point, in texels.
+fn texture_point(size: usize, x: f32, y: f32) -> [f32; 2] {
+    let w = weights(size, x, y);
+    core::array::from_fn(|axis| (0..3).map(|corner| w[corner] * UVS[corner * 2 + axis]).sum::<f32>() * TEXELS as f32)
+}
+
 /// Whether the triangle covers the centre of any pixel of tile `tile`.
 fn covered(size: usize, tile: usize) -> bool {
     let tiles_x = size / mali::TILE;
@@ -386,8 +480,10 @@ fn check_gp(shared: &Shared, scene: &Shaders, size: usize, report: bool) -> bool
         let want = expected(vertex, size);
         let mut right = got.iter().zip(want).all(|(got, want)| (got - want).abs() < 0.01);
         let color = &shared.gp_output.0[VARYINGS_OFFSET + vertex * 4..VARYINGS_OFFSET + vertex * 4 + 4];
-        if scene.shaded {
-            right &= color.iter().zip(&COLORS[vertex * 4..]).all(|(got, want)| (got - want).abs() < 0.001);
+        match scene.kind {
+            Kind::Flat => {}
+            Kind::Shaded => right &= color.iter().zip(&COLORS[vertex * 4..]).all(|(got, want)| (got - want).abs() < 0.001),
+            Kind::Textured => right &= color[..2].iter().zip(&UVS[vertex * 2..]).all(|(got, want)| (got - want).abs() < 0.001),
         }
         good &= right;
         if !report && right {
@@ -404,11 +500,15 @@ fn check_gp(shared: &Shared, scene: &Shaders, size: usize, report: bool) -> bool
             want[1],
             want[2],
             want[3],
-            if scene.shaded { "; colour" } else { "" },
+            match scene.kind {
+                Kind::Flat => "",
+                Kind::Shaded => "; colour",
+                Kind::Textured => "; texture coordinates",
+            },
             verdict(right)
         );
-        if scene.shaded {
-            println!("  colour {:.3} {:.3} {:.3} {:.3}", color[0], color[1], color[2], color[3]);
+        if scene.kind != Kind::Flat {
+            println!("  varying {:.3} {:.3} {:.3} {:.3}", color[0], color[1], color[2], color[3]);
         }
     }
     let tiles = (size / mali::TILE) * (size / mali::TILE);
@@ -465,8 +565,10 @@ struct Count {
     edge: usize,
     /// Flat: pixels inside written with green 0x7F.
     dithered: usize,
-    /// Shaded: the largest channel error inside, in 1/255.
+    /// Shaded and textured: the largest channel error inside, in 1/255.
     worst: f32,
+    /// Textured: pixels inside near a texel's edge, not checked.
+    texel_edge: usize,
     first_wrong: Option<(usize, usize, u32)>,
 }
 
@@ -494,10 +596,27 @@ fn count(pixels: &[u32], line: usize, size: usize, scene: &Shaders, flipped: boo
                 count.edge += 1;
                 continue;
             }
+            let want = match scene.kind {
+                _ if depth < 0.0 => None,
+                Kind::Flat => None,
+                Kind::Shaded => Some(shade(size, cx, cy)),
+                Kind::Textured => {
+                    let [u, v] = texture_point(size, cx, cy);
+                    let near_edge = |at: f32| {
+                        let within = at - (at as usize) as f32;
+                        !(TEXEL_MARGIN..=1.0 - TEXEL_MARGIN).contains(&within)
+                    };
+                    if near_edge(u) || near_edge(v) {
+                        count.texel_edge += 1;
+                        continue;
+                    }
+                    let last = TEXELS - 1;
+                    Some(channels(texel((u as usize).min(last), (v as usize).min(last))))
+                }
+            };
             let right = if depth < 0.0 {
                 pixel == GREY
-            } else if scene.shaded {
-                let want = shade(size, cx, cy);
+            } else if let Some(want) = want {
                 let error = channels(pixel).iter().zip(want).map(|(got, want)| (got - want).abs()).fold(0.0, f32::max);
                 count.worst = count.worst.max(error);
                 error <= TOLERANCE && pixel >> 24 == 0xFF
@@ -528,17 +647,18 @@ fn check_pixels(pixels: &[u32], line: usize, size: usize, scene: &Shaders) -> bo
         "Pixels {}x{}, {}: inside wrong {}, outside wrong {}, first {:x?}",
         size, size, way, best.inside_wrong, best.outside_wrong, best.first_wrong
     );
-    let detail = if scene.shaded { "largest channel error" } else { "green 0x7f on" };
-    let value = if scene.shaded { best.worst } else { best.dithered as f32 };
+    let detail = if scene.kind == Kind::Flat { "green 0x7f on" } else { "largest channel error" };
+    let value = if scene.kind == Kind::Flat { best.dithered as f32 } else { best.worst };
     println!(
-        "  {} {:.1} inside; {} at the edges not checked; the other way up {} wrong: {}",
+        "  {} {:.1} inside; {} at the edges, {} at texel edges not checked; the other way up {} wrong: {}",
         detail,
         value,
         best.edge,
+        best.texel_edge,
         down.wrong().max(up.wrong()),
         verdict(good)
     );
-    if scene.shaded {
+    if scene.kind != Kind::Flat {
         // The corners as drawn: a pixel inside near each, and the centre.
         let points = [(0.25, 0.8), (0.75, 0.8), (0.5, 0.25), (0.5, 0.6)];
         let mut text = [0u32; 4];
@@ -662,9 +782,13 @@ fn run(gpu: Mali, mct: Mct, shared: &mut Shared, screen: Option<&mut Framebuffer
     let mut good = small(gpu, mct, shared, &FLAT, 1);
     good &= small(gpu, mct, shared, &SHADED, 1);
     good &= small(gpu, mct, shared, &SHADED, mali::PP_COUNT);
+    good &= small(gpu, mct, shared, &TEXTURED, 1);
+    good &= small(gpu, mct, shared, &TEXTURED, mali::PP_COUNT);
     if good && let Some(screen) = screen {
-        // Two columns, even for the write-back: a quarter and three quarters across.
-        for (scene, x) in [(&FLAT, WIDTH / 4 - LARGE / 2), (&SHADED, WIDTH * 3 / 4 - LARGE / 2)] {
+        // Three columns, centred near a sixth, a half and five sixths across: on a tile's
+        // column, as the PP writes from its target rounded down to 8 bytes (`PpFrame::clear`).
+        for (column, scene) in [&FLAT, &SHADED, &TEXTURED].into_iter().enumerate() {
+            let x = (WIDTH * (2 * column + 1) / 6 - LARGE / 2) / mali::TILE * mali::TILE;
             let one = large(gpu, mct, shared, scene, screen, x, 1);
             let four = large(gpu, mct, shared, scene, screen, x, mali::PP_COUNT);
             if let (Some(one), Some(four)) = (one, four) {
@@ -721,7 +845,7 @@ fn wait_keys(gpu: Mali, mct: Mct, shared: &mut Shared, mut screen: Option<Frameb
 }
 
 fn main(_args: BootArgs) -> ! {
-    println!("\nGPU triangles: Mali-400 GP and PPs, flat and shaded");
+    println!("\nGPU triangles: Mali-400 GP and PPs, flat, shaded and textured");
     let mct = Mct::new();
     mct.start();
     mmu::enable();

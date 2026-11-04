@@ -29,7 +29,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `wifi_async_test/`: the same chip under Embassy as an `embassy-net` device, its runner task woken by the host wake line
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
 - `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom and starts it, instead of fastboot
-- `gpu_triangle_test/`: one triangle through the GP and a PP, with shaders compiled offline by Mesa's lima compiler
+- `gpu_triangle_test/`: flat, shaded and textured triangles through the GP and the PPs, with shaders compiled offline by Mesa's lima compiler
 - `gpu_rect_test/`: rectangles filled by the pixel processors with CPU-drawn edges, against the CPU alone, cached and uncached
 - `gpu_test/`: Mali-400 MP4 bring-up: its supply, power domain and clock, what its blocks say they are, their resets and interrupt lines
 - `heap_test/`: the TLSF global allocator: collections, timings, 48 MiB, then four cores and their interrupt handlers allocating at once
@@ -1138,9 +1138,9 @@ for what the CPU cannot do as fast: triangles, textures, blending.
 
 ### First triangle
 
-`gpu_triangle_test` draws one flat orange triangle through the whole pipeline: the GP runs the
-vertex shader and the PLBU, which bins the triangle into each tile's polygon list, and a PP
-renders the tiles from those lists with the fragment shader. The shaders are compiled offline
+`gpu_triangle_test` draws triangles through the whole pipeline, first a flat orange one: the
+GP runs the vertex shader and the PLBU, which bins the triangle into each tile's polygon list,
+and a PP renders the tiles from those lists with the fragment shader. The shaders are compiled offline
 by Mesa 25.3.3's lima compiler (MIT), run on a PC with `drm-shim` and `LIMA_DEBUG=dump`; the
 binaries and the render state are copied from that dump into the application. The command
 lists are built on the board with `mali::Commands`, whose commands are those of Mesa's
@@ -1179,6 +1179,19 @@ The 256 x 256 frame is 256 KiB of write-back: four PPs write about 1.0 GB/s, nea
 the four-PP screen clear, so DRAM, not the shaders, is the likely limit. On the 64 x 64 frame,
 16 tiles, four PPs take longer than one; the cause is not known, perhaps starting and waiting on
 each PP in turn.
+
+A third scene samples a texture: 16 x 16 RGBA8888 texels in lines, nearest, clamped to the
+edges, its descriptor from `mali::texture_rgba8888`, which packs it as Mesa does; the render
+state points the PP at the texture list. The vertex shader passes texture coordinates on as it
+did the colours. On the board every pixel checked is its texel's within 1/255 (those within a
+tenth of a texel of a texel's edge are not checked), in both sizes, on one PP and four, with the
+flat scene's times: 387 us and 261 us at 256 x 256.
+
+Where the frame starts matters. The PP writes from its target rounded down to 8 bytes
+(`PpFrame::clear`): a frame at column 85 of the screen came out a pixel to the left, and took
+540 us on one PP. A target off a 64-byte line is slow too: at column 938, 8- but not 64-byte
+aligned, the textured frame took 879 us; at column 928, 386 us. The test puts its frames on
+tile columns.
 
 The GP and the PP need a soft reset before each frame, as Linux gives them after each job:
 without one, the PP drew the shaded scene after the flat one in black, every pixel inside

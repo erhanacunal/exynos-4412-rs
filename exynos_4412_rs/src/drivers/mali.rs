@@ -845,6 +845,41 @@ pub const PLB_BLOCK: usize = 512;
 /// The most blocks a Mali-400 frame takes: lima_screen.c:362.
 pub const PLB_MAX_BLOCKS: usize = 512;
 
+/// Bytes of a texture descriptor: `Texture Descriptor`, lima genxml/common.xml.
+pub const TEXTURE_DESCRIPTOR_BYTES: usize = 64;
+
+/// The texture descriptor of a 2D texture of one level, `width` x `height` RGBA8888 texels in
+/// lines, red in the first byte, at `texels`: nearest filtering, clamped to its edges, as Mesa's
+/// driver packs one for `GL_RGBA`/`GL_UNSIGNED_BYTE`, `GL_NEAREST`, `GL_CLAMP_TO_EDGE`
+/// (lima_texture.c:60-100, 131-243; fields from genxml/common.xml).
+///
+/// # Panics
+///
+/// If `texels` is not 64-byte aligned: the descriptor holds the address shifted right by 6.
+pub fn texture_rgba8888(texels: u32, width: u32, height: u32) -> [u32; 16] {
+    assert!(texels.is_multiple_of(64), "texels 64-byte aligned");
+    const FORMAT_RGBA_8888: u32 = 0x16;
+    const SWAP_RB: u32 = 1 << 7;
+    const DIM_2D: u32 = 1 << 10;
+    // Lod Bias, signed, 4 fraction bits, from bit 28: 0.5, Mesa's for nearest filtering.
+    const LOD_BIAS_HALF: u32 = 8 << 28;
+    const HAS_STRIDE: u32 = 1 << 8;
+    const MIN_NEAREST: u32 = 1 << 11;
+    const MAG_NEAREST: u32 = 1 << 12;
+    const CLAMP_TO_EDGE: u32 = 1;
+    let mip0 = texels >> 6;
+    let mut descriptor = [0; 16];
+    descriptor[0] = FORMAT_RGBA_8888 | SWAP_RB | ((width * 4) << 16);
+    descriptor[1] = DIM_2D | LOD_BIAS_HALF;
+    // Wrap S at bit 13, T at 16, R repeat; the width from bit 22, its high bits in word 3.
+    descriptor[2] = HAS_STRIDE | MIN_NEAREST | MAG_NEAREST | (CLAMP_TO_EDGE << 13) | (CLAMP_TO_EDGE << 16) | (width << 22);
+    // Depth 1; layout linear, 0, in word 6.
+    descriptor[3] = (width >> 10) | (height << 3) | (1 << 16);
+    descriptor[6] = mip0 << 30;
+    descriptor[7] = mip0 >> 2;
+    descriptor
+}
+
 /// A GP command list being written into `words`, a command being two of them. The commands and
 /// their names are those of lima_gpu.h:59-153 in Mesa, `VS_CMD_*` and `PLBU_CMD_*`; the order a
 /// list wants is that of lima_draw.c:287-439 and lima_job.c:406-434.
