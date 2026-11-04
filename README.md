@@ -27,6 +27,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `fat_test/`: FAT32 on CACHE with the `embedded-sdmmc` crate: formats it if needed, writes, reads and lists files
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `wifi_async_test/`: the same chip under Embassy as an `embassy-net` device, its runner task woken by the host wake line
+- `gpu_test/`: Mali-400 MP4 bring-up: its supply, power domain and clock, what its blocks say they are, their resets and interrupt lines
 - `heap_test/`: the TLSF global allocator: collections, timings, 48 MiB, then four cores and their interrupt handlers allocating at once
 - `async_test/`: Embassy on all four cores: timers, tasks, and channels between the cores
 - `mmc_async_test/`: async eMMC: reads and writes awaited on the controller's interrupt, from CPU0 and CPU1
@@ -1011,6 +1012,46 @@ With read-ahead too, on the fourth boot:
 On the fifth boot, with the RTC: `BOOTS.TXT` stamped 2026-11-03 12:36:28, local time, and
 `LOGS/BOOT.LOG` got `boot 5 at 2026-11-03 12:36:28`. `LOGS`, made on the first boot, keeps
 2026-01-01.
+
+## GPU
+
+The Mali-400 MP4 at `0x13000000` (`exynos4.dtsi:398`): a geometry processor (GP), four pixel
+processors (PP0-3), each with an MMU, an L2 cache and a power unit. `drivers::mali` takes the
+register map from Linux's `lima` driver, and the interrupts from `exynos4412.dtsi:729-750`.
+
+- **Supply:** BUCK4 `vdd_g3d` (`mali-supply`), always on. BUCK2 to BUCK4 have eight voltage
+  registers each, chosen by the pins `gpl0-0` to `gpl0-2`. The DTS drives them to select `DVS2`;
+  U-Boot leaves them inputs, read low, which selects `DVS1`. `Max77686::dvs_buck` reads the
+  registers, nothing sets them yet.
+- **Power and clock:** `Mali::power_on` turns on the domain at `0x10023C60`, opens `CLK_G3D`
+  and runs `sclk_g3d` from the MPLL. 160 MHz at 875 mV is the lowest operating point
+  (`exynos4412.dtsi:756-771`); the vendor kernel ran up to 440 MHz from the VPLL.
+- **What it says:** `identify` reads the GP's and the PPs' `VERSION` and the L2's `SIZE`;
+  `pmu_power_up` brings up the blocks the GPU's own power unit keeps off.
+- **Resets:** the GP's and the PPs' soft resets, each MMU's hard reset after it takes a table
+  address, and emptying the L2.
+
+`make img APP=gpu_test`: reads the supply and the pins, powers the GPU at 160 MHz only if the
+supply is at least 875 mV, identifies the blocks before and after the power unit, resets each
+with its completion left on its interrupt line for the GIC to see, then the MMUs and the L2.
+On the board:
+
+| Check | Result |
+|---|---|
+| BUCK4 | on; `DVS1` 1.100 V, `DVS2` to `DVS8` 1.000 V; `gpl0-0` to `gpl0-6` inputs, low: `DVS1` |
+| As U-Boot left it | domain on (`0x60007`), every `GATE_IP_G3D` gate open, `sclk_g3d` 50 MHz from the MPLL (divider 16) |
+| After `power_on` | `sclk_g3d` 160 MHz (divider 5) |
+| GP | `0x0B070101`: Mali-400 r1p1 |
+| PP0 to PP3 | `0xCD070101` each: Mali-400 r1p1 |
+| L2 | `0x06110206`: 128 KiB, 4-way, 64-byte lines, 64-bit bus |
+| GPU power unit | status 0, every block on already; nothing to power up |
+| Resets | GP and PP0-3 under 1 us each; GIC 159 and 155-158 pending after, not after clearing |
+| MMUs | GP's and PP0-3's take a table address and reset; `STATUS` `0x18`, idle, paging off |
+| L2 emptied | under 1 us |
+
+The power unit's status reads 0 whether every block is on or there is no power unit: the vendor
+kernel does not list one. The supply is at 1.1 V, above the 1.025 V of the highest operating
+point, 440 MHz.
 
 ## Heap
 

@@ -19,8 +19,10 @@
 //! A rail at the wrong voltage can damage what it feeds, and turning off the wrong one can
 //! stop the board: some LDOs feed the CPU, the memory and the eMMC. This driver checks only
 //! that the voltage is one the LDO can produce. The caller must take the voltage from the
-//! DTS. Of the bucks, only the voltage of BUCK5 to BUCK9 is covered, and the GPIO control of
-//! BUCK8, BUCK9 and LDO20 to LDO22 (`max77686-regulator.c:103-107`) is not.
+//! DTS. Of the bucks, only the voltage of BUCK5 to BUCK9 can be set, and the GPIO control of
+//! BUCK8, BUCK9 and LDO20 to LDO22 (`max77686-regulator.c:103-107`) is not covered. BUCK2 to
+//! BUCK4 can only be read, [`Max77686::dvs_buck`]: each has eight voltage registers, and pins
+//! of the SoC choose which one counts.
 
 use crate::drivers::i2c::{self, I2c};
 use crate::drivers::timer::Mct;
@@ -47,6 +49,17 @@ const BUCK_MIN_MILLIVOLTS: u16 = 750;
 const BUCK_STEP_MILLIVOLTS: u16 = 50;
 /// max77686-regulator.c:62, which `regulator_desc_buck` uses as `.vsel_mask`.
 const BUCK_VSEL_MASK: u8 = VSEL_MASK;
+/// max77686-private.h:38,40: `MAX77686_REG_BUCK2CTRL1` and `MAX77686_REG_BUCK2DVS1`. BUCK3 and
+/// BUCK4 follow ten registers apart: max77686-regulator.c:432,434.
+const REG_BUCK2_CTRL1: u8 = 0x12;
+const REG_BUCK2_DVS1: u8 = 0x14;
+/// The bucks with eight voltage registers: `regulator_desc_buck_dvs`, max77686-regulator.c:471-473.
+const DVS_BUCKS: core::ops::RangeInclusive<u8> = 2..=4;
+/// max77686-regulator.c:33-34.
+const DVS_MIN_MICROVOLTS: u32 = 600_000;
+const DVS_STEP_MICROVOLTS: u32 = 12_500;
+/// max77686-regulator.c:59: where BUCK2 to BUCK4 keep their mode in `CTRL1`.
+const OPMODE_BUCK234_SHIFT: u32 = 4;
 /// Number of LDOs: max77686-regulator.c:68.
 const LDO_COUNT: u8 = 26;
 
@@ -218,6 +231,44 @@ impl Max77686 {
         self.i2c.write(ADDRESS, &[register, wrote])?;
         let read = self.read(register)?;
         if read == wrote { Ok(()) } else { Err(Error::ReadBack { wrote, read }) }
+    }
+}
+
+/// BUCK2, BUCK3 or BUCK4 as the PMIC has it: [`Max77686::dvs_buck`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DvsBuck {
+    /// `BUCKnCTRL1`.
+    pub ctrl1: u8,
+    /// `BUCKnDVS1` to `BUCKnDVS8`: the pins `SET1` to `SET3` choose one.
+    pub dvs: [u8; 8],
+}
+
+impl DvsBuck {
+    /// The mode in `CTRL1`: 3 is on, 0 off, 1 on or off with `PWRREQ`, 2 low power
+    /// (max77686-regulator.c:47-56).
+    pub const fn mode(&self) -> u8 {
+        (self.ctrl1 >> OPMODE_BUCK234_SHIFT) & 3
+    }
+
+    /// The voltage of `DVS(index + 1)`, in microvolts.
+    pub const fn microvolts(&self, index: usize) -> u32 {
+        DVS_MIN_MICROVOLTS + self.dvs[index] as u32 * DVS_STEP_MICROVOLTS
+    }
+}
+
+impl Max77686 {
+    /// The control and the eight voltage registers of BUCK `number`, from 2 to 4.
+    pub fn dvs_buck(&self, number: u8) -> Result<DvsBuck, Error> {
+        if !DVS_BUCKS.contains(&number) {
+            return Err(Error::NoSuchBuck);
+        }
+        let offset = (number - 2) * 10;
+        let ctrl1 = self.read(REG_BUCK2_CTRL1 + offset)?;
+        let mut dvs = [0; 8];
+        for (index, value) in dvs.iter_mut().enumerate() {
+            *value = self.read(REG_BUCK2_DVS1 + offset + index as u8)?;
+        }
+        Ok(DvsBuck { ctrl1, dvs })
     }
 }
 

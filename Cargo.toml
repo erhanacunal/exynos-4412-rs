@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["async_test", "audio_async_test", "audio_dma_test", "audio_test", "display_test", "exynos_4412_rs", "ext4_test", "fat_test", "gpio_test", "heap_test", "hello_world", "i2c_test", "irq_timer", "l2_test", "mmc_async_test", "mmc_test", "mmc_write_test", "mmu_test", "pmic_test", "power_test", "rtc_test", "smp_test", "timer_test", "touch_async_test", "touch_test", "uart_tx_test", "wifi_async_test", "wifi_test"]
+members = ["async_test", "audio_async_test", "audio_dma_test", "audio_test", "display_test", "exynos_4412_rs", "ext4_test", "fat_test", "gpio_test", "gpu_test", "heap_test", "hello_world", "i2c_test", "irq_timer", "l2_test", "mmc_async_test", "mmc_test", "mmc_write_test", "mmu_test", "pmic_test", "power_test", "rtc_test", "smp_test", "timer_test", "touch_async_test", "touch_test", "uart_tx_test", "wifi_async_test", "wifi_test"]
 
 [profile.release]
 panic = "abort"

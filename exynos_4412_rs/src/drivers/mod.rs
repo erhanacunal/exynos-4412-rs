@@ -8,6 +8,7 @@ pub mod gpio;
 pub mod i2s;
 pub mod i2c;
 pub mod l2c;
+pub mod mali;
 pub mod max77686;
 pub mod mxt;
 pub mod pl330;

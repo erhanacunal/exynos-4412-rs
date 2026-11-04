@@ -1,0 +1,9 @@
+[package]
+name = "gpu_test"
+version = "0.1.0"
+edition = "2024"
+description = "GPU bring-up for exynos_4412_rs: the Mali-400 MP4's supply, power domain, clock, identity and resets"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }

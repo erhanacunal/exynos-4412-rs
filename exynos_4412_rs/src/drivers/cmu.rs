@@ -1,9 +1,9 @@
 //! Clock management unit: reads the clock of the peripheral bus and opens clock gates.
 //!
 //! The only PLL it changes is the EPLL, for audio: see [`Cmu::set_epll`]. Nothing else here
-//! runs from the EPLL. The only muxes and dividers it changes are those of the FIMD and of
-//! `sclk_mmc3`, which nothing else uses: see [`Cmu::set_fimd_clock`] and
-//! [`Cmu::set_mmc3_clock`]. The rest stay as U-Boot set them.
+//! runs from the EPLL. The only muxes and dividers it changes are those of the FIMD, of
+//! `sclk_mmc3` and of `sclk_g3d`, which nothing else uses: see [`Cmu::set_fimd_clock`],
+//! [`Cmu::set_mmc3_clock`] and [`Cmu::set_g3d_clock`]. The rest stay as U-Boot set them.
 //!
 //! Register offsets and clock tree are verified against Linux 5.15.198
 //! `drivers/clk/samsung/clk-exynos4.c`, cited as `clk-exynos4.c:<line>`, relative to
@@ -12,7 +12,8 @@
 //! # Concurrency
 //!
 //! [`Cmu::enable_i2c`], [`Cmu::open_fimd_gates`], [`Cmu::set_fimd_clock`],
-//! [`Cmu::set_mmc3_clock`], [`Cmu::open_audio_gates`] and [`Cmu::open_pdma0_gate`] are
+//! [`Cmu::set_mmc3_clock`], [`Cmu::open_audio_gates`], [`Cmu::open_pdma0_gate`],
+//! [`Cmu::open_g3d_gate`] and [`Cmu::set_g3d_clock`] are
 //! read-modify-writes of registers shared with other peripherals. They mask IRQs on the
 //! calling core. Use them from one core at a time.
 
@@ -68,6 +69,21 @@ const GATE_IP_FSYS: usize = 0xC940;
 const DIV_TOP: usize = 0xC510;
 /// clk-exynos4.c:99.
 const GATE_IP_PERIL: usize = 0xC950;
+/// clk-exynos4.c:45.
+const SRC_G3D: usize = 0xC22C;
+/// clk-exynos4.c:69.
+const DIV_G3D: usize = 0xC52C;
+/// clk-exynos4.c:91.
+const GATE_IP_G3D: usize = 0xC92C;
+/// clk-exynos4.c:553,339: `mout_g3d0` selects `sclk_apll` when set, `mout_mpll_user_t` when
+/// clear.
+const SRC_G3D_G3D0_APLL: u32 = 1 << 0;
+/// clk-exynos4.c:427,286: `mout_g3d` selects `mout_g3d1` when set, `mout_g3d0` when clear.
+const SRC_G3D_G3D1: u32 = 1 << 8;
+/// clk-exynos4.c:620: the divider of `sclk_g3d`, bits 0 to 3.
+const DIV_G3D_MASK: u32 = 0xF;
+/// clk-exynos4.c:728: `CLK_G3D`, the GPU's own clock gate.
+const GATE_G3D: u32 = 1 << 0;
 /// clk-exynos4.c:104 `E4X12_MPLL_CON0`.
 const MPLL_CON0: usize = 0x1_0108;
 /// clk-exynos4.c:105.
@@ -194,6 +210,24 @@ impl Epll {
 /// The EPLL did not lock within [`PLL_TIMEOUT_US`] of being set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpllTimeout(pub Epll);
+
+/// Raw clock registers of the GPU, for reports.
+#[derive(Clone, Copy, Debug)]
+pub struct G3dClocks {
+    /// `SRC_G3D`.
+    pub src: u32,
+    /// `DIV_G3D`.
+    pub div: u32,
+    /// `GATE_IP_G3D`.
+    pub gate: u32,
+}
+
+impl G3dClocks {
+    /// Whether the GPU's clock gate is open, without which its registers do not answer.
+    pub const fn gate_open(&self) -> bool {
+        self.gate & GATE_G3D != 0
+    }
+}
 
 /// Raw clock registers of the FIMD, for reports.
 #[derive(Clone, Copy, Debug)]
@@ -349,6 +383,46 @@ impl Cmu {
         input / (div * pre)
     }
 
+    /// The clock registers of the GPU as they are now.
+    pub fn g3d_clocks(&self) -> G3dClocks {
+        G3dClocks { src: self.read(SRC_G3D), div: self.read(DIV_G3D), gate: self.read(GATE_IP_G3D) }
+    }
+
+    /// Rate of `sclk_g3d`, the GPU's core clock. `None` if it comes from a PLL whose rate this
+    /// module does not read: the APLL, the VPLL, or the EPLL, which audio retunes.
+    pub fn sclk_g3d_hz(&self) -> Option<u32> {
+        let src = self.read(SRC_G3D);
+        if src & (SRC_G3D_G3D1 | SRC_G3D_G3D0_APLL) != 0 {
+            return None;
+        }
+        Some(self.mout_mpll_user_t_hz() / ((self.read(DIV_G3D) & DIV_G3D_MASK) + 1))
+    }
+
+    /// Opens the GPU's clock gate, without which its registers do not answer.
+    pub fn open_g3d_gate(&self) {
+        self.modify(GATE_IP_G3D, 0, GATE_G3D);
+    }
+
+    /// Runs `sclk_g3d` from `mout_mpll_user_t`, divided down to the highest rate not above `hz`,
+    /// and returns the rate. The GPU must be idle.
+    ///
+    /// # Panics
+    ///
+    /// If `hz` is below what the divider reaches.
+    pub fn set_g3d_clock(&self, hz: u32) -> u32 {
+        let input = self.mout_mpll_user_t_hz();
+        let div = input.div_ceil(hz.max(1)).max(1);
+        assert!(div <= DIV_G3D_MASK + 1, "sclk_g3d rate below what the divider reaches");
+        // The divider first: the rate only falls while the mux changes.
+        let current = self.read(DIV_G3D) & DIV_G3D_MASK;
+        if div - 1 > current {
+            self.modify(DIV_G3D, DIV_G3D_MASK, div - 1);
+        }
+        self.modify(SRC_G3D, SRC_G3D_G3D1 | SRC_G3D_G3D0_APLL, 0);
+        self.modify(DIV_G3D, DIV_G3D_MASK, div - 1);
+        input / div
+    }
+
     /// Opens the gates of the FIMD's registers and of its bus path.
     pub fn open_fimd_gates(&self) {
         self.modify(GATE_IP_LCD0, 0, GATE_LCD0_FIMD0 | GATE_LCD0_SMMU_FIMD0);
@@ -366,7 +440,7 @@ impl Cmu {
         let address = (soc::CMU_BASE + offset) as *mut u32;
         let was_masked = cpu::mask_irq();
         // SAFETY: as in `read`. Every caller changes only fields of the block it configures: the
-        // FIMD, `sdhci_3`, `pdma0` or the audio subsystem.
+        // FIMD, `sdhci_3`, `pdma0`, the audio subsystem or the GPU.
         unsafe {
             ptr::write_volatile(address, (ptr::read_volatile(address) & !clear) | set);
         }
