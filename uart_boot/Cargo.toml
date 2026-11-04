@@ -6,4 +6,4 @@ description = "Waits for an application image over UART2, checks it and starts i
 license = "MIT"
 
 [dependencies]
-exynos_4412_rs = { path = "../exynos_4412_rs" }
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["fat"] }

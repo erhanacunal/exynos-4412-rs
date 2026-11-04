@@ -105,6 +105,30 @@ caches off and U-Boot's `r0`-`r2`. The application's startup then moves it down 
 address, as it does when `bootm` starts it at `0x40009000`. The protocol is described in
 `uart_boot/src/main.rs`. While it waits, `f` restarts into fastboot and `r` restarts.
 
+Without minicom (Windows, or a script), `tools/uartboot.py --port COM5 <app>.bin` opens the port
+itself through pyserial; `--monitor` keeps printing the board's output afterwards.
+
+#### The saved application
+
+`uart_boot` can also start an application by itself, from the CACHE partition (p8, FAT32):
+
+- At power-on it waits 3 s for an image over the UART. If none starts arriving, it loads
+  `FERRITE/FERRITE.BIN` from CACHE, checks it against the CRC saved with it and starts it.
+- Without that file, or with a bad one, it keeps waiting for the UART: a saved application that
+  crashes costs one restart, never the board.
+- Holding **volume up** at power-on skips the saved application.
+- `uartboot.py --save <app>.bin` replaces it: `uart_boot` saves the image only after its CRC
+  checked out (`uart_boot: saved FERRITE/FERRITE.BIN`), then starts it. Without `--save` an
+  image runs from RAM only, as before.
+- `--wait 30` waits up to 30 s for `uart_boot`'s banner and sends the header then, so the
+  script can be started before the board is reset. It never sends blindly: stray bytes in
+  U-Boot's countdown would stop its autoboot.
+- `--reset` restarts a running ferrite application first (its restart message) when
+  `uart_boot` does not answer, then catches the banner. `--debug` prints every byte received.
+
+The file is the 16-byte wire header (`EXYNBOOT`, length, CRC) followed by the image
+(`uart_boot/src/cache.rs`). CACHE is never formatted by `uart_boot`; `fat_test` does that.
+
 ## Image format
 
 This U-Boot is signed and has no source, so how `bootm` recognises an image is unknown. The
