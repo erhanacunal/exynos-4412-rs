@@ -245,7 +245,7 @@ fn prepare(shared: &mut Shared, screen: &Framebuffer) -> (GpFrame, PpFrame) {
     let descriptor = address(&shared.textures) + (DESCRIPTOR_OFFSET * 4) as u32;
     shared.textures.0[0] = descriptor;
     shared.textures.0[DESCRIPTOR_OFFSET..]
-        .copy_from_slice(&mali::texture_rgba8888(address(&shared.texels), TEXELS as u32, TEXELS as u32));
+        .copy_from_slice(&mali::texture_rgba8888(address(&shared.texels), TEXELS as u32, TEXELS as u32, mali::Filter::Nearest));
     shared.render_state.0 = RENDER_STATE;
     shared.render_state.0[9] = address(&shared.fragment_shader) | (FRAGMENT_SHADER[0] & 0x1F);
     shared.render_state.0[12] = address(&shared.textures);

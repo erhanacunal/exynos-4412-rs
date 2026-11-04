@@ -354,7 +354,7 @@ fn prepare(shared: &mut Shared, scene: &Shaders, size: usize) -> GpFrame {
     let descriptor = address(&shared.textures) + (DESCRIPTOR_OFFSET * 4) as u32;
     shared.textures.0[0] = descriptor;
     shared.textures.0[DESCRIPTOR_OFFSET..]
-        .copy_from_slice(&mali::texture_rgba8888(address(&shared.texels), TEXELS as u32, TEXELS as u32));
+        .copy_from_slice(&mali::texture_rgba8888(address(&shared.texels), TEXELS as u32, TEXELS as u32, mali::Filter::Nearest));
     // The second attribute and its varying: the colour, or the texture coordinates.
     let (second, components) = if scene.kind == Kind::Textured { (address(&shared.uvs), 2) } else { (address(&shared.colors), 4) };
     // `stride << 11 | type << 2 | (components - 1)`, type 0 float: lima_draw.c:850-855.

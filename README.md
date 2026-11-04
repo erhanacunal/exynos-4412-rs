@@ -30,7 +30,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
 - `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom and starts it, instead of fastboot
 - `gpu_triangle_test/`: flat, shaded and textured triangles through the GP and the PPs, with shaders compiled offline by Mesa's lima compiler
-- `gpu_cube_test/`: a textured, lit cube turning in perspective, transformed by the GP's vertex shader, depth tested by the PPs
+- `gpu_cube_test/`: a textured (bilinear), lit cube turning in perspective, transformed by the GP's vertex shader, depth tested by the PPs
 - `gpu_spin_test/`: a textured square turning on the screen, drawn by the GP and four PPs every frame
 - `gpu_rect_test/`: rectangles filled by the pixel processors with CPU-drawn edges, against the CPU alone, cached and uncached
 - `gpu_test/`: Mali-400 MP4 bring-up: its supply, power domain and clock, what its blocks say they are, their resets and interrupt lines
@@ -1243,6 +1243,14 @@ first frame's texture coordinates and brightnesses are the CPU's, and the faces 
 turn away. The fragment shader is now three instructions, not one, and the PPs take 435 to
 500 us (largest 543), more the more of the frame the cube covers: the PPs' shading starts to
 show beside the write-back. 1730 to 1920 frames a second without vsync, 58.1 with.
+
+The texture is then sampled bilinearly: `mali::texture_rgba8888` takes a `Filter`, and for
+`GL_LINEAR` Mesa's descriptor differs from `GL_NEAREST`'s in two fields only, the nearest bits
+off and the LOD bias 0 rather than 0.5; the shaders are the same. Key `b` switches the filter
+while the cube turns. The atlas's two unused cells are white, as the cells' borders, so that the
+filter at a cell's edge takes nothing else from its neighbour. On the board the edges of the
+checkerboard are smooth, and the PPs' time, 435 to 509 us, cannot be told from nearest's: the
+four texels a pixel cost no more than the one.
 
 ## Heap
 

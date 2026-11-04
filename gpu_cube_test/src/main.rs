@@ -27,7 +27,11 @@
 //! `gpu_spin_test`, each frame starts at vsync; a line every two seconds gives the frame rate
 //! and the GPU's microseconds.
 //!
-//! Keys: `v` vsync on or off, `p` pause, `r` restart, `f` restart into fastboot.
+//! The texture is sampled bilinearly; key `b` switches between that and nearest, which differ
+//! in the texture's descriptor alone.
+//!
+//! Keys: `b` bilinear or nearest, `v` vsync on or off, `p` pause, `r` restart, `f` restart into
+//! fastboot.
 
 #![no_std]
 #![no_main]
@@ -38,7 +42,7 @@ use core::f32::consts::TAU;
 use exynos_4412_rs::drivers::display::{self, Fimd, Framebuffer, LTN101AL03, LVDS_SETTLE_MS};
 use exynos_4412_rs::drivers::gic::Gic;
 use exynos_4412_rs::drivers::l2c::L2c;
-use exynos_4412_rs::drivers::mali::{self, Commands, GpFrame, IdentityMap, Mali, PpFrame, TileEnd};
+use exynos_4412_rs::drivers::mali::{self, Commands, Filter, GpFrame, IdentityMap, Mali, PpFrame, TileEnd};
 use exynos_4412_rs::drivers::power::{self, BootMode};
 use exynos_4412_rs::drivers::timer::Mct;
 use exynos_4412_rs::{BootArgs, console, mmu, println, soc};
@@ -159,10 +163,11 @@ const DESCRIPTOR_OFFSET: usize = 16;
 
 /// The atlas's texel at column `x`, line `y`, alpha, red, green, blue from the top byte: in
 /// each cell a white border, then its face's colour on a checkerboard of 8 x 8 texel squares,
-/// bright and dim. The two cells past the sixth are black.
+/// bright and dim. The two cells past the sixth are white, as the borders are, so that bilinear
+/// filtering at a cell's edge takes nothing else from its neighbour.
 fn texel(x: usize, y: usize) -> u32 {
     let face = (y / CELL) * CELLS_ACROSS + x / CELL;
-    let Some(color) = FACE_COLORS.get(face) else { return 0xFF00_0000 };
+    let Some(color) = FACE_COLORS.get(face) else { return 0xFFFF_FFFF };
     let (u, v) = (x % CELL, y % CELL);
     if u < 2 || v < 2 || u >= CELL - 2 || v >= CELL - 2 {
         return 0xFFFF_FFFF;
@@ -375,8 +380,7 @@ fn prepare(shared: &mut Shared, screen: &Framebuffer) -> (GpFrame, PpFrame) {
     shared.varyings.0 = [address(&shared.gp_output), 0x8020, varyings, (16 << 11) | (3 - 1)];
     let descriptor = address(&shared.textures) + (DESCRIPTOR_OFFSET * 4) as u32;
     shared.textures.0[0] = descriptor;
-    shared.textures.0[DESCRIPTOR_OFFSET..]
-        .copy_from_slice(&mali::texture_rgba8888(address(&shared.texels), ATLAS_WIDTH as u32, ATLAS_HEIGHT as u32));
+    set_filter(shared, Filter::Bilinear);
     shared.render_state.0 = RENDER_STATE;
     shared.render_state.0[9] = address(&shared.fragment_shader) | (FRAGMENT_SHADER[0] & 0x1F);
     shared.render_state.0[12] = address(&shared.textures);
@@ -414,6 +418,13 @@ fn prepare(shared: &mut Shared, screen: &Framebuffer) -> (GpFrame, PpFrame) {
     let corner = screen.address() + (TOP * WIDTH + LEFT) * 4;
     let pp = PpFrame::clear(SIZE, SIZE, GREY, corner, screen.stride(), address(&shared.frame_state) as usize);
     (gp, pp)
+}
+
+/// The texture's descriptor for `filter`, cleaned to DRAM.
+fn set_filter(shared: &mut Shared, filter: Filter) {
+    let descriptor = mali::texture_rgba8888(address(&shared.texels), ATLAS_WIDTH as u32, ATLAS_HEIGHT as u32, filter);
+    shared.textures.0[DESCRIPTOR_OFFSET..].copy_from_slice(&descriptor);
+    mmu::clean_dcache_range(shared.textures.0.as_ptr() as usize, size_of_val(&shared.textures));
 }
 
 /// The frame's matrix and light into the uniforms, cleaned to DRAM.
@@ -546,14 +557,15 @@ impl Stats {
         self.most.all = self.most.all.max(times.all);
     }
 
-    fn report(&self, us: u64, vsync: bool) {
+    fn report(&self, us: u64, vsync: bool, filter: Filter) {
         let frames = self.frames.max(1);
         let fps_tenths = self.frames * 10_000_000 / us.max(1);
         println!(
-            "{}.{} fps, vsync {}: GP {}/{} us, PPs {}/{} us, all {}/{} us (mean/max)",
+            "{}.{} fps, vsync {}, {:?}: GP {}/{} us, PPs {}/{} us, all {}/{} us (mean/max)",
             fps_tenths / 10,
             fps_tenths % 10,
             if vsync { "on" } else { "off" },
+            filter,
             self.sum.gp / frames,
             self.most.gp,
             self.sum.pps / frames,
@@ -605,10 +617,11 @@ fn wait_keys() -> ! {
 }
 
 fn spin(gpu: Mali, mct: Mct, fimd: &Fimd, shared: &mut Shared, gp: &GpFrame, pp: &PpFrame) -> ! {
-    println!("Turning: keys v vsync, p pause, r restart, f fastboot");
+    println!("Turning: keys b bilinear/nearest, v vsync, p pause, r restart, f fastboot");
     console::flush();
     let uart = console::uart();
     let (mut vsync, mut paused, mut first) = (true, false, true);
+    let mut filter = Filter::Bilinear;
     // Time of the animation, which a pause stops.
     let mut shown_us = 0;
     let mut last = mct.count();
@@ -616,6 +629,10 @@ fn spin(gpu: Mali, mct: Mct, fimd: &Fimd, shared: &mut Shared, gp: &GpFrame, pp:
     let mut stats = Stats::default();
     loop {
         match uart.try_read_byte() {
+            Some(b'b') => {
+                filter = if filter == Filter::Bilinear { Filter::Nearest } else { Filter::Bilinear };
+                set_filter(shared, filter);
+            }
             Some(b'v') => vsync = !vsync,
             Some(b'p') => paused = !paused,
             Some(b'r') => power::restart(BootMode::Normal),
@@ -650,7 +667,7 @@ fn spin(gpu: Mali, mct: Mct, fimd: &Fimd, shared: &mut Shared, gp: &GpFrame, pp:
         }
         let since = (mct.count() - report_start) / COUNTS_PER_US;
         if since >= REPORT_US {
-            stats.report(since, vsync);
+            stats.report(since, vsync, filter);
             stats = Stats::default();
             report_start = mct.count();
         }

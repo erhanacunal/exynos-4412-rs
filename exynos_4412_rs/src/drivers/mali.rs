@@ -848,20 +848,30 @@ pub const PLB_MAX_BLOCKS: usize = 512;
 /// Bytes of a texture descriptor: `Texture Descriptor`, lima genxml/common.xml.
 pub const TEXTURE_DESCRIPTOR_BYTES: usize = 64;
 
+/// How a texture is sampled, minified and magnified alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    /// The nearest texel: `GL_NEAREST`.
+    Nearest,
+    /// The four nearest, weighted by distance: `GL_LINEAR`.
+    Bilinear,
+}
+
 /// The texture descriptor of a 2D texture of one level, `width` x `height` RGBA8888 texels in
-/// lines, red in the first byte, at `texels`: nearest filtering, clamped to its edges, as Mesa's
-/// driver packs one for `GL_RGBA`/`GL_UNSIGNED_BYTE`, `GL_NEAREST`, `GL_CLAMP_TO_EDGE`
-/// (lima_texture.c:60-100, 131-243; fields from genxml/common.xml).
+/// lines, red in the first byte, at `texels`, sampled by `filter`, clamped to its edges, as
+/// Mesa's driver packs one for `GL_RGBA`/`GL_UNSIGNED_BYTE`, `GL_NEAREST` or `GL_LINEAR`,
+/// `GL_CLAMP_TO_EDGE` (lima_texture.c:60-100, 131-243; fields from genxml/common.xml).
 ///
 /// # Panics
 ///
 /// If `texels` is not 64-byte aligned: the descriptor holds the address shifted right by 6.
-pub fn texture_rgba8888(texels: u32, width: u32, height: u32) -> [u32; 16] {
+pub fn texture_rgba8888(texels: u32, width: u32, height: u32, filter: Filter) -> [u32; 16] {
     assert!(texels.is_multiple_of(64), "texels 64-byte aligned");
     const FORMAT_RGBA_8888: u32 = 0x16;
     const SWAP_RB: u32 = 1 << 7;
     const DIM_2D: u32 = 1 << 10;
-    // Lod Bias, signed, 4 fraction bits, from bit 28: 0.5, Mesa's for nearest filtering.
+    // Lod Bias, signed, 4 fraction bits, from bit 28: 0.5, Mesa's for nearest filtering; 0 for
+    // linear.
     const LOD_BIAS_HALF: u32 = 8 << 28;
     const HAS_STRIDE: u32 = 1 << 8;
     const MIN_NEAREST: u32 = 1 << 11;
@@ -870,9 +880,13 @@ pub fn texture_rgba8888(texels: u32, width: u32, height: u32) -> [u32; 16] {
     let mip0 = texels >> 6;
     let mut descriptor = [0; 16];
     descriptor[0] = FORMAT_RGBA_8888 | SWAP_RB | ((width * 4) << 16);
-    descriptor[1] = DIM_2D | LOD_BIAS_HALF;
+    let (bias, nearest) = match filter {
+        Filter::Nearest => (LOD_BIAS_HALF, MIN_NEAREST | MAG_NEAREST),
+        Filter::Bilinear => (0, 0),
+    };
+    descriptor[1] = DIM_2D | bias;
     // Wrap S at bit 13, T at 16, R repeat; the width from bit 22, its high bits in word 3.
-    descriptor[2] = HAS_STRIDE | MIN_NEAREST | MAG_NEAREST | (CLAMP_TO_EDGE << 13) | (CLAMP_TO_EDGE << 16) | (width << 22);
+    descriptor[2] = HAS_STRIDE | nearest | (CLAMP_TO_EDGE << 13) | (CLAMP_TO_EDGE << 16) | (width << 22);
     // Depth 1; layout linear, 0, in word 6.
     descriptor[3] = (width >> 10) | (height << 3) | (1 << 16);
     descriptor[6] = mip0 << 30;
