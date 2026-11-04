@@ -1,0 +1,16 @@
+[package]
+name = "wifi_async_test"
+version = "0.1.0"
+edition = "2024"
+description = "BCM4334 WiFi for exynos_4412_rs under Embassy: embassy-net over a runner task woken by the chip's host wake line"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["wifi-net"] }
+embassy-executor = "0.10"
+embassy-time = "0.5"
+embassy-sync = "0.8"
+embassy-futures = "0.1"
+embassy-net = { version = "0.9", features = ["medium-ethernet", "proto-ipv4", "dhcpv4", "tcp", "auto-icmp-echo-reply"] }
+
+

@@ -13,6 +13,8 @@ panic-handler = []
 fat = ["dep:embedded-sdmmc"]
 # Async tasks with Embassy, one executor per core: the `embassy` module.
 embassy = ["dep:embassy-executor", "dep:embassy-time-driver", "dep:embassy-time-queue-utils", "dep:embassy-sync", "dep:embassy-time", "dep:critical-section"]
+# The BCM4334 as an embassy-net device, run by an async task: the `embassy::wifi` module.
+wifi-net = ["embassy", "dep:embassy-net-driver-channel", "dep:embassy-futures"]
 
 [dependencies]
 smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4", "socket-icmp", "auto-icmp-echo-reply"] }
@@ -22,5 +24,7 @@ embassy-time-driver = { version = "0.2", features = ["tick-hz-1_000_000"], optio
 embassy-time-queue-utils = { version = "0.3", optional = true }
 embassy-sync = { version = "0.8", optional = true }
 embassy-time = { version = "0.5", optional = true }
+embassy-net-driver-channel = { version = "0.4", optional = true }
+embassy-futures = { version = "0.1", optional = true }
 critical-section = { version = "1.2", features = ["restore-state-u8"], optional = true }
 tock-registers = { version = "0.10.1", default-features = false, features = ["register_types"] }

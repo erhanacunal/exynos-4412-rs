@@ -26,6 +26,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `ext4_test/`: reads the ext4 file systems on the eMMC with the `ext4-view` crate, no writes
 - `fat_test/`: FAT32 on CACHE with the `embedded-sdmmc` crate: formats it if needed, writes, reads and lists files
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
+- `wifi_async_test/`: the same chip under Embassy as an `embassy-net` device, its runner task woken by the host wake line
 - `async_test/`: Embassy on all four cores: timers, tasks, and channels between the cores
 - `mmc_async_test/`: async eMMC: reads and writes awaited on the controller's interrupt, from CPU0 and CPU1
 - `uart_tx_test/`: buffered console: `print!` sent on the UART's transmit interrupt, the ring overflowing, two cores printing, flush before a panic and a restart
@@ -1372,6 +1373,40 @@ generator: fine to test with, unproven beyond that.
 `crypto` and `wpa` have tests that run on the development machine, with published vectors and values
 from Python's `hashlib`. Their code needs nothing of the board, so a root that includes only them
 builds with `rustc --test`.
+
+### Under Embassy (`embassy::wifi`)
+
+With the `wifi-net` feature, `embassy::wifi::new` makes a joined chip an `embassy-net` device
+(`embassy-net-driver-channel`). Its `Runner::run` task is the only thing that touches the chip: it
+awaits a rising edge on `gpx0-3` (`EintInput::wait_latched`, the pending bit latched while
+masked), a frame from the stack, room in the stack's receive queue, or a deadline, and the core
+sleeps meanwhile. It reads the chip after an edge, while frames it announced wait, every 50 ms
+regardless (a read that finds something counts as missed), and every 200 us while a frame waits
+for room in the firmware (`room_polls`). `embassy::wifi::stats` gives the counts. The runner and
+`embassy_net`'s runner must be on the same executor.
+
+`WIFI_FIRMWARE_DIR=<directory> make img APP=wifi_async_test`, with `WIFI_SSID` and
+`WIFI_PASSWORD` as for `wifi_test`. It joins as `wifi_test` does, polled, then runs on CPU0: DHCP,
+a fetch from `1.1.1.1:80`, three HTTP servers on port 80 (`/`, `/data` 1 MiB, `POST /upload`),
+pings answered, a 1 ms ticker whose lateness shows how busy the core is, and a report every 10 s
+(`s` for one now). On the board, bus at 50 MHz:
+
+| Check | Result |
+|---|---|
+| DHCP | 2123 to 2142 ms; fetch from `1.1.1.1:80` 17 to 19 ms |
+| 1 MiB of `/data` to `curl` | 113 ms, 9048 KiB/s (`curl`: 8904 KiB/s); 8406 KiB/s before the slice |
+| 3 MiB `POST /upload` from `curl` | 1438 ms, 2086 KiB/s; 2161 frames in, 374 ms reading the chip |
+| Idle, every 10 s | 200 empty reads, all backstops, 1 ms reading the chip; 0 missed |
+| Around the transfers | 624 and 151 edges, 9 room polls, rx queue never full, 0 missed |
+| 1 ms ticker on the same core | 25 to 30 us late at most idle |
+| Ticker during the download | 2052 us late at most before the slice, 1277 us with it |
+| Ticker during the upload | 1888 us late at most, with the slice |
+| Pinged from another computer | 1.2 to 1.5 ms |
+
+No read found what the line had not announced. The runner returns to the executor once 500 us
+have passed (`embassy::wifi::SLICE`) and goes on where it stopped; that took the download's worst
+from 2052 to 1277 us. What is left is longer than a slice and a frame: it is likely the stack
+taking in all that is queued in one poll, not yet measured.
 
 ## QEMU
 

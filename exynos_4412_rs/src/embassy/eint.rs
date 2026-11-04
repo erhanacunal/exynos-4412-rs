@@ -10,6 +10,14 @@
 //! may still hold an earlier one if the controller latches it later than the clear. A task
 //! that waits for a device to have work therefore checks the device, and waits again if it
 //! has none. The pin's data bit is not relied on while the pin is in its interrupt function.
+//!
+//! # Latched edges
+//!
+//! A line that pulses, shorter than a look at its level can catch, is followed by its edge
+//! instead: [`EintInput::arm`] sets the trigger once, and the controller latches each edge in
+//! the pin's pending bit, masked or not. [`EintInput::take`] clears it before the caller looks
+//! at the device, so that an edge meanwhile is kept, and [`EintInput::wait_latched`] waits for
+//! one without clearing what is already there.
 
 use core::future::poll_fn;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -72,6 +80,42 @@ impl EintInput {
     /// Interrupts the handler took for this pin so far.
     pub fn interrupts(&self) -> u32 {
         INTERRUPTS[usize::from(self.eint.index())].load(Ordering::Relaxed)
+    }
+
+    /// Sets the pin to latch `trigger`, an edge, from now on, masked and cleared: see [Latched
+    /// edges](self#latched-edges). The level waits must not be used after it.
+    pub fn arm(&self, trigger: Trigger) {
+        let eint = self.eint;
+        eint.mask();
+        eint.set_trigger(trigger);
+        eint.clear();
+    }
+
+    /// Whether an edge was latched since the last call, and clears it.
+    pub fn take(&self) -> bool {
+        if !self.eint.is_pending() {
+            return false;
+        }
+        self.eint.clear();
+        true
+    }
+
+    /// Waits until an edge is latched, at once if one is, leaving it for [`take`](Self::take).
+    /// The pin must be [`arm`](Self::arm)ed.
+    pub async fn wait_latched(&self) {
+        let eint = self.eint;
+        let waker = &WAKERS[usize::from(eint.index())];
+        poll_fn(|cx| {
+            eint.mask();
+            if eint.is_pending() {
+                return Poll::Ready(());
+            }
+            waker.register(cx.waker());
+            // An edge latched while masked reaches the GIC on the unmask.
+            eint.unmask();
+            Poll::Pending
+        })
+        .await;
     }
 
     async fn wait(&self, trigger: Trigger) {

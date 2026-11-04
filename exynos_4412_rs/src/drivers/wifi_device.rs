@@ -69,11 +69,13 @@ pub struct Stats {
     pub backstops: u32,
     /// Of those, the ones that found a frame or an event: what the line missed.
     pub missed: u32,
-    /// With the line observed: reads that found a frame with the line high, and low.
+    /// With the line observed: reads that found a frame with the line high.
     pub frame_line_high: u32,
+    /// Reads that found a frame with the line low.
     pub frame_line_low: u32,
-    /// Reads that found nothing with the line high, and low.
+    /// Reads that found nothing with the line high.
     pub empty_line_high: u32,
+    /// Reads that found nothing with the line low.
     pub empty_line_low: u32,
     /// Times the line was seen at another level than at the read before.
     pub line_changes: u32,

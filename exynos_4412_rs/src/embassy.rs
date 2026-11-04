@@ -15,7 +15,8 @@
 //!   [`drivers::mmc`](crate::drivers::mmc);
 //! - `pdma0`'s events awaited on its interrupt: `Pl330::wait_event` in
 //!   [`drivers::pl330`](crate::drivers::pl330), and `DmaPlayback::wait_half` in
-//!   [`drivers::i2s`](crate::drivers::i2s).
+//!   [`drivers::i2s`](crate::drivers::i2s);
+//! - with the `wifi-net` feature, the BCM4334 as an `embassy-net` device: [`wifi`].
 //!
 //! The executor is `embassy-executor`'s raw one, run here: it sleeps with `WFE`, and a wake-up
 //! from any core sends `DSB` then `SEV`, which wakes all of them. An interrupt also ends a
@@ -43,6 +44,8 @@
 
 pub mod eint;
 pub mod uart;
+#[cfg(feature = "wifi-net")]
+pub mod wifi;
 
 use core::cell::{RefCell, UnsafeCell};
 use core::mem::MaybeUninit;
