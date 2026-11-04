@@ -1,0 +1,9 @@
+[package]
+name = "gpu_cube_test"
+version = "0.1.0"
+edition = "2024"
+description = "A textured cube turning on the screen: the Mali-400 transforms it and tests depth"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }

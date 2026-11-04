@@ -30,6 +30,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
 - `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom and starts it, instead of fastboot
 - `gpu_triangle_test/`: flat, shaded and textured triangles through the GP and the PPs, with shaders compiled offline by Mesa's lima compiler
+- `gpu_cube_test/`: a textured cube turning in perspective, transformed by the GP's vertex shader, depth tested by the PPs
 - `gpu_spin_test/`: a textured square turning on the screen, drawn by the GP and four PPs every frame
 - `gpu_rect_test/`: rectangles filled by the pixel processors with CPU-drawn edges, against the CPU alone, cached and uncached
 - `gpu_test/`: Mali-400 MP4 bring-up: its supply, power domain and clock, what its blocks say they are, their resets and interrupt lines
@@ -1217,6 +1218,22 @@ On the board, 160 MHz, means over 2 s (largest in brackets):
 | off | 2150 to 2176 | the same | the same | the same |
 
 The PPs write 400 KiB a frame, about 1.05 GB/s, as in the triangle test: DRAM sets the rate.
+
+`gpu_cube_test` turns a cube, 12 triangles, in perspective in the same frame. The CPU makes one
+matrix a frame, perspective times camera times the turns, and writes it into the uniforms; the
+vertex shader, Mesa's for `gl_Position = mvp * pos`, takes the 36 vertices through it. Each face
+is a cell of a 128 x 64 texture atlas, its own colour. The depth test, `Less`, is one word of the
+render state; the depth buffer is the PPs' tile memory, cleared per tile by the frame and never
+written to DRAM. On the board the GP's positions of the first frame are those of the CPU's own
+transform, and the far faces stay hidden:
+
+| Vsync | Frames a second | GP | 4 PPs | Frame |
+|---|---|---|---|---|
+| on | 58.1 | 38 us (45) | 392 us (398) | 467 us (475) |
+| off | 2092 to 2119 | 38 us (45) | 395 us (409) | 470 us (488) |
+
+The 36 vertices and the matrix cost the GP 9 us more than the square's 6; the PPs' time is the
+write-back's, as before.
 
 ## Heap
 
