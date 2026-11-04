@@ -1166,6 +1166,20 @@ as Mesa lays its GP output out, and the render state points the PP at them. On t
 pixel inside is within 1/255 of the exact interpolation, in both sizes, with the same times as
 the flat scene.
 
+The vertex shader's viewport scale has a negative y, so the frame's first line is the scene's
+top and the triangles stand apex up on the screen. Each frame is also rendered by all four PPs,
+each taking every fourth tile of the stream. On the board, 160 MHz, every pixel right either way:
+
+| Frame | 1 PP | 4 PPs |
+|---|---|---|
+| Shaded, 64 x 64 | 40 us | 70 us |
+| Flat or shaded, 256 x 256 on the screen | 387 us | 261 us, 1.48 times as fast |
+
+The 256 x 256 frame is 256 KiB of write-back: four PPs write about 1.0 GB/s, near the 1.1 GB/s of
+the four-PP screen clear, so DRAM, not the shaders, is the likely limit. On the 64 x 64 frame,
+16 tiles, four PPs take longer than one; the cause is not known, perhaps starting and waiting on
+each PP in turn.
+
 The GP and the PP need a soft reset before each frame, as Linux gives them after each job:
 without one, the PP drew the shaded scene after the flat one in black, every pixel inside
 `0xFF000000`, though its render state named the new fragment shader.

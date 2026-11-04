@@ -18,16 +18,20 @@
 //! The command lists are built here with `mali::Commands`, in the order Mesa's driver builds
 //! them.
 //!
-//! 1. GPU on, the GP and PP0 reset, their MMUs paging over DRAM.
+//! The viewport's y scale is negative, so that the frame's first line is the scene's top, as the
+//! screen's is: the triangle stands apex up. Each frame is rendered by PP0 alone, then by all
+//! four PPs, each taking every fourth tile.
+//!
+//! 1. GPU on, the GP and the PPs reset, their MMUs paging over DRAM.
 //! 2. For each scene, a 64 x 64 frame of 4 x 4 tiles into a buffer of its own. The GP: both
 //!    lists end, without an error; the positions the shader wrote are the viewport's transform
 //!    of the three vertices, and the colours it passed on are the vertices' own; the polygon list
 //!    blocks of the tiles the triangle covers list it. A pattern marks what the GP left alone.
 //!    Then PP0: every pixel checked against the triangle, the clear grey outside; those within a
-//!    pixel of an edge are counted apart. On the board the PP's first line is the viewport's
-//!    bottom: the apex is up in memory, down on the screen.
+//!    pixel of an edge are counted apart. The target is filled with the pattern before each
+//!    frame, so what is checked is the frame's.
 //! 3. If all hold: the screen on, and each scene drawn 256 x 256 on it, side by side, checked
-//!    the same.
+//!    the same; one PP and four timed.
 //!
 //! Keys afterwards: `g` again, `r` restart, `f` restart into fastboot.
 
@@ -169,7 +173,7 @@ struct Shared {
     /// The polygon list blocks, one a tile.
     plb: [u32; MAX_TILES * BLOCK_WORDS],
     heap: [u32; HEAP_WORDS],
-    stream: Lines<[u32; STREAM_WORDS]>,
+    streams: [Lines<[u32; STREAM_WORDS]>; mali::PP_COUNT],
     block_addresses: Lines<[u32; MAX_TILES]>,
     vertex_shader: Lines<[u32; 36]>,
     fragment_shader: Lines<[u32; 4]>,
@@ -200,7 +204,7 @@ static STORE: Store = Store(UnsafeCell::new(Shared {
     small: [0; SMALL * SMALL],
     plb: [0; MAX_TILES * BLOCK_WORDS],
     heap: [0; HEAP_WORDS],
-    stream: Lines([0; STREAM_WORDS]),
+    streams: [Lines([0; STREAM_WORDS]); mali::PP_COUNT],
     block_addresses: Lines([0; MAX_TILES]),
     vertex_shader: Lines([0; 36]),
     fragment_shader: Lines([0; 4]),
@@ -263,7 +267,8 @@ fn prepare(shared: &mut Shared, scene: &Shaders, size: usize) -> GpFrame {
     shared.vertex_shader.0[..scene.vertex.len()].copy_from_slice(scene.vertex);
     shared.fragment_shader.0[..scene.fragment.len()].copy_from_slice(scene.fragment);
     let half = size as f32 / 2.0;
-    shared.uniforms.0[..8].copy_from_slice(&[half, half, 0.5, 0.0, half, half, 0.5, 0.0]);
+    // y scaled by minus half: the scene's top on the frame's first line.
+    shared.uniforms.0[..8].copy_from_slice(&[half, -half, 0.5, 0.0, half, half, 0.5, 0.0]);
     shared.uniforms.0[8..].copy_from_slice(&CLAMP);
     shared.vertices.0 = VERTICES;
     shared.colors.0 = COLORS;
@@ -313,11 +318,12 @@ fn prepare(shared: &mut Shared, scene: &Shaders, size: usize) -> GpFrame {
     GpFrame { vs_start, vs_end, plbu_start, plbu_end, heap_start, heap_end: heap_start + (HEAP_WORDS * 4) as u32 }
 }
 
-/// Where the viewport puts a vertex: what the shader should write.
+/// Where the viewport puts a vertex: what the shader should write, `y` counted down from the
+/// frame's first line.
 fn expected(vertex: usize, size: usize) -> [f32; 4] {
     let half = size as f32 / 2.0;
     let (x, y) = (VERTICES[vertex * 2], VERTICES[vertex * 2 + 1]);
-    [x * half + half, y * half + half, 0.5, 1.0]
+    [x * half + half, -y * half + half, 0.5, 1.0]
 }
 
 /// A square root by Newton's method: `core` has none without `std`.
@@ -332,12 +338,14 @@ fn sqrt(value: f32) -> f32 {
 /// How far inside the triangle a point is, in pixels: negative outside.
 fn inside(size: usize, x: f32, y: f32) -> f32 {
     let corners = [expected(0, size), expected(1, size), expected(2, size)];
+    let [a, b, c] = corners;
+    // Which way round the corners go: the inside is on that side of each edge.
+    let turn = ((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])).signum();
     let mut nearest = f32::MAX;
     for i in 0..3 {
         let (a, b) = (corners[i], corners[(i + 1) % 3]);
         let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-        // The corners go counter-clockwise with y up, so the inside is on the left.
-        let distance = (dx * (y - a[1]) - dy * (x - a[0])) / sqrt(dx * dx + dy * dy);
+        let distance = turn * (dx * (y - a[1]) - dy * (x - a[0])) / sqrt(dx * dx + dy * dy);
         nearest = nearest.min(distance);
     }
     nearest
@@ -370,7 +378,8 @@ fn written(words: &[u32]) -> usize {
 }
 
 /// Step 2's checks of what the GP wrote.
-fn check_gp(shared: &Shared, scene: &Shaders, size: usize) -> bool {
+/// With `report`, all of it is printed; otherwise only what is wrong.
+fn check_gp(shared: &Shared, scene: &Shaders, size: usize, report: bool) -> bool {
     let mut good = true;
     for vertex in 0..3 {
         let got = &shared.gp_output.0[vertex * 4..vertex * 4 + 4];
@@ -381,6 +390,9 @@ fn check_gp(shared: &Shared, scene: &Shaders, size: usize) -> bool {
             right &= color.iter().zip(&COLORS[vertex * 4..]).all(|(got, want)| (got - want).abs() < 0.001);
         }
         good &= right;
+        if !report && right {
+            continue;
+        }
         println!(
             "Vertex {}: {:.3} {:.3} {:.3} {:.3}, want {:.1} {:.1} {:.1} {:.1}{}: {}",
             vertex,
@@ -411,6 +423,10 @@ fn check_gp(shared: &Shared, scene: &Shaders, size: usize) -> bool {
         listed += polygon as usize;
         missing += (covers && !polygon) as usize;
     }
+    good &= missing == 0;
+    if !report && missing == 0 {
+        return good;
+    }
     println!(
         "Tiles {}: covered {}, blocks written {}, with the triangle {}, covered without it {}: {}",
         tiles,
@@ -420,7 +436,6 @@ fn check_gp(shared: &Shared, scene: &Shaders, size: usize) -> bool {
         missing,
         verdict(missing == 0)
     );
-    good &= missing == 0;
     if let Some(tile) = (0..tiles).find(|tile| written(&shared.plb[tile * BLOCK_WORDS..(tile + 1) * BLOCK_WORDS]) > 2) {
         let block = &shared.plb[tile * BLOCK_WORDS..];
         println!(
@@ -507,7 +522,7 @@ fn count(pixels: &[u32], line: usize, size: usize, scene: &Shaders, flipped: boo
 /// Both ways up are tried.
 fn check_pixels(pixels: &[u32], line: usize, size: usize, scene: &Shaders) -> bool {
     let (down, up) = (count(pixels, line, size, scene, true), count(pixels, line, size, scene, false));
-    let (best, way) = if down.wrong() <= up.wrong() { (down, "apex down in memory") } else { (up, "apex up in memory") };
+    let (best, way) = if up.wrong() <= down.wrong() { (up, "first line on top") } else { (down, "lines reversed") };
     let good = best.wrong() == 0;
     println!(
         "Pixels {}x{}, {}: inside wrong {}, outside wrong {}, first {:x?}",
@@ -525,7 +540,7 @@ fn check_pixels(pixels: &[u32], line: usize, size: usize, scene: &Shaders) -> bo
     );
     if scene.shaded {
         // The corners as drawn: a pixel inside near each, and the centre.
-        let points = [(0.25, 0.2), (0.75, 0.2), (0.5, 0.75), (0.5, 0.4)];
+        let points = [(0.25, 0.8), (0.75, 0.8), (0.5, 0.25), (0.5, 0.6)];
         let mut text = [0u32; 4];
         for (slot, (fx, fy)) in text.iter_mut().zip(points) {
             let (x, y) = ((fx * size as f32) as usize, (fy * size as f32) as usize);
@@ -536,28 +551,37 @@ fn check_pixels(pixels: &[u32], line: usize, size: usize, scene: &Shaders) -> bo
     good
 }
 
-/// A frame of `scene` through the GP, then PP0. Returns whether the GP's checks held and both
-/// ended.
-fn draw(gpu: Mali, mct: Mct, shared: &mut Shared, scene: &Shaders, target: Target) -> bool {
+/// A frame of `scene` through the GP, then `pps` PPs from PP0, each with every `pps`th tile.
+/// Returns the microseconds of the PPs, from the first start to the last end, if the GP's
+/// checks held and all ended. `report` prints all of the GP's checks.
+fn draw(gpu: Mali, mct: Mct, shared: &mut Shared, scene: &Shaders, target: Target, pps: usize, report: bool) -> Option<u64> {
     let size = target.size;
     let frame = prepare(shared, scene, size);
-    let words = mali::clear_stream(&mut shared.stream.0, size, size, 0, 1, TileEnd::Blocks(address(&shared.plb)));
+    let plb = address(&shared.plb);
+    let mut words = 0;
+    for pp in 0..pps {
+        words += mali::clear_stream(&mut shared.streams[pp].0, size, size, pp, pps, TileEnd::Blocks(plb));
+    }
     mmu::clean_dcache_range(shared as *const Shared as usize, size_of::<Shared>());
-    // A soft reset of both before each frame, as Linux gives them after each job
+    // A soft reset of each before each frame, as Linux gives them after each job
     // (lima_gp.c:68-101, lima_pp.c:104-135): what they hold from the frame before goes.
-    for (name, reset) in [("GP", gpu.reset_gp(mct, false)), ("PP0", gpu.reset_pp(0, mct, false))] {
-        if let Err(error) = reset {
-            println!("{} reset ERROR {:?}", name, error);
-            return false;
+    if let Err(error) = gpu.reset_gp(mct, false) {
+        println!("GP reset ERROR {:?}", error);
+        return None;
+    }
+    for pp in 0..pps {
+        if let Err(error) = gpu.reset_pp(pp, mct, false) {
+            println!("PP{} reset ERROR {:?}", pp, error);
+            return None;
         }
     }
     if let Err(error) = gpu.clear_l2(mct) {
         println!("L2 ERROR {:?}", error);
-        return false;
+        return None;
     }
     if let Err(error) = gpu.start_gp(&frame) {
         println!("GP start ERROR {:?}", error);
-        return false;
+        return None;
     }
     let result = gpu.wait_gp(&frame, mct, TIMEOUT_US);
     for region in [
@@ -572,70 +596,83 @@ fn draw(gpu: Mali, mct: Mct, shared: &mut Shared, scene: &Shaders, target: Targe
         Err(error) => {
             println!("GP ERROR {:?}", error);
             println!("GP hard reset {:?}", gpu.hard_reset_gp(mct));
-            return false;
+            return None;
         }
     };
-    println!(
-        "{} {}x{}: GP lists ended in {} us, INT_RAWSTAT {:#x}; PP stream {} words",
-        scene.name, size, size, gp_us, rawstat, words
-    );
-    let good = check_gp(shared, scene, size);
-    console::flush();
+    if !check_gp(shared, scene, size, report) {
+        return None;
+    }
 
     let pp_frame = PpFrame::clear(size, size, GREY, target.corner, target.stride, address(&shared.frame_state) as usize);
-    if let Err(error) = gpu.start_pp(0, &pp_frame, address(&shared.stream)) {
-        println!("PP start ERROR {:?}", error);
-        return false;
-    }
-    match gpu.wait_pp(0, mct, TIMEOUT_US) {
-        Ok(us) => println!("PP0 frame in {} us", us),
-        Err(error) => {
-            println!("PP0 ERROR {:?}, state {:x?}", error, gpu.pp_state(0));
-            println!("PP0 hard reset {:?}", gpu.hard_reset_pp(0, mct));
-            return false;
+    let begin = mct.count();
+    for pp in 0..pps {
+        if let Err(error) = gpu.start_pp(pp, &pp_frame, address(&shared.streams[pp])) {
+            println!("PP{} start ERROR {:?}", pp, error);
+            return None;
         }
     }
-    good
+    let mut good = true;
+    for pp in 0..pps {
+        if let Err(error) = gpu.wait_pp(pp, mct, TIMEOUT_US) {
+            println!("PP{} ERROR {:?}, state {:x?}", pp, error, gpu.pp_state(pp));
+            println!("PP{} hard reset {:?}", pp, gpu.hard_reset_pp(pp, mct));
+            good = false;
+        }
+    }
+    let pp_us = (mct.count() - begin) / COUNTS_PER_US;
+    println!(
+        "{} {}x{}, {} PP: GP {} us (INT_RAWSTAT {:#x}), PPs {} us; streams {} words",
+        scene.name, size, size, pps, gp_us, rawstat, pp_us, words
+    );
+    good.then_some(pp_us)
 }
 
-/// Step 2, for one scene.
-fn small(gpu: Mali, mct: Mct, shared: &mut Shared, scene: &Shaders) -> bool {
+/// Step 2, for one scene on `pps` PPs.
+fn small(gpu: Mali, mct: Mct, shared: &mut Shared, scene: &Shaders, pps: usize) -> bool {
     shared.small.fill(PATTERN);
     let corner = shared.small.as_ptr() as usize;
     let target = Target { size: SMALL, corner, stride: SMALL * 4 };
-    let mut good = draw(gpu, mct, shared, scene, target);
+    let mut good = draw(gpu, mct, shared, scene, target, pps, pps == 1).is_some();
     if good {
         mmu::invalidate_dcache_range(corner, size_of_val(&shared.small));
         good = check_pixels(&shared.small, SMALL, SMALL, scene);
     }
-    println!("Triangle {} {}x{}: {}", scene.name, SMALL, SMALL, verdict(good));
+    println!("Triangle {} {}x{}, {} PP: {}", scene.name, SMALL, SMALL, pps, verdict(good));
     console::flush();
     good
 }
 
-/// Step 3 for one scene, onto the uncached screen at column `x`: nothing to keep in step with
-/// the caches.
-fn large(gpu: Mali, mct: Mct, shared: &mut Shared, scene: &Shaders, screen: &Framebuffer, x: usize) -> bool {
+/// Step 3 for one scene on `pps` PPs, onto the uncached screen at column `x`: nothing to keep
+/// in step with the caches. Returns the PPs' microseconds if all was right.
+fn large(gpu: Mali, mct: Mct, shared: &mut Shared, scene: &Shaders, screen: &mut Framebuffer, x: usize, pps: usize) -> Option<u64> {
     let y = (HEIGHT - LARGE) / 2;
+    screen.fill_rect(x, y, LARGE, LARGE, PATTERN);
+    screen.flush();
     let corner = screen.address() + (y * WIDTH + x) * 4;
     let target = Target { size: LARGE, corner, stride: screen.stride() };
-    let mut good = draw(gpu, mct, shared, scene, target);
-    if good {
-        good = check_pixels(&screen.pixels()[y * WIDTH + x..], WIDTH, LARGE, scene);
-    }
-    println!("Triangle {} {}x{} on the screen: {}", scene.name, LARGE, LARGE, verdict(good));
+    let us = draw(gpu, mct, shared, scene, target, pps, false);
+    let good = us.is_some() && check_pixels(&screen.pixels()[y * WIDTH + x..], WIDTH, LARGE, scene);
+    println!("Triangle {} {}x{} on the screen, {} PP: {}", scene.name, LARGE, LARGE, pps, verdict(good));
     console::flush();
-    good
+    us.filter(|_| good)
 }
 
 /// Steps 2 and 3, each scene; the screen's step only if every small frame was right.
-fn run(gpu: Mali, mct: Mct, shared: &mut Shared, screen: Option<&Framebuffer>) -> bool {
-    let mut good = small(gpu, mct, shared, &FLAT);
-    good &= small(gpu, mct, shared, &SHADED);
+fn run(gpu: Mali, mct: Mct, shared: &mut Shared, screen: Option<&mut Framebuffer>) -> bool {
+    let mut good = small(gpu, mct, shared, &FLAT, 1);
+    good &= small(gpu, mct, shared, &SHADED, 1);
+    good &= small(gpu, mct, shared, &SHADED, mali::PP_COUNT);
     if good && let Some(screen) = screen {
         // Two columns, even for the write-back: a quarter and three quarters across.
-        good &= large(gpu, mct, shared, &FLAT, screen, WIDTH / 4 - LARGE / 2);
-        good &= large(gpu, mct, shared, &SHADED, screen, WIDTH * 3 / 4 - LARGE / 2);
+        for (scene, x) in [(&FLAT, WIDTH / 4 - LARGE / 2), (&SHADED, WIDTH * 3 / 4 - LARGE / 2)] {
+            let one = large(gpu, mct, shared, scene, screen, x, 1);
+            let four = large(gpu, mct, shared, scene, screen, x, mali::PP_COUNT);
+            if let (Some(one), Some(four)) = (one, four) {
+                let speedup = one as f32 / four as f32;
+                println!("{} {}x{}: 1 PP {} us, 4 PPs {} us: {:.2} times as fast", scene.name, LARGE, LARGE, one, four, speedup);
+            }
+            good &= one.is_some() && four.is_some();
+        }
     }
     println!("Triangles: {}", verdict(good));
     good
@@ -665,14 +702,14 @@ fn start_screen(mct: Mct) -> Option<Framebuffer> {
     Some(screen)
 }
 
-fn wait_keys(gpu: Mali, mct: Mct, shared: &mut Shared, screen: Option<&Framebuffer>) -> ! {
+fn wait_keys(gpu: Mali, mct: Mct, shared: &mut Shared, mut screen: Option<Framebuffer>) -> ! {
     println!("Keys: g again, r restart, f fastboot");
     console::flush();
     let uart = console::uart();
     loop {
         match uart.try_read_byte() {
             Some(b'g') => {
-                run(gpu, mct, shared, screen);
+                run(gpu, mct, shared, screen.as_mut());
                 println!("Keys: g again, r restart, f fastboot");
                 console::flush();
             }
@@ -684,7 +721,7 @@ fn wait_keys(gpu: Mali, mct: Mct, shared: &mut Shared, screen: Option<&Framebuff
 }
 
 fn main(_args: BootArgs) -> ! {
-    println!("\nGPU triangles: Mali-400 GP and PP0, flat and shaded");
+    println!("\nGPU triangles: Mali-400 GP and PPs, flat and shaded");
     let mct = Mct::new();
     mct.start();
     mmu::enable();
@@ -710,14 +747,20 @@ fn main(_args: BootArgs) -> ! {
         wait_keys(gpu, mct, shared, None);
     }
     let gp = (gpu.reset_gp(mct, false), gpu.enable_mmu(None, tables.directory(), mct));
-    let pp = (gpu.reset_pp(0, mct, false), gpu.enable_mmu(Some(0), tables.directory(), mct));
-    if gp.0.is_err() || gp.1.is_err() || pp.0.is_err() || pp.1.is_err() {
-        println!("GP reset, MMU {:?}; PP0 reset, MMU {:?}", gp, pp);
+    if gp.0.is_err() || gp.1.is_err() {
+        println!("GP reset, MMU {:?}", gp);
         wait_keys(gpu, mct, shared, None);
     }
-    println!("GP and PP0 reset, their MMUs paging; buffers at {:#x}", shared as *const Shared as usize);
+    for index in 0..mali::PP_COUNT {
+        let pp = (gpu.reset_pp(index, mct, false), gpu.enable_mmu(Some(index), tables.directory(), mct));
+        if pp.0.is_err() || pp.1.is_err() {
+            println!("PP{} reset, MMU {:?}", index, pp);
+            wait_keys(gpu, mct, shared, None);
+        }
+    }
+    println!("GP and PP0-3 reset, their MMUs paging; buffers at {:#x}", shared as *const Shared as usize);
     console::flush();
-    let screen = start_screen(mct);
-    run(gpu, mct, shared, screen.as_ref());
-    wait_keys(gpu, mct, shared, screen.as_ref());
+    let mut screen = start_screen(mct);
+    run(gpu, mct, shared, screen.as_mut());
+    wait_keys(gpu, mct, shared, screen);
 }
