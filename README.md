@@ -27,6 +27,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `fat_test/`: FAT32 on CACHE with the `embedded-sdmmc` crate: formats it if needed, writes, reads and lists files
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `wifi_async_test/`: the same chip under Embassy as an `embassy-net` device, its runner task woken by the host wake line
+- `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
 - `gpu_test/`: Mali-400 MP4 bring-up: its supply, power domain and clock, what its blocks say they are, their resets and interrupt lines
 - `heap_test/`: the TLSF global allocator: collections, timings, 48 MiB, then four cores and their interrupt handlers allocating at once
 - `async_test/`: Embassy on all four cores: timers, tasks, and channels between the cores
@@ -1052,6 +1053,28 @@ On the board:
 The power unit's status reads 0 whether every block is on or there is no power unit: the vendor
 kernel does not list one. The supply is at 1.1 V, above the 1.025 V of the highest operating
 point, 440 MHz.
+
+### First frames
+
+`IdentityMap` gives the GPU's MMUs the CPU's addresses, read and write. `PpFrame::clear` and
+`clear_stream` make a PP frame that draws nothing: each tile is written back in its clear colour,
+B8G8R8A8 into a linear buffer, which the FIMD shows as XRGB. The frame and stream layouts come from
+Mesa's lima driver (MIT). A stream lists the tiles a PP renders; the GP and its polygon lists are
+not used yet, so a tile is either its position alone or points at an empty list.
+
+`make img APP=gpu_clear_test`: PP0 clears a 64 x 64 buffer, trying both kinds of tile, and the CPU
+checks every pixel; then the screen, by PP0 alone and by all four, against a CPU fill. On the
+board, GPU at 160 MHz:
+
+| Check | Result |
+|---|---|
+| PP0, 64 x 64 | 40 us, every pixel right, with tiles as their position alone |
+| PP0, 1280 x 800 | 4782 us, every pixel right: about 860 MB/s |
+| PP0-3, 1280 x 800 | 3623 to 3626 us over 20 frames, every pixel right: about 1.1 GB/s |
+| CPU fill and cache flush, 1280 x 800 | 7101 us |
+
+Four PPs are only 1.3 times one: the frame is 4 MB of writes and nothing else, with the FIMD
+reading the same DRAM meanwhile, so the bus is the likely limit, not measured.
 
 ## Heap
 

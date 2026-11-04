@@ -1,0 +1,9 @@
+[package]
+name = "gpu_clear_test"
+version = "0.1.0"
+edition = "2024"
+description = "First Mali-400 frames for exynos_4412_rs: the pixel processors clear a buffer, then the screen"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }

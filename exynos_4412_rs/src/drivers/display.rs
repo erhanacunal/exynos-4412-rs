@@ -310,11 +310,19 @@ impl Framebuffer {
         self.height
     }
 
-    fn address(&self) -> usize {
+    /// Where the pixels start: an identity-mapped, so physical, address.
+    pub fn address(&self) -> usize {
         self.pixels.as_ptr() as usize
     }
 
-    const fn stride(&self) -> usize {
+    /// The pixels, line after line, as the CPU's caches have them: after a device wrote them,
+    /// [`mmu::invalidate_dcache_range`](crate::mmu::invalidate_dcache_range) first.
+    pub fn pixels(&self) -> &[u32] {
+        &self.pixels[..self.width * self.height]
+    }
+
+    /// Bytes from one line to the next.
+    pub const fn stride(&self) -> usize {
         self.width * size_of::<u32>()
     }
 
