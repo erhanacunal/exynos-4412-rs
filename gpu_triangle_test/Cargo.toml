@@ -1,0 +1,9 @@
+[package]
+name = "gpu_triangle_test"
+version = "0.1.0"
+edition = "2024"
+description = "One triangle through the Mali-400's geometry processor, with shaders compiled offline by Mesa"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }

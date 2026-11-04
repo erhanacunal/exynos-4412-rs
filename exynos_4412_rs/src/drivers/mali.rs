@@ -83,8 +83,20 @@ const L2_COMMAND: usize = 0x10;
 const L2_COMMAND_CLEAR_ALL: u32 = 1 << 0;
 
 /// lima_regs.h:60-105.
+/// The six frame registers, from `VSCL_START_ADDR`: lima_regs.h:54-59.
+const GP_FRAME: usize = 0x00;
 const GP_CMD: usize = 0x20;
+const GP_CMD_START_VS: u32 = 1 << 0;
+const GP_CMD_START_PLBU: u32 = 1 << 1;
+const GP_CMD_UPDATE_PLBU_ALLOC: u32 = 1 << 4;
+const GP_CMD_RESET: u32 = 1 << 5;
 const GP_CMD_SOFT_RESET: u32 = 1 << 10;
+const GP_IRQ_VS_END_CMD_LST: u32 = 1 << 0;
+const GP_IRQ_PLBU_END_CMD_LST: u32 = 1 << 1;
+/// `LIMA_GP_IRQ_MASK_ERROR`: lima_regs.h:131-142.
+const GP_IRQ_ERRORS: u32 = (1 << 2) | (1 << 6) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 13) | (1 << 14) | (1 << 20) | (1 << 21) | (1 << 22);
+const GP_STATUS_ACTIVE: u32 = (1 << 1) | (1 << 3);
+const GP_PERF_CNT_0_LIMIT: usize = 0x54;
 const GP_INT_RAWSTAT: usize = 0x24;
 const GP_INT_CLEAR: usize = 0x28;
 const GP_INT_MASK: usize = 0x2C;
@@ -161,6 +173,18 @@ pub enum Error {
         index: usize,
         /// `INT_RAWSTAT`.
         rawstat: u32,
+        /// Its MMU's `STATUS`.
+        mmu_status: u32,
+        /// Its MMU's last page fault address.
+        fault: u32,
+    },
+    /// The GP raised an error, or did not finish in time: its `INT_RAWSTAT` and `STATUS`, and
+    /// its MMU's `STATUS` and page fault address.
+    Gp {
+        /// `INT_RAWSTAT`.
+        rawstat: u32,
+        /// `STATUS`.
+        status: u32,
         /// Its MMU's `STATUS`.
         mmu_status: u32,
         /// Its MMU's last page fault address.
@@ -479,7 +503,9 @@ const WB_FORMAT_B8G8R8A8: u32 = 0x03;
 const WB_TYPE_COLOR: u32 = 0x02;
 
 /// The registers of a PP frame: [`PP_FRAME_REGISTERS`] words, then up to three write-backs of
-/// twelve. A frame from [`PpFrame::clear`] draws nothing: every tile is the clear colour.
+/// twelve. A frame from [`PpFrame::clear`] clears every tile to its colour, then draws what the
+/// tile's polygon list holds: nothing with [`TileEnd::Bare`], what the GP binned there with
+/// [`TileEnd::Blocks`].
 #[derive(Clone, Copy, Debug)]
 pub struct PpFrame {
     /// The frame registers: `genxml/common.xml:222-263`.
@@ -582,6 +608,10 @@ pub enum TileEnd {
     Bare,
     /// The position, then a list of polygons at this address that holds only its end.
     EmptyList(u32),
+    /// The position, then the tile's own polygon list: the block the GP's PLBU wrote for it,
+    /// [`PLB_BLOCK`] bytes a tile from this address, row after row of the frame's tiles, as
+    /// [`Commands::plbu_head`] lays them out (lima_job.c:549-554).
+    Blocks(u32),
 }
 
 /// Writes into `stream` the tiles of a `width` by `height` frame that PP `pp` of `pp_count`
@@ -597,7 +627,12 @@ pub fn clear_stream(stream: &mut [u32], width: usize, height: usize, pp: usize, 
         stream[at] = 0;
         stream[at + 1] = 0xB800_0000 | x | (y << 8);
         at += 2;
-        if let TileEnd::EmptyList(list) = end {
+        let list = match end {
+            TileEnd::Bare => None,
+            TileEnd::EmptyList(list) => Some(list),
+            TileEnd::Blocks(blocks) => Some(blocks + tile as u32 * PLB_BLOCK as u32),
+        };
+        if let Some(list) = list {
             stream[at] = 0xE000_0002 | ((list >> 3) & !0xE000_0003);
             stream[at + 1] = 0xB000_0000;
             at += 2;
@@ -692,6 +727,81 @@ impl Mali {
         ))
     }
 
+    /// Writes `frame` into the GP and starts the lists it holds, as lima_gp.c:127-167 does. The
+    /// GP must be idle, after a reset, with its MMU on.
+    pub fn start_gp(&self, frame: &GpFrame) -> Result<(), Error> {
+        self.check()?;
+        self.write(GP + GP_INT_CLEAR, self.read(GP + GP_INT_RAWSTAT));
+        let registers = [frame.vs_start, frame.vs_end, frame.plbu_start, frame.plbu_end, frame.heap_start, frame.heap_end];
+        for (i, value) in registers.iter().enumerate() {
+            self.write(GP + GP_FRAME + i * 4, *value);
+        }
+        let mut command = 0;
+        if frame.vs_start != frame.vs_end {
+            command |= GP_CMD_START_VS;
+        }
+        if frame.plbu_start != frame.plbu_end {
+            command |= GP_CMD_START_PLBU;
+        }
+        self.write(GP + GP_CMD, GP_CMD_UPDATE_PLBU_ALLOC);
+        self.write(GP + GP_CMD, command);
+        Ok(())
+    }
+
+    /// Waits until the lists [`start_gp`](Self::start_gp) started have ended and the GP is idle,
+    /// as lima_gp.c:33-58 judges, and returns how many microseconds that took from the call.
+    /// Returns `INT_RAWSTAT` too: which lists ended. An error or `timeout_us` without an end
+    /// leaves the GP to [`hard_reset_gp`](Self::hard_reset_gp).
+    pub fn wait_gp(&self, frame: &GpFrame, mct: Mct, timeout_us: u64) -> Result<(u64, u32), Error> {
+        self.check()?;
+        let mut wanted = 0;
+        if frame.vs_start != frame.vs_end {
+            wanted |= GP_IRQ_VS_END_CMD_LST;
+        }
+        if frame.plbu_start != frame.plbu_end {
+            wanted |= GP_IRQ_PLBU_END_CMD_LST;
+        }
+        let begin = mct.count();
+        loop {
+            let raw = self.read(GP + GP_INT_RAWSTAT);
+            if raw & GP_IRQ_ERRORS != 0 {
+                return Err(self.gp_error());
+            }
+            if raw & wanted == wanted && self.read(GP + GP_STATUS) & GP_STATUS_ACTIVE == 0 {
+                let us = (mct.count() - begin) / COUNTS_PER_US;
+                self.write(GP + GP_INT_CLEAR, raw);
+                return Ok((us, raw));
+            }
+            if mct.count() - begin > timeout_us * COUNTS_PER_US {
+                return Err(self.gp_error());
+            }
+        }
+    }
+
+    fn gp_error(&self) -> Error {
+        Error::Gp {
+            rawstat: self.read(GP + GP_INT_RAWSTAT),
+            status: self.read(GP + GP_STATUS),
+            mmu_status: self.read(GP_MMU + MMU_STATUS),
+            fault: self.read(GP_MMU + MMU_PAGE_FAULT_ADDR),
+        }
+    }
+
+    /// Stops the GP whatever it does, as lima_gp.c:175-193 does.
+    pub fn hard_reset_gp(&self, mct: Mct) -> Result<u64, Error> {
+        self.check()?;
+        self.write(GP + GP_PERF_CNT_0_LIMIT, 0xC0FF_E000);
+        self.write(GP + GP_INT_MASK, 0);
+        self.write(GP + GP_CMD, GP_CMD_RESET);
+        let us = self.wait(Block::Gp, mct, || {
+            self.write(GP + GP_PERF_CNT_0_LIMIT, 0xC01A_0000);
+            self.read(GP + GP_PERF_CNT_0_LIMIT) == 0xC01A_0000
+        })?;
+        self.write(GP + GP_PERF_CNT_0_LIMIT, 0);
+        self.write(GP + GP_INT_CLEAR, self.read(GP + GP_INT_RAWSTAT));
+        Ok(us)
+    }
+
     /// Stops PP `index` whatever it does, as lima_pp.c:171-195 does.
     pub fn hard_reset_pp(&self, index: usize, mct: Mct) -> Result<u64, Error> {
         self.check()?;
@@ -706,5 +816,171 @@ impl Mali {
         self.write(base + PP_PERF_CNT_0_LIMIT, 0);
         self.write(base + PP_INT_CLEAR, self.read(base + PP_INT_RAWSTAT));
         Ok(us)
+    }
+}
+
+/// The GP's frame registers: where its two command lists start and end, and the heap its PLBU
+/// takes polygon list memory from when a block's own is full. A list that starts where it ends
+/// is not run. lima_job.c:914-921 in Mesa.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpFrame {
+    /// The vertex shader's command list.
+    pub vs_start: u32,
+    /// Its end: the address after its last command.
+    pub vs_end: u32,
+    /// The PLBU's command list, which bins the primitives into the tiles' polygon lists.
+    pub plbu_start: u32,
+    /// Its end.
+    pub plbu_end: u32,
+    /// The heap.
+    pub heap_start: u32,
+    /// Its end.
+    pub heap_end: u32,
+}
+
+/// Primitive mode of [`Commands::plbu_draw_arrays`]: lima_gpu.h and `MESA_PRIM_TRIANGLES`.
+pub const MODE_TRIANGLES: u32 = 4;
+/// Bytes of a tile's polygon list block: `LIMA_CTX_PLB_BLK_SIZE`, lima_context.h:242.
+pub const PLB_BLOCK: usize = 512;
+/// The most blocks a Mali-400 frame takes: lima_screen.c:362.
+pub const PLB_MAX_BLOCKS: usize = 512;
+
+/// A GP command list being written into `words`, a command being two of them. The commands and
+/// their names are those of lima_gpu.h:59-153 in Mesa, `VS_CMD_*` and `PLBU_CMD_*`; the order a
+/// list wants is that of lima_draw.c:287-439 and lima_job.c:406-434.
+pub struct Commands<'a> {
+    words: &'a mut [u32],
+    len: usize,
+}
+
+impl<'a> Commands<'a> {
+    /// An empty list in `words`.
+    pub fn new(words: &'a mut [u32]) -> Self {
+        Self { words, len: 0 }
+    }
+
+    /// Bytes written so far: the list's end is its start plus these.
+    pub fn bytes(&self) -> u32 {
+        (self.len * size_of::<u32>()) as u32
+    }
+
+    /// # Panics
+    ///
+    /// If the list is full.
+    fn push(&mut self, low: u32, high: u32) {
+        self.words[self.len] = low;
+        self.words[self.len + 1] = high;
+        self.len += 2;
+    }
+
+    /// `VS_CMD_ARRAYS_SEMAPHORE_BEGIN_1` and `_2`: the vertex shader waits for the PLBU.
+    pub fn vs_arrays_semaphore_begin(&mut self) {
+        self.push(0x0002_8000, 0x5000_0000);
+        self.push(0x0000_0001, 0x5000_0000);
+    }
+
+    /// `VS_CMD_UNIFORMS_ADDRESS`: `bytes`, a multiple of 16, of uniforms, then the viewport's
+    /// scale and translation, then the shader's constants.
+    pub fn vs_uniforms(&mut self, address: u32, bytes: u32) {
+        self.push(address, 0x3000_0000 | (bytes << 12));
+    }
+
+    /// `VS_CMD_SHADER_ADDRESS` and `VS_CMD_SHADER_INFO`: `bytes` of shader, 16 an instruction,
+    /// and how many instructions to fetch ahead, from the compiler.
+    pub fn vs_shader(&mut self, address: u32, bytes: u32, prefetch: u32) {
+        self.push(address, 0x4000_0000 | (bytes << 12));
+        self.push((prefetch << 20) | (((bytes >> 4) - 1) << 10), 0x1000_0040);
+    }
+
+    /// `VS_CMD_VARYING_ATTRIBUTE_COUNT`, then `VS_CMD_UNKNOWN1`. Outputs include the position.
+    pub fn vs_counts(&mut self, outputs: u32, attributes: u32) {
+        self.push(((outputs - 1) << 8) | ((attributes - 1) << 24), 0x1000_0042);
+        self.push(0x0000_0003, 0x1000_0041);
+    }
+
+    /// `VS_CMD_ATTRIBUTES_ADDRESS`: `count` descriptors of two words, the data's address and
+    /// `stride << 11 | type << 2 | (components - 1)` (lima_draw.c:850-855).
+    pub fn vs_attributes(&mut self, address: u32, count: u32) {
+        self.push(address, 0x2000_0000 | (count << 17));
+    }
+
+    /// `VS_CMD_VARYINGS_ADDRESS`: `count` descriptors of two words, where each output goes and
+    /// how; the position's is `0x8020` (lima_draw.c:1006-1009).
+    pub fn vs_varyings(&mut self, address: u32, count: u32) {
+        self.push(address, 0x2000_0008 | (count << 17));
+    }
+
+    /// `VS_CMD_DRAW` of `vertices`, not indexed, then `VS_CMD_UNKNOWN2` and
+    /// `VS_CMD_ARRAYS_SEMAPHORE_END`.
+    pub fn vs_draw(&mut self, vertices: u32) {
+        self.push(vertices << 24, vertices >> 8);
+        self.push(0x0000_0000, 0x6000_0000);
+        self.push(0x0000_0000, 0x5000_0000);
+    }
+
+    /// The head of a PLBU list for a frame of `tiles_x` by `tiles_y` tiles, a polygon list block
+    /// each: `PLBU_CMD_UNKNOWN2`, `BLOCK_STEP` of no shifts, `TILED_DIMENSIONS`, `BLOCK_STRIDE`
+    /// and `ARRAY_ADDRESS`, the address of the blocks' addresses, one word each.
+    ///
+    /// # Panics
+    ///
+    /// If the frame has more than [`PLB_MAX_BLOCKS`] tiles: Mesa then shares a block among tiles.
+    pub fn plbu_head(&mut self, tiles_x: u32, tiles_y: u32, block_addresses: u32) {
+        let blocks = tiles_x * tiles_y;
+        assert!(blocks as usize <= PLB_MAX_BLOCKS, "one polygon list block a tile");
+        self.push(0x0000_0200, 0x1000_010B);
+        self.push(0, 0x1000_010C);
+        self.push(((tiles_x - 1) << 24) | ((tiles_y - 1) << 8), 0x1000_0109);
+        self.push(tiles_x & 0xFF, 0x3000_0000);
+        self.push(block_addresses, 0x2800_0000 | (blocks - 1) | 1);
+    }
+
+    /// `PLBU_CMD_VIEWPORT_LEFT`, `_RIGHT`, `_BOTTOM` and `_TOP`, in pixels.
+    pub fn plbu_viewport(&mut self, left: f32, right: f32, bottom: f32, top: f32) {
+        self.push(left.to_bits(), 0x1000_0107);
+        self.push(right.to_bits(), 0x1000_0108);
+        self.push(bottom.to_bits(), 0x1000_0105);
+        self.push(top.to_bits(), 0x1000_0106);
+    }
+
+    /// `PLBU_CMD_ARRAYS_SEMAPHORE_BEGIN`.
+    pub fn plbu_arrays_semaphore_begin(&mut self) {
+        self.push(0x0001_0002, 0x6000_0000);
+    }
+
+    /// `PLBU_CMD_PRIMITIVE_SETUP`, not indexed, no point size: `cull` 0, or `0x20000` and
+    /// `0x40000` as lima_draw.c:354-359 choose them.
+    pub fn plbu_primitive_setup(&mut self, cull: u32) {
+        self.push(0x2200 | cull, 0x1000_010B);
+    }
+
+    /// `PLBU_CMD_RSW_VERTEX_ARRAY`: the render state the PPs use, and where the vertex shader
+    /// wrote the positions, 16-aligned.
+    pub fn plbu_render_state(&mut self, render_state: u32, positions: u32) {
+        self.push(render_state, 0x8000_0000 | (positions >> 4));
+    }
+
+    /// `PLBU_CMD_SCISSORS`, in pixels, the maxima exclusive; then `PLBU_CMD_UNKNOWN1`.
+    pub fn plbu_scissor(&mut self, min_x: u32, max_x: u32, min_y: u32, max_y: u32) {
+        self.push((min_x << 30) | ((max_y - 1) << 15) | min_y, 0x7000_0000 | ((max_x - 1) << 13) | (min_x >> 2));
+        self.push(0, 0x1000_010A);
+    }
+
+    /// `PLBU_CMD_DEPTH_RANGE_NEAR` and `_FAR`.
+    pub fn plbu_depth_range(&mut self, near: f32, far: f32) {
+        self.push(near.to_bits(), 0x1000_010E);
+        self.push(far.to_bits(), 0x1000_010F);
+    }
+
+    /// `PLBU_CMD_DRAW_ARRAYS` of `count` vertices from `start`, then
+    /// `PLBU_CMD_ARRAYS_SEMAPHORE_END`.
+    pub fn plbu_draw_arrays(&mut self, mode: u32, start: u32, count: u32) {
+        self.push((count << 24) | start, ((mode & 0x1F) << 16) | (count >> 8));
+        self.push(0x0001_0001, 0x6000_0000);
+    }
+
+    /// `PLBU_CMD_END`, also how Mesa ends a vertex shader list after its semaphore.
+    pub fn end(&mut self) {
+        self.push(0, 0x5000_0000);
     }
 }

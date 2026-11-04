@@ -1,0 +1,9 @@
+[package]
+name = "uart_boot"
+version = "0.1.0"
+edition = "2024"
+description = "Waits for an application image over UART2, checks it and starts it"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }

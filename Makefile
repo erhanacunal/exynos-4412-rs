@@ -22,10 +22,12 @@ bin: build
 	@size=$$(stat -c %s $(BIN)); echo "$(BIN): $$size bytes"; \
 	if [ $$size -gt $(MAX_SIZE) ]; then echo "error: larger than bootcmd reads"; exit 1; fi
 
-# Same invocation as ~/prepare.sh, with the same pagesize and no ramdisk.
+# Same invocation as ~/prepare.sh, with the same pagesize and no ramdisk. Also kept as
+# $(APP).img, which the next `make img` of another application leaves alone.
 img: bin
 	$(MKBOOTIMG) --kernel $(BIN) --ramdisk NONE --cmdline "console=ttySAC2,115200" --pagesize 4096 -o $(IMG)
 	@echo "$(IMG): $$(stat -c %s $(IMG)) bytes"
+	@cp $(IMG) $(OUT)/$(APP).img
 
 disasm: build
 	@$(TOOLS)/llvm-nm $(ELF) | grep -E ' (_start|__exynos_vectors|__image_end|__bss_start|__stacks_end)$$'

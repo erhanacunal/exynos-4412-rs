@@ -28,6 +28,8 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `wifi_async_test/`: the same chip under Embassy as an `embassy-net` device, its runner task woken by the host wake line
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
+- `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom and starts it, instead of fastboot
+- `gpu_triangle_test/`: one triangle through the GP and a PP, with shaders compiled offline by Mesa's lima compiler
 - `gpu_rect_test/`: rectangles filled by the pixel processors with CPU-drawn edges, against the CPU alone, cached and uncached
 - `gpu_test/`: Mali-400 MP4 bring-up: its supply, power domain and clock, what its blocks say they are, their resets and interrupt lines
 - `heap_test/`: the TLSF global allocator: collections, timings, 48 MiB, then four cores and their interrupt handlers allocating at once
@@ -74,6 +76,32 @@ back, write `~/boot.img` with the same command; U-Boot is not touched.
 
 Starting with `go` is also supported (`dcache off`, load, `go 0x40008000`), but this path has
 not been tested.
+
+### Loading over UART (`uart_boot`)
+
+`uart_boot` stays in the boot partition and takes each new build over the console, so fastboot
+is needed only to install it:
+
+1. Once: `make img APP=uart_boot`, then flash `boot.img` as above. `make img` also leaves each
+   image as `<app>.img`, so `uart_boot.img` stays after other builds overwrite `boot.img`.
+2. Each build: `make bin APP=<app>`. In minicom, Ctrl-A S, `uartboot`, then
+   `<app>.bin`. `tools/uartboot.py` sends it, and the board checks and starts it.
+3. To load again, restart the board: the application's `r` key, or the reset button.
+
+minicom runs `tools/uartboot.py` with its standard input and output on the port. It is set up
+in `~/.minirc.dfl` (or with Ctrl-A O, File transfer protocols):
+
+```
+pu pname10          YUNYNuartboot
+pu pprog10          python3 /path/to/tools/uartboot.py
+```
+
+The image is a `make bin` output with its zImage header; a `boot.img` also works, as its
+Android header is skipped. It is sent at 115200 baud, about 11 KB/s. `uart_boot` puts it at
+`0x50000000`, checks its length, CRC-32 and zImage magic, and jumps there with the MMU and
+caches off and U-Boot's `r0`-`r2`. The application's startup then moves it down to its link
+address, as it does when `bootm` starts it at `0x40009000`. The protocol is described in
+`uart_boot/src/main.rs`. While it waits, `f` restarts into fastboot and `r` restarts.
 
 ## Image format
 
@@ -1107,6 +1135,30 @@ board, all eleven right:
 Plain fills are the CPU's: through the uncached view it writes about 1.8 GB/s, combining writes,
 and needs no cache maintenance. Each of the GPU's 200 frames costs about 200 to 270 us. The GPU is
 for what the CPU cannot do as fast: triangles, textures, blending.
+
+### First triangle
+
+`gpu_triangle_test` draws one flat orange triangle through the whole pipeline: the GP runs the
+vertex shader and the PLBU, which bins the triangle into each tile's polygon list, and a PP
+renders the tiles from those lists with the fragment shader. The shaders are compiled offline
+by Mesa 25.3.3's lima compiler (MIT), run on a PC with `drm-shim` and `LIMA_DEBUG=dump`; the
+binaries and the render state are copied from that dump into the application. The command
+lists are built on the board with `mali::Commands`, whose commands are those of Mesa's
+`lima_gpu.h`, in the order Mesa's driver writes them. `TileEnd::Blocks` points each tile of the
+PP's stream at its polygon list block, and `Mali::start_gp` and `wait_gp` run the GP.
+
+On the board, GPU at 160 MHz, every pixel checked, none wrong:
+
+| Frame | GP, both lists | PP0 | Tiles: covered, listing the triangle |
+|---|---|---|---|
+| 64 x 64, own buffer | 8 to 12 us | 24 us | 12, 16 |
+| 256 x 256, middle of the screen | 20 to 22 us | 367 us | 84, 169 |
+
+- The vertex shader's positions are exactly the viewport transform of the three vertices.
+- The PLBU bins by more than the triangle's pixels: tiles near its edges get it too. Every
+  block gets at least the end of its list, so the PP needs no other empty list.
+- The colour's green, 0.5, comes out 0x7F or 0x80 by pixel: the frame dithers, as Mesa sets it.
+- The PP's first line is the viewport's bottom, so the triangle is upside down on the screen.
 
 ## Heap
 
