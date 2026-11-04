@@ -1160,6 +1160,16 @@ On the board, GPU at 160 MHz, every pixel checked, none wrong:
 - The colour's green, 0.5, comes out 0x7F or 0x80 by pixel: the frame dithers, as Mesa sets it.
 - The PP's first line is the viewport's bottom, so the triangle is upside down on the screen.
 
+A second scene passes a colour per vertex through a varying: red, green and blue corners,
+interpolated by the PP. The vertex shader writes the colours after the positions, 64 bytes on,
+as Mesa lays its GP output out, and the render state points the PP at them. On the board every
+pixel inside is within 1/255 of the exact interpolation, in both sizes, with the same times as
+the flat scene.
+
+The GP and the PP need a soft reset before each frame, as Linux gives them after each job:
+without one, the PP drew the shaded scene after the flat one in black, every pixel inside
+`0xFF000000`, though its render state named the new fragment shader.
+
 ## Heap
 
 The `heap` feature gives a global allocator: TLSF (the `rlsf` crate) behind a lock that masks
