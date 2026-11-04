@@ -42,6 +42,8 @@ pub mod exceptions;
 #[cfg(feature = "fat")]
 pub mod fat;
 pub mod firmware;
+#[cfg(feature = "heap")]
+pub mod heap;
 pub mod mmu;
 pub mod nvram;
 pub mod partition;

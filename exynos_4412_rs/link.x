@@ -6,6 +6,8 @@
  *     MEMORY { RAM : ORIGIN = 0x40008000, LENGTH = 4M }
  *
  * memory.x may also override any stack size below, e.g. __svc_stack_size = 64K;
+ * and give the heap of the `heap` feature its size, e.g. __heap_size = 64M; it goes after
+ * the stacks, so RAM must be that much longer.
  */
 INCLUDE memory.x
 
@@ -34,6 +36,7 @@ PROVIDE(__irq_stack_size = 16K);
 PROVIDE(__abt_stack_size = 16K);
 PROVIDE(__und_stack_size = 16K);
 PROVIDE(__fiq_stack_size = 16K);
+PROVIDE(__heap_size = 0);
 
 SECTIONS
 {
@@ -101,6 +104,14 @@ SECTIONS
         __stacks_end = .;
     } > RAM
 
+    /* Not cleared at boot: memory the allocator hands out is uninitialised anyway. */
+    .heap (NOLOAD) : ALIGN(4096)
+    {
+        __heap_start = .;
+        . += __heap_size;
+        __heap_end = .;
+    } > RAM
+
     /* Unwind tables are useless with panic=abort and would land in the binary. */
     /DISCARD/ :
     {
@@ -113,4 +124,5 @@ ASSERT(_start == ORIGIN(RAM), "link.x: _start must be exactly at the load addres
 ASSERT(__image_end - __exynos_relocate_tail <= 0x40, "link.x: the relocation loop must fit in the bytes a 0x40 offset leaves intact");
 ASSERT(__exynos_vectors % 32 == 0, "link.x: VBAR requires a 32-byte aligned vector table");
 ASSERT(__bss_start % 4 == 0 && __bss_end % 4 == 0, "link.x: .bss must be word aligned");
+ASSERT(__heap_end <= ORIGIN(RAM) + LENGTH(RAM), "link.x: the heap does not fit in RAM; enlarge RAM in memory.x or shrink __heap_size");
 ASSERT(__stacks_end <= ORIGIN(RAM) + LENGTH(RAM), "link.x: the stacks do not fit in RAM; enlarge RAM in memory.x or shrink __*_stack_size");

@@ -1,0 +1,9 @@
+[package]
+name = "heap_test"
+version = "0.1.0"
+edition = "2024"
+description = "Heap test for exynos_4412_rs: the TLSF global allocator on one core, then on four at once"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["heap"] }

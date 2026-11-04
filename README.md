@@ -27,6 +27,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `fat_test/`: FAT32 on CACHE with the `embedded-sdmmc` crate: formats it if needed, writes, reads and lists files
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `wifi_async_test/`: the same chip under Embassy as an `embassy-net` device, its runner task woken by the host wake line
+- `heap_test/`: the TLSF global allocator: collections, timings, 48 MiB, then four cores and their interrupt handlers allocating at once
 - `async_test/`: Embassy on all four cores: timers, tasks, and channels between the cores
 - `mmc_async_test/`: async eMMC: reads and writes awaited on the controller's interrupt, from CPU0 and CPU1
 - `uart_tx_test/`: buffered console: `print!` sent on the UART's transmit interrupt, the ring overflowing, two cores printing, flush before a panic and a restart
@@ -1010,6 +1011,42 @@ With read-ahead too, on the fourth boot:
 On the fifth boot, with the RTC: `BOOTS.TXT` stamped 2026-11-03 12:36:28, local time, and
 `LOGS/BOOT.LOG` got `boot 5 at 2026-11-03 12:36:28`. `LOGS`, made on the first boot, keeps
 2026-01-01.
+
+## Heap
+
+The `heap` feature gives a global allocator: TLSF (the `rlsf` crate) behind a lock that masks
+IRQs, so `Box`, `Vec` and the rest work on every core and in interrupt handlers. Finding and
+freeing a block take a bounded number of steps whatever the heap's history; growing a block
+allocates, copies with the lock released, and frees. An application:
+
+1. writes `exynos_4412_rs::global_heap!();` and `extern crate alloc;`; the library does not name
+   the allocator itself, so `ext4_test` keeps its own;
+2. sets `__heap_size` in `memory.x`, up to the DRAM free (`heap_test`: `1024M`), and makes `RAM` that much longer: `link.x` places the
+   heap after the stacks of all cores, not cleared at boot;
+3. calls `heap::init()` on CPU0 after `mmu::enable`, before anything allocates.
+
+`heap::stats()` gives bytes in use, the peak, and allocations, frees and refusals. A refused
+allocation returns null, which `Box` and `Vec` turn into a panic.
+
+`make img APP=heap_test`: collections on CPU0, 20000 timed allocations and frees of 16 B to
+4 KiB, a 768 MiB block written through and a 1.5 GiB one refused; then all four cores at once,
+100000 operations each on blocks of random size and alignment with a pattern each, resizes,
+blocks handed to the next core to check and free, and SGIs whose handlers allocate. At the end
+nothing may be left in use. On the board, heap 1 GiB (MCT resolution 42 ns):
+
+| Check | Result |
+|---|---|
+| `heap::init`, 1 GiB | 1 us |
+| Collections | OK |
+| CPU0 alone, 16 B to 4 KiB | allocation mean 166 ns, max 666 ns; free mean 125 ns, max 583 ns |
+| 768 MiB block | 791 ns; written in 503 ms (1527 MiB/s), read and compared in 1912 ms; 1.5 GiB refused with null |
+| Four cores, 100000 operations each | 314 ms; about 43700 allocations and 12500 resizes per core, 0 corrupt, 0 refused |
+| Per call, on four cores | allocation mean 291 ns, max about 10.1 us; free mean 250 ns, max about 10 us |
+| Across cores and in handlers | about 1440 blocks handed on per core; 391 allocations in SGI handlers per core |
+| After all | 243827 allocations, as many frees, 0 bytes in use |
+
+The worst cases on four cores include waiting for the lock, and an SGI handler that may run
+between the two reads of the counter: they are not the allocator's own time.
 
 ## Async (Embassy)
 
