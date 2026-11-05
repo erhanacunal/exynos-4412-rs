@@ -2,7 +2,7 @@
 name = "mfc_test"
 version = "0.1.0"
 edition = "2024"
-description = "MFC v5.1 bring-up: power, clock, firmware start and its version"
+description = "MFC v5.1 test: firmware start, then H.264 decoding checked picture by picture"
 license = "GPL-2.0-or-later"
 
 [dependencies]

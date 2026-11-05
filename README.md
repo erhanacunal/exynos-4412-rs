@@ -29,7 +29,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `wifi_async_test/`: the same chip under Embassy as an `embassy-net` device, its runner task woken by the host wake line
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
-- `mfc_test/`: MFC bring-up: power, clock, firmware start and its version (GPL, links `exynos_4412_mfc`)
+- `mfc_test/`: MFC test: firmware start, then H.264 decoding checked picture by picture (GPL, links `exynos_4412_mfc`)
 - `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom, or over WiFi by HTTP, and starts it, instead of fastboot
 - `gpu_triangle_test/`: flat, shaded and textured triangles through the GP and the PPs, with shaders compiled offline by Mesa's lima compiler
 - `gpu_cube_test/`: two textured (bilinear), lit cubes turning in perspective, drawn with the `gpu` runtime: two draws a frame, depth tested by the PPs
@@ -1868,8 +1868,18 @@ MFC_FIRMWARE=<path>/s5p-mfc.fw make img APP=mfc_test
 `mfc_test` copies it to the start of port A (`0x6000_0000`; port B at `0x6400_0000`, 36 and
 8 MiB as Linux reserves them), resets the codec, releases the RISC, waits for its
 `FW_STATUS_RET`, sends `SYS_INIT` and prints the firmware's version. The system MMUs in front of
-the ports are not used. Decoding H.264 is the next step; its frames come out as NV12 in 64x32
-tiles.
+the ports are not used.
+
+Then it decodes H.264 with `exynos_4412_mfc::h264::Decoder`: `open` (`OPEN_INSTANCE`), `header`
+with the SPS and PPS (`SEQ_HEADER`, then the frame buffers and `INIT_BUFS`), `decode` once per
+picture (`FRAME_START`), `finish` at the end (`LAST_FRAME`). All of it is polled. A picture handed
+out stays the caller's until `release`. The pictures are NV12MT: 64x32 tiles in Z and mirrored-Z
+groups, which `exynos_4412_mfc::tiles::Plane` reads.
+
+The test stream, `mfc_test/data/pcm320x240.h264`, comes from `tools/h264_pcm.py`. It has only
+I_PCM and P_Skip macroblocks, so a correct decoder gives exactly the pictures drawn, and the
+script also writes their CRC-32s. On the board all 30 pictures match: about 3.9 ms for an IDR
+picture and 1.4 ms for a P picture, at 320x240.
 
 ## QEMU
 

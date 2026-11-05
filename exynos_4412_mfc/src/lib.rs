@@ -20,11 +20,14 @@
 //! # So far
 //!
 //! [`Mfc::init`]: power, clock, reset, firmware into port A, its start, `SYS_INIT`, and its
-//! version (`s5p_mfc_init_hw`, `s5p_mfc_ctrl.c`). Decoding comes next.
+//! version (`s5p_mfc_init_hw`, `s5p_mfc_ctrl.c`). [`h264::Decoder`]: H.264 decoding, one
+//! instance at a time, polled.
 
 #![no_std]
 
+pub mod h264;
 pub mod regs;
+pub mod tiles;
 
 use core::ptr;
 
@@ -59,6 +62,14 @@ pub enum Error {
     /// The firmware answered with an error, or with another answer: `RISC2HOST_CMD` and
     /// `RISC2HOST_ARG2`, its error code.
     Firmware { want: u32, got: u32, error: u32 },
+    /// The ports' memory is used up: what was asked for, in bytes.
+    OutOfMemory(usize),
+    /// The stream data is larger than the stream buffer, or empty.
+    BadStream(usize),
+    /// The sequence header gave a size or a buffer count this crate cannot take.
+    BadSequence { width: u32, height: u32, buffers: u32 },
+    /// The picture to show is in none of the frame buffers: `SI_DISPLAY_Y_ADR`.
+    UnknownFrame(u32),
 }
 
 impl From<PowerDomainTimeout> for Error {
@@ -108,15 +119,27 @@ pub struct Started {
 pub struct Mfc {
     banks: Banks,
     mct: Mct,
+    /// The ports' memory from here on is free; instances take it in order and give it back
+    /// when they close.
+    a_next: usize,
+    b_next: usize,
 }
 
-fn read(offset: usize) -> u32 {
+/// An answer of the firmware: `RISC2HOST_CMD`, `RISC2HOST_ARG1` and `RISC2HOST_ARG2`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Answer {
+    pub got: u32,
+    pub arg1: u32,
+    pub error: u32,
+}
+
+pub(crate) fn read(offset: usize) -> u32 {
     // SAFETY: every offset is a register of the MFC's 64 KiB, device memory that stays mapped for
     // the whole program; `Mfc` exists only after its power domain and gate are on.
     unsafe { ptr::read_volatile((soc::MFC_BASE + offset) as *const u32) }
 }
 
-fn write(offset: usize, value: u32) {
+pub(crate) fn write(offset: usize, value: u32) {
     // SAFETY: as in `read`.
     unsafe { ptr::write_volatile((soc::MFC_BASE + offset) as *mut u32, value) }
 }
@@ -133,7 +156,7 @@ impl Mfc {
             return Err(Error::BadFirmware(firmware.len()));
         }
         let hz = mfc::power_on(hz, mct)?;
-        let mfc = Self { banks, mct };
+        let mfc = Self { banks, mct, a_next: banks.a + regs::FW_BUFFER_BYTES, b_next: banks.b };
 
         // s5p_mfc_load_firmware: the image at port A's base, in DRAM before the RISC reads it.
         // SAFETY: port A's memory is the caller's to give, at least FW_BUFFER_BYTES long, and
@@ -168,6 +191,49 @@ impl Mfc {
         self.banks
     }
 
+    /// How many bytes of each port are still free.
+    pub const fn free(&self) -> (usize, usize) {
+        (self.banks.a + self.banks.a_len - self.a_next, self.banks.b + self.banks.b_len - self.b_next)
+    }
+
+    /// `len` bytes of port A (`false`) or B (`true`), aligned to [`regs::DEC_BUF_ALIGN`].
+    pub(crate) fn take(&mut self, port_b: bool, len: usize) -> Result<usize, Error> {
+        let (next, end) = if port_b {
+            (&mut self.b_next, self.banks.b + self.banks.b_len)
+        } else {
+            (&mut self.a_next, self.banks.a + self.banks.a_len)
+        };
+        let start = next.next_multiple_of(regs::DEC_BUF_ALIGN);
+        let len = len.next_multiple_of(regs::DEC_BUF_ALIGN);
+        if start + len > end {
+            return Err(Error::OutOfMemory(len));
+        }
+        *next = start + len;
+        Ok(start)
+    }
+
+    /// Where the free memory starts, to [`give_back`](Self::give_back) all taken after it.
+    pub(crate) const fn mark(&self) -> (usize, usize) {
+        (self.a_next, self.b_next)
+    }
+
+    pub(crate) fn give_back(&mut self, mark: (usize, usize)) {
+        (self.a_next, self.b_next) = mark;
+    }
+
+    /// `OFFSETA` and `OFFSETB` (`s5p_mfc_opr_v5.c:30`): an address as the firmware takes it.
+    pub(crate) const fn offset_a(&self, address: usize) -> u32 {
+        ((address - self.banks.a) >> regs::OFFSET_SHIFT) as u32
+    }
+
+    pub(crate) const fn offset_b(&self, address: usize) -> u32 {
+        ((address - self.banks.b) >> regs::OFFSET_SHIFT) as u32
+    }
+
+    pub(crate) const fn mct(&self) -> Mct {
+        self.mct
+    }
+
     /// `s5p_mfc_reset` for v5: the RISC, then everything but the memory controller, which is
     /// then waited for, then all but the RISC out of reset.
     fn reset(&self) -> Result<(), Error> {
@@ -186,7 +252,7 @@ impl Mfc {
     }
 
     /// `s5p_mfc_cmd_host2risc_v5`: waits for the command register to be free, then sends.
-    fn command(&self, command: u32, args: [u32; 4]) -> Result<(), Error> {
+    pub(crate) fn command(&self, command: u32, args: [u32; 4]) -> Result<(), Error> {
         let begin = self.mct.count();
         while read(regs::HOST2RISC_CMD) != regs::H2R_CMD_EMPTY {
             if self.elapsed_ms(begin) > BUS_TIMEOUT_MS {
@@ -203,7 +269,16 @@ impl Mfc {
 
     /// Waits for the firmware's answer, polled where Linux takes the interrupt, and clears it as
     /// `s5p_mfc_clear_int_flags_v5` does. Any other answer is an error.
-    fn wait_answer(&self, want: u32) -> Result<u32, Error> {
+    pub(crate) fn wait_answer(&self, want: u32) -> Result<u32, Error> {
+        let answer = self.answer(want)?;
+        if answer.got != want {
+            return Err(Error::Firmware { want, got: answer.got, error: answer.error });
+        }
+        Ok(answer.arg1)
+    }
+
+    /// Waits for any answer and clears it. `want` is only for the timeout's error.
+    pub(crate) fn answer(&self, want: u32) -> Result<Answer, Error> {
         let begin = self.mct.count();
         let got = loop {
             let got = read(regs::RISC2HOST_CMD) & regs::RISC2HOST_CMD_MASK;
@@ -219,10 +294,7 @@ impl Mfc {
         write(regs::RISC_HOST_INT, 0);
         write(regs::RISC2HOST_CMD, 0);
         write(regs::SI_RTN_CHID, 0xFFFF);
-        if got != want {
-            return Err(Error::Firmware { want, got, error });
-        }
-        Ok(arg1)
+        Ok(Answer { got, arg1, error })
     }
 
     fn elapsed_ms(&self, begin: u64) -> u64 {
