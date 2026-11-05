@@ -1887,11 +1887,12 @@ the panel at three times its size, 30 fps.
 
 `mfc_play` plays an H.264 stream on the panel, over and over. `exynos_4412_mfc::annexb` cuts it
 into pictures, and the decoder puts them in display order, B-frames included.
-`exynos_4412_mfc::convert` draws each one with the CPU while the MFC decodes the next one
-(`Decoder::start` and `Decoder::wait`): it detiles the picture, converts BT.601 YCbCr to RGB
-and scales it up by a whole number. A portrait picture that only fits turned is turned a
-quarter turn clockwise. There are three framebuffers: one on the panel, one waiting for its
-vsync, one being drawn (`Fimd::show`, `Fimd::wait_shown`). The stream is built into the image;
+FIMC 0 (`drivers::fimc`, below) converts each one into a framebuffer while the MFC decodes
+the next one (`Decoder::start` and `Decoder::wait`). The picture fills the panel as far as its
+shape allows, turned a quarter turn clockwise when that makes it larger. There are three
+framebuffers: one on the panel, one waiting for its vsync, one being drawn (`Fimd::show`,
+`Fimd::wait_shown`). If the FIMC cannot take the picture, the CPU draws it
+(`exynos_4412_mfc::convert`). The stream is built into the image;
 an MP4 file's video track comes out with `tools/mp4_annexb.py`:
 
 ```
@@ -1901,8 +1902,20 @@ MFC_FIRMWARE=<path>/s5p-mfc.fw MFC_VIDEO=video.h264 MFC_FPS=24 make bin APP=mfc_
 
 Without `MFC_VIDEO` it plays `mfc_test`'s stream. Port B gets 64 MiB here: a 720p frame buffer
 takes about 1.2 MiB of it. On the board a 720x1280 High profile stream with B-frames plays at
-24 fps, turned to fill 1280x720: 35.9 s for 860 pictures. Drawing takes 35.4 ms of each
-picture's 41.7 ms.
+24 fps, turned to fill 1280x720: 35.9 s for 860 pictures. The FIMC takes 6.4 ms per picture,
+where the CPU took 35.4 ms; the CPU waits 1.2 ms on average for the decoder, and is otherwise
+free.
+
+### Scaler and colour converter: FIMC
+
+The four FIMCs at `0x1180_0000` (`exynos4.dtsi:214-264`) are the camera interface's back end:
+each scales, converts between YCbCr and RGB, turns by quarter turns and writes the result to
+memory. `drivers::fimc` uses one from memory to memory: a two-plane YCbCr 4:2:0 picture,
+linear or in the MFC's 64x32 tiles, comes out as `0x00RRGGBB` pixels in a framebuffer, at any
+size. `Fimc::power_on` (camera power domain `0x1002_3C00`, gates, `sclk_fimc` at 160 MHz from
+the MPLL, reset), `configure` once per size, then `start` and `wait` per picture, polled on
+`CISTATUS`. FIMC 3 has no rotator. The registers come from Linux's `exynos4-is/fimc-reg.h`;
+nothing here uses its System MMU.
 
 ## QEMU
 

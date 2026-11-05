@@ -3,12 +3,15 @@
 //!
 //! The stream and the rate are chosen at build time (`build.rs`): `MFC_VIDEO`, in Annex B form,
 //! `MFC_FPS`. The pictures are shown in display order, the decoder reordering them
-//! ([`Config::display_delay`] `None`). The CPU converts each to RGB into one of three
-//! framebuffers while the MFC decodes the next picture, then the FIMD switches to it at a vsync
-//! (`Fimd::show`): one buffer on the panel, one waiting for its vsync, one being drawn. A
-//! picture that fits the panel is scaled up by the largest whole number that still fits; one that
-//! fits only turned, a portrait picture on the landscape panel, is turned a quarter turn
-//! clockwise. One line per pass gives the times.
+//! ([`Config::display_delay`] `None`). FIMC 0 converts each to RGB, scaled and turned, into one
+//! of three framebuffers while the MFC decodes the next picture, then the FIMD switches to it at
+//! a vsync (`Fimd::show`): one buffer on the panel, one waiting for its vsync, one being drawn.
+//! The picture fills the panel as far as its shape allows, turned a quarter turn clockwise when
+//! that makes it larger, a portrait picture on the landscape panel. One line per pass gives the
+//! times.
+//!
+//! If the FIMC cannot take the picture, the CPU draws it (`exynos_4412_mfc::convert`): scaled
+//! up by the largest whole number that fits, or turned at its size.
 //!
 //! Keys: `r` restart, `f` restart into fastboot.
 
@@ -22,6 +25,7 @@ use exynos_4412_mfc::convert::{self, MAX_SCALE};
 use exynos_4412_mfc::h264::{Config, Decoded, Decoder, Sequence};
 use exynos_4412_mfc::{Banks, Error, Mfc, regs};
 use exynos_4412_rs::drivers::display::{self, Fimd, Framebuffer, LTN101AL03, LVDS_SETTLE_MS, Timing, rgb};
+use exynos_4412_rs::drivers::fimc::{self, ColorSpace, Fimc, Rotation, Source, Target};
 use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::drivers::mfc;
 use exynos_4412_rs::drivers::power::{self, BootMode};
@@ -46,6 +50,10 @@ const CONFIG: Config = Config { stream_bytes: 1 << 20, extra_frames: 2, display_
 const PANEL: Timing = LTN101AL03;
 const PIXELS: usize = PANEL.width * PANEL.height;
 const COUNTS_PER_US: u64 = soc::MCT_CLOCK_HZ as u64 / 1_000_000;
+/// The FIMC with all rotators (`exynos4412.dtsi:690-722`; FIMC 3 has none), and how long a
+/// picture may take it.
+const FIMC: usize = 0;
+const FIMC_TIMEOUT_US: u64 = 100_000;
 
 /// The framebuffers, in `.bss`, inside the first 16 MiB of DRAM that the uncached view covers:
 /// `memory.x` makes room.
@@ -98,7 +106,36 @@ fn start_panel(mct: Mct) -> Result<[Framebuffer; BUFFERS], display::Error> {
     Ok(framebuffers)
 }
 
-/// Where and how a picture goes on the panel.
+/// Where and how the FIMC puts a picture on the panel: as large as fits with its shape kept,
+/// turned if that is larger.
+#[derive(Clone, Copy, Debug)]
+struct Fit {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    rotation: Rotation,
+}
+
+impl Fit {
+    fn new(sequence: &Sequence) -> Self {
+        let (width, height) = (sequence.width, sequence.height);
+        // The scale as panel / picture, compared without division: a / b against c / d.
+        let fit = |w: usize, h: usize| if PANEL.width * h <= PANEL.height * w { (PANEL.width, w) } else { (PANEL.height, h) };
+        let (straight, turned) = (fit(width, height), fit(height, width));
+        let (rotation, (w, h), (num, den)) = if turned.0 * straight.1 > straight.0 * turned.1 {
+            (Rotation::Quarter, (height, width), turned)
+        } else {
+            (Rotation::None, (width, height), straight)
+        };
+        // Even sizes, the width a multiple of 8.
+        let out_width = (w * num / den).min(PANEL.width) & !7;
+        let out_height = (h * num / den).min(PANEL.height) & !1;
+        Self { x: (PANEL.width - out_width) / 2, y: (PANEL.height - out_height) / 2, width: out_width, height: out_height, rotation }
+    }
+}
+
+/// Where and how the CPU puts a picture on the panel.
 #[derive(Clone, Copy, Debug)]
 struct Layout {
     x: usize,
@@ -139,6 +176,8 @@ struct Pass {
 /// What stays from picture to picture.
 struct Player {
     framebuffers: [Framebuffer; BUFFERS],
+    /// `None` if it did not start: the CPU draws.
+    fimc: Option<Fimc>,
     /// The one to draw into next, and the one shown last, which may still wait for its vsync.
     back: usize,
     pending: Option<usize>,
@@ -150,19 +189,29 @@ struct Player {
 impl Player {
     /// Draws the picture the decoder handed out, if any, gives it back, and shows it at its
     /// time. The decoder may be decoding the next picture meanwhile.
-    fn show(&mut self, decoder: &mut Decoder, sequence: &Sequence, layout: Layout, decoded: &Decoded, pass: &mut Pass) -> Result<(), display::Error> {
+    fn show(&mut self, decoder: &mut Decoder, sequence: &Sequence, how: How, decoded: &Decoded, pass: &mut Pass) -> Result<(), PlayError> {
         let Some(frame) = decoded.frame else {
             return Ok(());
         };
         let begin = self.mct.count();
         let framebuffer = &mut self.framebuffers[self.back];
-        let (luma, chroma) = decoder.planes(&frame);
-        if layout.scale == 0 {
-            convert::draw_rotated(luma, chroma, sequence, framebuffer, layout.x, layout.y);
-        } else {
-            convert::draw(luma, chroma, sequence, framebuffer, layout.x, layout.y, layout.scale);
+        match (how, self.fimc) {
+            (How::Fimc(fit), Some(fimc)) => {
+                let target = framebuffer.address() + (fit.y * PANEL.width + fit.x) * size_of::<u32>();
+                fimc.start(frame.luma, frame.chroma, target);
+                fimc.wait(self.mct, FIMC_TIMEOUT_US)?;
+            }
+            _ => {
+                let layout = if let How::Cpu(layout) = how { layout } else { Layout::new(sequence) };
+                let (luma, chroma) = decoder.planes(&frame);
+                if layout.scale == 0 {
+                    convert::draw_rotated(luma, chroma, sequence, framebuffer, layout.x, layout.y);
+                } else {
+                    convert::draw(luma, chroma, sequence, framebuffer, layout.x, layout.y, layout.scale);
+                }
+                framebuffer.flush();
+            }
         }
-        framebuffer.flush();
         decoder.release(frame);
         let us = (self.mct.count() - begin) / COUNTS_PER_US;
         pass.draw_us += us;
@@ -188,6 +237,34 @@ impl Player {
         Ok(())
     }
 
+    /// The FIMC set up for this sequence, or the CPU if it cannot be.
+    fn how(&mut self, sequence: &Sequence) -> How {
+        let Some(fimc) = self.fimc else {
+            return How::Cpu(Layout::new(sequence));
+        };
+        let fit = Fit::new(sequence);
+        let source = Source {
+            luma: 0,
+            chroma: 0,
+            tiled: true,
+            buf_width: sequence.buf_width,
+            buf_height: sequence.buf_height,
+            width: sequence.width,
+            height: sequence.height,
+            full_range: false,
+            // As Linux chooses (fimc-reg.c:158): BT.709 from 1280 pixels wide on.
+            color_space: if fit.width >= 1280 { ColorSpace::Bt709 } else { ColorSpace::Bt601 },
+        };
+        let target = Target { address: 0, line_pixels: PANEL.width, width: fit.width, height: fit.height };
+        match fimc.configure(&source, &target, fit.rotation) {
+            Ok(()) => How::Fimc(fit),
+            Err(error) => {
+                println!("FIMC cannot take {:?}: {:?}; the CPU draws", fit, error);
+                How::Cpu(Layout::new(sequence))
+            }
+        }
+    }
+
     fn account(decoded: &Decoded, pass: &mut Pass) {
         pass.decoded += 1;
         pass.warnings += u64::from(decoded.warning != 0);
@@ -198,12 +275,10 @@ impl Player {
         let begin = self.mct.count();
         let mut decoder = Decoder::open(mfc, CONFIG)?;
         let sequence = decoder.header(header(STREAM))?;
-        let layout = Layout::new(&sequence);
+        let how = self.how(&sequence);
         if number == 1 {
-            println!(
-                "{}x{}, {} buffers needed, {} made; {:?}",
-                sequence.width, sequence.height, sequence.needed, sequence.frames, layout
-            );
+            println!("{}x{}, {} buffers needed, {} made", sequence.width, sequence.height, sequence.needed, sequence.frames);
+            println!("{:?}", how);
             console::flush();
         }
         let mut pass = Pass::default();
@@ -234,7 +309,7 @@ impl Player {
                 }
                 None => break,
             }
-            self.show(&mut decoder, &sequence, layout, &decoded, &mut pass)?;
+            self.show(&mut decoder, &sequence, how, &decoded, &mut pass)?;
         }
         drop(decoder);
         let ms = (self.mct.count() - begin) / COUNTS_PER_US / 1000;
@@ -257,12 +332,26 @@ impl Player {
     }
 }
 
+/// Who draws the pictures.
+#[derive(Clone, Copy, Debug)]
+enum How {
+    Fimc(Fit),
+    Cpu(Layout),
+}
+
 /// What can stop the playing; printed with `Debug`, which the dead code lint does not count.
 #[derive(Debug)]
 #[allow(dead_code)]
 enum PlayError {
     Mfc(Error),
     Display(display::Error),
+    Fimc(fimc::Error),
+}
+
+impl From<fimc::Error> for PlayError {
+    fn from(error: fimc::Error) -> Self {
+        Self::Fimc(error)
+    }
 }
 
 impl From<Error> for PlayError {
@@ -308,7 +397,18 @@ fn main(_args: BootArgs) -> ! {
     };
     println!("Playing; keys: r restart, f fastboot");
     console::flush();
-    let mut player = Player { framebuffers, back: 1, pending: None, mct, due: mct.count() };
+    let fimc = Fimc::new(FIMC);
+    let fimc = match fimc.power_on(fimc::DEFAULT_HZ, mct) {
+        Ok(hz) => {
+            println!("FIMC {} on, sclk_fimc {} Hz", FIMC, hz);
+            Some(fimc)
+        }
+        Err(error) => {
+            println!("FIMC {} ERROR {:?}: the CPU draws", FIMC, error);
+            None
+        }
+    };
+    let mut player = Player { framebuffers, fimc, back: 1, pending: None, mct, due: mct.count() };
     for number in 1.. {
         if let Err(error) = player.pass(&mut mfc, number) {
             println!("PLAY ERROR {:?} (MISMATCH)", error);

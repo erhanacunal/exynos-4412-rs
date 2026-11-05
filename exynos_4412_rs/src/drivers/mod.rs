@@ -3,6 +3,7 @@
 pub mod bcm4334;
 pub mod cmu;
 pub mod display;
+pub mod fimc;
 pub mod gic;
 pub mod gpio;
 pub mod i2s;

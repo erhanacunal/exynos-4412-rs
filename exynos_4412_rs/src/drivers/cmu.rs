@@ -100,6 +100,19 @@ const SRC_MFC_MFC1: u32 = 1 << 8;
 const DIV_MFC_MASK: u32 = 0xF;
 /// clk-exynos4.c:823: `CLK_MFC`, the MFC's own gate. Bits 1 to 4 are its system MMUs and PPMUs.
 const GATE_MFC: u32 = 1 << 0;
+/// clk-exynos4.c:42,56,66,88: the camera block's clocks, the FIMCs' among them.
+const SRC_CAM: usize = 0xC220;
+const SRC_MASK_CAM: usize = 0xC320;
+const DIV_CAM: usize = 0xC520;
+const GATE_IP_CAM: usize = 0xC920;
+/// clk-exynos4.c:544-547,611-614,753-759: `mout_fimcN`, `div_fimcN` and `sclk_fimcN` are the
+/// 4-bit field, or the bit, at 4 * N of `SRC_CAM`, `DIV_CAM` and `SRC_MASK_CAM`.
+const CAM_FIMC_FIELD: u32 = 0xF;
+/// Index of `mout_mpll_user_t` in `group1_p4x12` (clk-exynos4.c:340-341).
+const SRC_CAM_FIMC_MPLL_USER: u32 = 6;
+/// clk-exynos4.c:795-801,807-813: `CLK_FIMCn` at bit n of `GATE_IP_CAM`, `CLK_SMMU_FIMCn` at
+/// 7 + n. The System MMUs stay off, but sit on the FIMCs' path to memory.
+const GATE_CAM_SMMU_FIMC0_BIT: u32 = 7;
 /// clk-exynos4.c:104 `E4X12_MPLL_CON0`.
 const MPLL_CON0: usize = 0x1_0108;
 /// clk-exynos4.c:105.
@@ -261,6 +274,19 @@ impl MfcClocks {
     pub const fn gate_open(&self) -> bool {
         self.gate & GATE_MFC != 0
     }
+}
+
+/// Raw clock registers of one FIMC, for reports: see [`Cmu::fimc_clocks`].
+#[derive(Clone, Copy, Debug)]
+pub struct FimcClocks {
+    /// Its field of `SRC_CAM`: 6 is `mout_mpll_user_t`.
+    pub src: u32,
+    /// Its field of `DIV_CAM`.
+    pub div: u32,
+    /// Its bit of `SRC_MASK_CAM`.
+    pub mask: u32,
+    /// `GATE_IP_CAM`.
+    pub gate: u32,
 }
 
 /// Raw clock registers of the FIMD, for reports.
@@ -496,6 +522,46 @@ impl Cmu {
         input / div
     }
 
+    /// Raw clock registers of FIMC `index`, for reports: its 4-bit fields of `SRC_CAM` and
+    /// `DIV_CAM`, its bit of `SRC_MASK_CAM`, and all of `GATE_IP_CAM`.
+    pub fn fimc_clocks(&self, index: usize) -> FimcClocks {
+        let shift = 4 * index as u32;
+        FimcClocks {
+            src: (self.read(SRC_CAM) >> shift) & CAM_FIMC_FIELD,
+            div: (self.read(DIV_CAM) >> shift) & CAM_FIMC_FIELD,
+            mask: (self.read(SRC_MASK_CAM) >> shift) & 1,
+            gate: self.read(GATE_IP_CAM),
+        }
+    }
+
+    /// Opens the gates of FIMC `index`'s registers and of its System MMU, which stays off but is
+    /// on its path to memory.
+    pub fn open_fimc_gates(&self, index: usize) {
+        self.modify(GATE_IP_CAM, 0, 1 << index | 1 << (GATE_CAM_SMMU_FIMC0_BIT + index as u32));
+    }
+
+    /// Runs `sclk_fimc<index>` from `mout_mpll_user_t`, divided down to the highest rate not
+    /// above `hz`, lets it through, and returns the rate. The FIMC must be idle.
+    ///
+    /// # Panics
+    ///
+    /// If `index` is not 0 to 3, or `hz` is below what the divider reaches.
+    pub fn set_fimc_clock(&self, index: usize, hz: u32) -> u32 {
+        assert!(index < 4, "FIMC {} does not exist", index);
+        let shift = 4 * index as u32;
+        let input = self.mout_mpll_user_t_hz();
+        let div = input.div_ceil(hz.max(1)).max(1);
+        assert!(div <= CAM_FIMC_FIELD + 1, "sclk_fimc rate below what the divider reaches");
+        // The divider first, if it grows: the rate only falls while the mux changes.
+        if div - 1 > (self.read(DIV_CAM) >> shift) & CAM_FIMC_FIELD {
+            self.modify(DIV_CAM, CAM_FIMC_FIELD << shift, (div - 1) << shift);
+        }
+        self.modify(SRC_CAM, CAM_FIMC_FIELD << shift, SRC_CAM_FIMC_MPLL_USER << shift);
+        self.modify(DIV_CAM, CAM_FIMC_FIELD << shift, (div - 1) << shift);
+        self.modify(SRC_MASK_CAM, 0, 1 << shift);
+        input / div
+    }
+
     /// Opens the gates of the FIMD's registers and of its bus path.
     pub fn open_fimd_gates(&self) {
         self.modify(GATE_IP_LCD0, 0, GATE_LCD0_FIMD0 | GATE_LCD0_SMMU_FIMD0);
@@ -513,7 +579,7 @@ impl Cmu {
         let address = (soc::CMU_BASE + offset) as *mut u32;
         let was_masked = cpu::mask_irq();
         // SAFETY: as in `read`. Every caller changes only fields of the block it configures: the
-        // FIMD, `sdhci_3`, `pdma0`, the audio subsystem, the GPU or the MFC.
+        // FIMD, `sdhci_3`, `pdma0`, the audio subsystem, the GPU, the MFC or a FIMC.
         unsafe {
             ptr::write_volatile(address, (ptr::read_volatile(address) & !clear) | set);
         }

@@ -129,6 +129,13 @@ pub const MFC_IRQ: u16 = 32 + 94;
 /// `reg`.
 pub const PD_MFC_BASE: usize = 0x1002_3C40;
 
+/// `exynos4.dtsi:214-264`: the four FIMCs (camera interface, scaler and colour converter).
+pub const FIMC_BASE: [usize; 4] = [0x1180_0000, 0x1181_0000, 0x1182_0000, 0x1183_0000];
+/// Their interrupts, `GIC_SPI 84` to `87` (`exynos4.dtsi:217`, and so on).
+pub const FIMC_IRQ: [u16; 4] = [32 + 84, 32 + 85, 32 + 86, 32 + 87];
+/// `exynos4.dtsi:143-147`, `pd_cam`: the FIMCs' power domain.
+pub const PD_CAM_BASE: usize = 0x1002_3C00;
+
 /// eMMC controller, `mshc_0`. Verified: `exynos4412.dtsi:307-309`, node `mshc_0: mmc@12550000`,
 /// and `exynos4412-mehmet.dts:1399-1414` has the eMMC on it.
 pub const MSHC_BASE: usize = 0x1255_0000;
