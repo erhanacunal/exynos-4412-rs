@@ -73,6 +73,10 @@ pub enum Error {
     BadSequence { width: u32, height: u32, buffers: u32 },
     /// The picture to show is in none of the frame buffers: `SI_DISPLAY_Y_ADR`.
     UnknownFrame(u32),
+    /// A picture is still being decoded: [`h264::Decoder::wait`] first.
+    Busy,
+    /// Nothing to wait for.
+    NotRunning,
 }
 
 impl From<PowerDomainTimeout> for Error {

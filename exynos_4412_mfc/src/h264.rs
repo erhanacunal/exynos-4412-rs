@@ -87,7 +87,8 @@ pub struct Decoded {
     pub consumed: u32,
     /// The firmware's warning, from an `ERR_RET` that still decoded the picture; 0 if none.
     pub warning: u32,
-    /// How long the firmware took, in microseconds.
+    /// Microseconds from the command to the answer: the firmware's time with [`Decoder::decode`],
+    /// and whatever the caller did in between with [`Decoder::start`] and [`Decoder::wait`].
     pub us: u64,
 }
 
@@ -106,6 +107,8 @@ pub struct Decoder<'a> {
     chroma: [usize; MAX_FRAMES],
     /// Frame buffers the caller holds: a bit for each.
     held: u32,
+    /// When the picture being decoded was started, in MCT counts.
+    running: Option<u64>,
 }
 
 /// Zeroes `len` bytes at `start` and writes them out to DRAM.
@@ -164,6 +167,7 @@ impl<'a> Decoder<'a> {
             luma: [0; MAX_FRAMES],
             chroma: [0; MAX_FRAMES],
             held: 0,
+            running: None,
         })
     }
 
@@ -181,6 +185,9 @@ impl<'a> Decoder<'a> {
     /// gives them to the firmware (`INIT_BUFS`). `data` is the sequence and picture parameter
     /// sets, with their start codes.
     pub fn header(&mut self, data: &[u8]) -> Result<Sequence, Error> {
+        if self.running.is_some() {
+            return Err(Error::Busy);
+        }
         self.load(data)?;
         self.set_stream(0, data.len());
         write(regs::ENC_LF_CTRL, 0);
@@ -189,7 +196,7 @@ impl<'a> Decoder<'a> {
             None => 0,
         };
         write(regs::SI_CH0_DPB_CONF_CTRL, delay);
-        self.start(regs::CH_SEQ_HEADER);
+        self.start_command(regs::CH_SEQ_HEADER);
         self.mfc.wait_answer(regs::R2H_CMD_SEQ_DONE_RET)?;
 
         let width = read(regs::SI_HRESOL);
@@ -250,7 +257,7 @@ impl<'a> Decoder<'a> {
         self.write_shared(regs::SHARED_LUMA_DPB_SIZE, luma_bytes as u32);
         self.write_shared(regs::SHARED_CHROMA_DPB_SIZE, chroma_bytes as u32);
         self.write_shared(regs::SHARED_MV_SIZE, mv_bytes as u32);
-        self.start(regs::CH_INIT_BUFS);
+        self.start_command(regs::CH_INIT_BUFS);
         self.mfc.wait_answer(regs::R2H_CMD_INIT_BUFFERS_RET)?;
         self.held = 0;
         self.sequence = Some(sequence);
@@ -259,20 +266,45 @@ impl<'a> Decoder<'a> {
 
     /// Decodes one picture: `data` is all its slices, with their start codes.
     pub fn decode(&mut self, data: &[u8]) -> Result<Decoded, Error> {
-        if data.is_empty() {
-            return Err(Error::BadStream(0));
-        }
-        self.load(data)?;
-        self.set_stream(0, data.len());
-        self.run(regs::CH_FRAME_START)
+        self.start(data)?;
+        self.wait()
     }
 
     /// At the end of the stream: one picture still held back by the decoder, if any (`LAST_FRAME`
     /// with an empty stream, `s5p_mfc_run_dec_frame`). Call it until the status is
     /// [`regs::DEC_STATUS_DECODING_EMPTY`].
     pub fn finish(&mut self) -> Result<Decoded, Error> {
+        self.start_finish()?;
+        self.wait()
+    }
+
+    /// [`decode`](Self::decode) in two halves: this one starts the firmware on the picture and
+    /// returns, so the CPU can do other work meanwhile, such as drawing a picture it holds;
+    /// [`wait`](Self::wait) is the other.
+    pub fn start(&mut self, data: &[u8]) -> Result<(), Error> {
+        if self.running.is_some() {
+            return Err(Error::Busy);
+        }
+        if data.is_empty() {
+            return Err(Error::BadStream(0));
+        }
+        self.load(data)?;
+        self.set_stream(0, data.len());
+        self.begin(regs::CH_FRAME_START)
+    }
+
+    /// [`finish`](Self::finish)'s first half: see [`start`](Self::start).
+    pub fn start_finish(&mut self) -> Result<(), Error> {
+        if self.running.is_some() {
+            return Err(Error::Busy);
+        }
         self.set_stream(0, 0);
-        self.run(regs::CH_LAST_FRAME)
+        self.begin(regs::CH_LAST_FRAME)
+    }
+
+    /// Whether a picture is being decoded: [`start`](Self::start) without [`wait`](Self::wait) yet.
+    pub const fn is_running(&self) -> bool {
+        self.running.is_some()
     }
 
     /// Gives a frame buffer back to the decoder.
@@ -284,7 +316,8 @@ impl<'a> Decoder<'a> {
     pub fn planes(&self, frame: &Frame) -> (&[u8], &[u8]) {
         let sequence = self.sequence.expect("a frame comes after the header");
         // SAFETY: both are frame buffers of this instance, taken from the ports for it, which the
-        // firmware does not write while the caller holds them (their bit in RELEASE_BUF is clear).
+        // firmware does not write while the caller holds them (their bit in RELEASE_BUF is clear),
+        // even while it decodes another picture.
         // `release` needs `&mut self`, so these borrows end first.
         unsafe {
             (
@@ -294,17 +327,27 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// Sends an instance command and reads what came of the picture, as `s5p_mfc_handle_frame`.
-    fn run(&mut self, command: u32) -> Result<Decoded, Error> {
+    /// Sends an instance command for a picture.
+    fn begin(&mut self, command: u32) -> Result<(), Error> {
         let Some(sequence) = self.sequence else {
             return Err(Error::BadStream(0));
         };
+        // Frame buffers the caller holds stay out: the firmware writes none of them.
         let all = if sequence.frames == MAX_FRAMES { u32::MAX } else { (1 << sequence.frames) - 1 };
         write(regs::SI_CH0_RELEASE_BUF, all & !self.held);
         let dpb = read(regs::SI_CH0_DPB_CONF_CTRL) & !regs::DPB_FLUSH;
         write(regs::SI_CH0_DPB_CONF_CTRL, dpb);
-        let begin = self.mfc.mct().count();
-        self.start(command);
+        self.running = Some(self.mfc.mct().count());
+        self.start_command(command);
+        Ok(())
+    }
+
+    /// Waits for the picture [`start`](Self::start) or [`start_finish`](Self::start_finish) sent
+    /// and reads what came of it, as `s5p_mfc_handle_frame`.
+    pub fn wait(&mut self) -> Result<Decoded, Error> {
+        let (Some(begin), Some(sequence)) = (self.running.take(), self.sequence) else {
+            return Err(Error::NotRunning);
+        };
         let answer = self.mfc.answer(regs::R2H_CMD_FRAME_DONE_RET)?;
         let us = (self.mfc.mct().count() - begin) / COUNTS_PER_US;
         let warning = match answer.got {
@@ -363,7 +406,7 @@ impl<'a> Decoder<'a> {
 
     /// `s5p_mfc_set_dec_desc_buffer` and `s5p_mfc_set_shared_buffer`, as `s5p_mfc_try_run_v5` does
     /// before each run, then the command.
-    fn start(&self, command: u32) {
+    fn start_command(&self, command: u32) {
         write(regs::SI_CH0_DESC_ADR, self.mfc.offset_a(self.desc));
         write(regs::SI_CH0_DESC_SIZE, regs::DESC_BUF_BYTES as u32);
         write(regs::SI_CH0_HOST_WR_ADR, (self.shared - self.mfc.banks().a) as u32);
@@ -397,6 +440,9 @@ fn is_warning(error: u32) -> bool {
 impl Drop for Decoder<'_> {
     /// Closes the instance (`s5p_mfc_close_inst_cmd_v5`) and gives its memory back.
     fn drop(&mut self) {
+        if self.running.is_some() {
+            let _ = self.wait();
+        }
         let closed = self.mfc.command(regs::H2R_CMD_CLOSE_INSTANCE, [self.instance, 0, 0, 0]);
         if closed.is_ok() {
             let _ = self.mfc.wait_answer(regs::R2H_CMD_CLOSE_INSTANCE_RET);

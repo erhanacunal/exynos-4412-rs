@@ -3,7 +3,9 @@
 //!
 //! The stream and the rate are chosen at build time (`build.rs`): `MFC_VIDEO`, in Annex B form,
 //! `MFC_FPS`. The pictures are shown in display order, the decoder reordering them
-//! ([`Config::display_delay`] `None`), each converted to RGB by the CPU right after a vsync. A
+//! ([`Config::display_delay`] `None`). The CPU converts each to RGB into one of three
+//! framebuffers while the MFC decodes the next picture, then the FIMD switches to it at a vsync
+//! (`Fimd::show`): one buffer on the panel, one waiting for its vsync, one being drawn. A
 //! picture that fits the panel is scaled up by the largest whole number that still fits; one that
 //! fits only turned, a portrait picture on the landscape panel, is turned a quarter turn
 //! clockwise. One line per pass gives the times.
@@ -45,15 +47,16 @@ const PANEL: Timing = LTN101AL03;
 const PIXELS: usize = PANEL.width * PANEL.height;
 const COUNTS_PER_US: u64 = soc::MCT_CLOCK_HZ as u64 / 1_000_000;
 
-/// The framebuffer, in `.bss`, inside the first 16 MiB of DRAM that the uncached view covers:
+/// The framebuffers, in `.bss`, inside the first 16 MiB of DRAM that the uncached view covers:
 /// `memory.x` makes room.
 #[repr(align(4096))]
-struct Pixels(UnsafeCell<[u32; PIXELS]>);
+struct Pixels(UnsafeCell<[[u32; PIXELS]; BUFFERS]>);
 
-// SAFETY: `main` is the only user, and takes the one reference to it once.
+// SAFETY: `main` is the only user, and takes the one reference to them once.
 unsafe impl Sync for Pixels {}
 
-static PIXEL_STORE: Pixels = Pixels(UnsafeCell::new([0; PIXELS]));
+const BUFFERS: usize = 3;
+static PIXEL_STORE: Pixels = Pixels(UnsafeCell::new([[0; PIXELS]; BUFFERS]));
 
 fn key() {
     match console::uart().try_read_byte() {
@@ -71,22 +74,28 @@ fn wait_keys() -> ! {
     }
 }
 
-/// Powers the panel on, black.
-fn start_panel(mct: Mct) -> Result<Framebuffer, display::Error> {
+/// Powers the panel on, black, showing the first framebuffer.
+fn start_panel(mct: Mct) -> Result<[Framebuffer; BUFFERS], display::Error> {
     let fimd = Fimd::new();
     fimd.power_on()?;
     display::configure_pins();
-    // SAFETY: the only reference to this buffer, taken once: see `Pixels`.
-    let pixels: &'static mut [u32] = unsafe { &mut *PIXEL_STORE.0.get() };
-    let mut framebuffer = Framebuffer::new(pixels, PANEL.width, PANEL.height).ok_or(display::Error::BadSize)?;
-    framebuffer.fill_rect(0, 0, PANEL.width, PANEL.height, rgb(0, 0, 0));
-    framebuffer.flush();
-    fimd.start(&PANEL, &framebuffer)?;
+    // SAFETY: the only reference to these buffers, taken once: see `Pixels`.
+    let store: &'static mut [[u32; PIXELS]; BUFFERS] = unsafe { &mut *PIXEL_STORE.0.get() };
+    let mut buffers = store.each_mut().map(|pixels| Framebuffer::new(pixels, PANEL.width, PANEL.height));
+    if buffers.iter().any(Option::is_none) {
+        return Err(display::Error::BadSize);
+    }
+    let mut framebuffers = buffers.each_mut().map(|buffer| buffer.take().expect("checked above"));
+    for framebuffer in &mut framebuffers {
+        framebuffer.fill_rect(0, 0, PANEL.width, PANEL.height, rgb(0, 0, 0));
+        framebuffer.flush();
+    }
+    fimd.start(&PANEL, &framebuffers[0])?;
     display::set_lvds(true);
     let end = mct.count() + u64::from(LVDS_SETTLE_MS) * 1000 * COUNTS_PER_US;
     while mct.count() < end {}
     display::set_backlight(true);
-    Ok(framebuffer)
+    Ok(framebuffers)
 }
 
 /// Where and how a picture goes on the panel.
@@ -118,8 +127,9 @@ impl Layout {
 struct Pass {
     decoded: u64,
     shown: u64,
-    decode_us: u64,
-    decode_max: u64,
+    /// How long the CPU waited for the decoder: the decoding that drawing did not hide.
+    wait_us: u64,
+    wait_max: u64,
     draw_us: u64,
     draw_max: u64,
     late: u64,
@@ -128,18 +138,36 @@ struct Pass {
 
 /// What stays from picture to picture.
 struct Player {
-    framebuffer: Framebuffer,
+    framebuffers: [Framebuffer; BUFFERS],
+    /// The one to draw into next, and the one shown last, which may still wait for its vsync.
+    back: usize,
+    pending: Option<usize>,
     mct: Mct,
     /// When the next picture is due, in MCT counts.
     due: u64,
 }
 
 impl Player {
-    /// Shows the picture the decoder handed out, if any, at its time, then gives it back.
-    fn show(&mut self, decoder: &mut Decoder, sequence: &Sequence, layout: Layout, decoded: &Decoded, pass: &mut Pass) {
+    /// Draws the picture the decoder handed out, if any, gives it back, and shows it at its
+    /// time. The decoder may be decoding the next picture meanwhile.
+    fn show(&mut self, decoder: &mut Decoder, sequence: &Sequence, layout: Layout, decoded: &Decoded, pass: &mut Pass) -> Result<(), display::Error> {
         let Some(frame) = decoded.frame else {
-            return;
+            return Ok(());
         };
+        let begin = self.mct.count();
+        let framebuffer = &mut self.framebuffers[self.back];
+        let (luma, chroma) = decoder.planes(&frame);
+        if layout.scale == 0 {
+            convert::draw_rotated(luma, chroma, sequence, framebuffer, layout.x, layout.y);
+        } else {
+            convert::draw(luma, chroma, sequence, framebuffer, layout.x, layout.y, layout.scale);
+        }
+        framebuffer.flush();
+        decoder.release(frame);
+        let us = (self.mct.count() - begin) / COUNTS_PER_US;
+        pass.draw_us += us;
+        pass.draw_max = pass.draw_max.max(us);
+
         if self.mct.count() > self.due {
             pass.late += 1;
         }
@@ -147,31 +175,26 @@ impl Player {
             key();
         }
         self.due = self.due.max(self.mct.count()) + 1_000_000 * COUNTS_PER_US / FPS;
-        let _ = Fimd::new().wait_vsync();
-        let begin = self.mct.count();
-        let (luma, chroma) = decoder.planes(&frame);
-        if layout.scale == 0 {
-            convert::draw_rotated(luma, chroma, sequence, &mut self.framebuffer, layout.x, layout.y);
-        } else {
-            convert::draw(luma, chroma, sequence, &mut self.framebuffer, layout.x, layout.y, layout.scale);
+        let fimd = Fimd::new();
+        // The last one shown must be on the panel before another takes its place, or it would
+        // never be seen; then the buffer after this one is free: neither on the panel nor waiting.
+        if let Some(pending) = self.pending {
+            fimd.wait_shown(&self.framebuffers[pending])?;
         }
-        self.framebuffer.flush();
-        let us = (self.mct.count() - begin) / COUNTS_PER_US;
-        pass.draw_us += us;
-        pass.draw_max = pass.draw_max.max(us);
+        fimd.show(&self.framebuffers[self.back])?;
+        self.pending = Some(self.back);
+        self.back = (self.back + 1) % BUFFERS;
         pass.shown += 1;
-        decoder.release(frame);
+        Ok(())
     }
 
     fn account(decoded: &Decoded, pass: &mut Pass) {
         pass.decoded += 1;
-        pass.decode_us += decoded.us;
-        pass.decode_max = pass.decode_max.max(decoded.us);
         pass.warnings += u64::from(decoded.warning != 0);
     }
 
-    /// Plays the stream once.
-    fn pass(&mut self, mfc: &mut Mfc, number: u32) -> Result<(), Error> {
+    /// Plays the stream once: each picture drawn while the next one decodes.
+    fn pass(&mut self, mfc: &mut Mfc, number: u32) -> Result<(), PlayError> {
         let begin = self.mct.count();
         let mut decoder = Decoder::open(mfc, CONFIG)?;
         let sequence = decoder.header(header(STREAM))?;
@@ -184,29 +207,46 @@ impl Player {
             console::flush();
         }
         let mut pass = Pass::default();
-        for (i, picture) in pictures(STREAM).enumerate() {
-            let decoded = decoder.decode(picture).inspect_err(|_| println!("At picture {} ({} bytes)", i, picture.len()))?;
-            Self::account(&decoded, &mut pass);
-            self.show(&mut decoder, &sequence, layout, &decoded, &mut pass);
-        }
-        for _ in 0..2 * exynos_4412_mfc::h264::MAX_FRAMES {
-            let decoded = decoder.finish()?;
-            if decoded.status == regs::DEC_STATUS_DECODING_EMPTY {
+        let mut pictures = pictures(STREAM);
+        let Some(first) = pictures.next() else {
+            return Ok(());
+        };
+        decoder.start(first)?;
+        let mut flushes = 0;
+        loop {
+            let waited = self.mct.count();
+            let decoded = decoder.wait()?;
+            let waited = (self.mct.count() - waited) / COUNTS_PER_US;
+            pass.wait_us += waited;
+            pass.wait_max = pass.wait_max.max(waited);
+            let finishing = flushes > 0;
+            if finishing && decoded.status == regs::DEC_STATUS_DECODING_EMPTY {
                 break;
             }
-            self.show(&mut decoder, &sequence, layout, &decoded, &mut pass);
+            if !finishing {
+                Self::account(&decoded, &mut pass);
+            }
+            match pictures.next() {
+                Some(picture) => decoder.start(picture)?,
+                None if flushes < 2 * exynos_4412_mfc::h264::MAX_FRAMES => {
+                    flushes += 1;
+                    decoder.start_finish()?;
+                }
+                None => break,
+            }
+            self.show(&mut decoder, &sequence, layout, &decoded, &mut pass)?;
         }
         drop(decoder);
         let ms = (self.mct.count() - begin) / COUNTS_PER_US / 1000;
         let (decoded, shown) = (pass.decoded.max(1), pass.shown.max(1));
         println!(
-            "Pass {}: {}/{} shown, {} ms; decode {}/{} us, draw {}/{} us (avg/max); late {}, warn {}",
+            "Pass {}: {}/{} shown, {} ms; wait {}/{} us, draw {}/{} us (avg/max); late {}, warn {}",
             number,
             pass.shown,
             pass.decoded,
             ms,
-            pass.decode_us / decoded,
-            pass.decode_max,
+            pass.wait_us / decoded,
+            pass.wait_max,
             pass.draw_us / shown,
             pass.draw_max,
             pass.late,
@@ -214,6 +254,26 @@ impl Player {
         );
         console::flush();
         Ok(())
+    }
+}
+
+/// What can stop the playing; printed with `Debug`, which the dead code lint does not count.
+#[derive(Debug)]
+#[allow(dead_code)]
+enum PlayError {
+    Mfc(Error),
+    Display(display::Error),
+}
+
+impl From<Error> for PlayError {
+    fn from(error: Error) -> Self {
+        Self::Mfc(error)
+    }
+}
+
+impl From<display::Error> for PlayError {
+    fn from(error: display::Error) -> Self {
+        Self::Display(error)
     }
 }
 
@@ -239,8 +299,8 @@ fn main(_args: BootArgs) -> ! {
             wait_keys();
         }
     };
-    let framebuffer = match start_panel(mct) {
-        Ok(framebuffer) => framebuffer,
+    let framebuffers = match start_panel(mct) {
+        Ok(framebuffers) => framebuffers,
         Err(error) => {
             println!("PANEL ERROR {:?} (MISMATCH)", error);
             wait_keys();
@@ -248,7 +308,7 @@ fn main(_args: BootArgs) -> ! {
     };
     println!("Playing; keys: r restart, f fastboot");
     console::flush();
-    let mut player = Player { framebuffer, mct, due: mct.count() };
+    let mut player = Player { framebuffers, back: 1, pending: None, mct, due: mct.count() };
     for number in 1.. {
         if let Err(error) = player.pass(&mut mfc, number) {
             println!("PLAY ERROR {:?} (MISMATCH)", error);

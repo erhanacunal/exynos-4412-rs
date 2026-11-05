@@ -1887,9 +1887,11 @@ the panel at three times its size, 30 fps.
 
 `mfc_play` plays an H.264 stream on the panel, over and over. `exynos_4412_mfc::annexb` cuts it
 into pictures, and the decoder puts them in display order, B-frames included.
-`exynos_4412_mfc::convert` draws each one with the CPU right after a vsync: it detiles the
-picture, converts BT.601 YCbCr to RGB and scales it up by a whole number. A portrait picture
-that only fits turned is turned a quarter turn clockwise. The stream is built into the image;
+`exynos_4412_mfc::convert` draws each one with the CPU while the MFC decodes the next one
+(`Decoder::start` and `Decoder::wait`): it detiles the picture, converts BT.601 YCbCr to RGB
+and scales it up by a whole number. A portrait picture that only fits turned is turned a
+quarter turn clockwise. There are three framebuffers: one on the panel, one waiting for its
+vsync, one being drawn (`Fimd::show`, `Fimd::wait_shown`). The stream is built into the image;
 an MP4 file's video track comes out with `tools/mp4_annexb.py`:
 
 ```
@@ -1899,7 +1901,8 @@ MFC_FIRMWARE=<path>/s5p-mfc.fw MFC_VIDEO=video.h264 MFC_FPS=24 make bin APP=mfc_
 
 Without `MFC_VIDEO` it plays `mfc_test`'s stream. Port B gets 64 MiB here: a 720p frame buffer
 takes about 1.2 MiB of it. On the board a 720x1280 High profile stream with B-frames plays at
-24 fps, turned to fill 1280x720.
+24 fps, turned to fill 1280x720: 35.9 s for 860 pictures. Drawing takes 35.4 ms of each
+picture's 41.7 ms.
 
 ## QEMU
 

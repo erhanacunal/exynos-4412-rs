@@ -629,6 +629,41 @@ impl Fimd {
         Ok(source / divider)
     }
 
+    /// Shows `framebuffer` instead, from the next vsync on, for double buffering: draw into one
+    /// buffer while the FIMD scans the other, then switch. Returns at once; [`wait_shown`]
+    /// waits until the switch has happened, after which the old buffer is free to draw into.
+    /// The window's address registers change together: the shadow update is held off while they
+    /// are written, as `fimd_shadow_protect_win` does (`exynos_drm_fimd.c:739`).
+    ///
+    /// [`start`](Self::start) must have run with a buffer of the same size.
+    ///
+    /// [`wait_shown`]: Self::wait_shown
+    pub fn show(&self, framebuffer: &Framebuffer) -> Result<(), Error> {
+        let regs = self.regs();
+        let start = framebuffer.address() as u32;
+        let len = (framebuffer.stride() * framebuffer.height()) as u32;
+        if regs.buf_end.get().wrapping_sub(regs.buf_start.get()) != len {
+            return Err(Error::BadSize);
+        }
+        regs.shadowcon.set(regs.shadowcon.get() | SHADOWCON_PROTECT0);
+        regs.buf_start.set(start);
+        regs.buf_end.set(start + len);
+        regs.shadowcon.set(regs.shadowcon.get() & !SHADOWCON_PROTECT0);
+        Ok(())
+    }
+
+    /// Waits until the FIMD scans `framebuffer`: see [`show`](Self::show).
+    pub fn wait_shown(&self, framebuffer: &Framebuffer) -> Result<(), Error> {
+        let mut polls = 0;
+        while self.scan_address() != framebuffer.address() as u32 {
+            polls += 1;
+            if polls == POLL_LIMIT {
+                return Err(Error::NoVsync);
+            }
+        }
+        Ok(())
+    }
+
     /// The FIMD's line counter, which moves only while it scans.
     pub fn line(&self) -> u32 {
         (self.regs().vidcon1.get() >> VIDCON1_LINECNT_SHIFT) & VIDCON1_LINECNT_MASK
