@@ -24,7 +24,17 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 ```
 
 `exynos_4412_rs/src/crypto.rs` and `exynos_4412_rs/src/wpa.rs` follow the published standards they
-name. Everywhere else in this repository, Linux is used only as a source of register maps.
+name. Everywhere else in this repository, Linux is used only as a source of register maps, with
+one exception, below.
+
+## Samsung's `s5p-mfc` driver (GPL)
+
+`exynos_4412_mfc/` and `mfc_test/` are not under this repository's MIT license: they are
+GPL-2.0-or-later, as the Linux driver whose commands, buffer sizes and order of operations they
+follow, `drivers/media/platform/s5p-mfc/` in Linux 5.15.198 (Copyright (C) 2010-2011 Samsung
+Electronics Co., Ltd.). The license text is in `exynos_4412_mfc/COPYING`. Nothing in
+`exynos_4412_rs` comes from that driver; its `drivers::mfc` takes register addresses only. The
+MFC's firmware is not in this repository.
 
 ## Mesa's lima driver
 

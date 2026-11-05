@@ -5,6 +5,7 @@ board's own U-Boot. `exynos_4412_rs` provides the runtime and the drivers. An ap
 depends on this crate, supplies a `memory.x` and writes `main`.
 
 - `exynos_4412_rs/`: startup, exceptions, drivers, console, panic, `link.x`
+- `exynos_4412_mfc/`: the MFC v5.1 video codec through its firmware; **GPL-2.0-or-later**, unlike the rest (see below)
 - `hello_world/`: console test
 - `irq_timer/`: GIC and MCT test
 - `mmu_test/`: MMU and cache test
@@ -28,6 +29,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `wifi_async_test/`: the same chip under Embassy as an `embassy-net` device, its runner task woken by the host wake line
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
+- `mfc_test/`: MFC bring-up: power, clock, firmware start and its version (GPL, links `exynos_4412_mfc`)
 - `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom, or over WiFi by HTTP, and starts it, instead of fastboot
 - `gpu_triangle_test/`: flat, shaded and textured triangles through the GP and the PPs, with shaders compiled offline by Mesa's lima compiler
 - `gpu_cube_test/`: two textured (bilinear), lit cubes turning in perspective, drawn with the `gpu` runtime: two draws a frame, depth tested by the PPs
@@ -1846,6 +1848,28 @@ No read found what the line had not announced. The runner returns to the executo
 have passed (`embassy::wifi::SLICE`) and goes on where it stopped; that took the download's worst
 from 2052 to 1277 us. What is left is longer than a slice and a frame: it is likely the stack
 taking in all that is queued in one poll, not yet measured.
+
+## Video codec (MFC)
+
+The MFC v5.1 at `0x1340_0000` decodes and encodes video through a firmware that runs on its own
+RISC core. Samsung documents how the host talks to it (commands, buffer sizes, their order)
+only in GPL drivers, so that part lives in its own crate, `exynos_4412_mfc`, licensed
+GPL-2.0-or-later after Linux 5.15.198's `drivers/media/platform/s5p-mfc` (text in
+`exynos_4412_mfc/COPYING`). An application that links it is GPL too. `exynos_4412_rs` stays MIT
+and has only the register-level part, `drivers::mfc`: the power domain (`0x1002_3C40`), the clock
+gate and `sclk_mfc` (200 MHz from the MPLL, as the vendor kernel sets it).
+
+The firmware, `s5p-mfc.fw`, is not in this repository:
+
+```
+MFC_FIRMWARE=<path>/s5p-mfc.fw make img APP=mfc_test
+```
+
+`mfc_test` copies it to the start of port A (`0x6000_0000`; port B at `0x6400_0000`, 36 and
+8 MiB as Linux reserves them), resets the codec, releases the RISC, waits for its
+`FW_STATUS_RET`, sends `SYS_INIT` and prints the firmware's version. The system MMUs in front of
+the ports are not used. Decoding H.264 is the next step; its frames come out as NV12 in 64x32
+tiles.
 
 ## QEMU
 

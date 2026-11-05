@@ -1,0 +1,10 @@
+[package]
+name = "mfc_test"
+version = "0.1.0"
+edition = "2024"
+description = "MFC v5.1 bring-up: power, clock, firmware start and its version"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }
+exynos_4412_mfc = { path = "../exynos_4412_mfc" }

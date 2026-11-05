@@ -1,0 +1,9 @@
+[package]
+name = "exynos_4412_mfc"
+version = "0.1.0"
+edition = "2024"
+description = "The Exynos 4412's MFC v5.1 video codec, after Linux's s5p-mfc driver"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs", default-features = false }

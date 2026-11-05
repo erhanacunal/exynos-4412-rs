@@ -120,6 +120,15 @@ pub const G3D_BASE: usize = 0x1300_0000;
 /// `pd_g3d: power-domain@10023c60`, `reg`.
 pub const PD_G3D_BASE: usize = 0x1002_3C60;
 
+/// The MFC, the video codec (v5.1). Verified: `exynos4.dtsi:438-447`, node `mfc: codec@13400000`,
+/// `reg`, 64 KiB.
+pub const MFC_BASE: usize = 0x1340_0000;
+/// Its interrupt: `exynos4.dtsi:441`, `GIC_SPI 94`.
+pub const MFC_IRQ: u16 = 32 + 94;
+/// Power domain of the MFC. Verified: `exynos4.dtsi:114-118`, node `pd_mfc: power-domain@10023c40`,
+/// `reg`.
+pub const PD_MFC_BASE: usize = 0x1002_3C40;
+
 /// eMMC controller, `mshc_0`. Verified: `exynos4412.dtsi:307-309`, node `mshc_0: mmc@12550000`,
 /// and `exynos4412-mehmet.dts:1399-1414` has the eMMC on it.
 pub const MSHC_BASE: usize = 0x1255_0000;

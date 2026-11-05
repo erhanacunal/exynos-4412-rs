@@ -84,6 +84,22 @@ const SRC_G3D_G3D1: u32 = 1 << 8;
 const DIV_G3D_MASK: u32 = 0xF;
 /// clk-exynos4.c:728: `CLK_G3D`, the GPU's own clock gate.
 const GATE_G3D: u32 = 1 << 0;
+/// clk-exynos4.c:44.
+const SRC_MFC: usize = 0xC228;
+/// clk-exynos4.c:68.
+const DIV_MFC: usize = 0xC528;
+/// clk-exynos4.c:90.
+const GATE_IP_MFC: usize = 0xC928;
+/// clk-exynos4.c:552,339: `mout_mfc0` selects `mout_apll` when set, `mout_mpll_user_t` when
+/// clear.
+const SRC_MFC_MFC0_APLL: u32 = 1 << 0;
+/// clk-exynos4.c:424,285: `mout_mfc` selects `mout_mfc1` (EPLL or VPLL) when set, `mout_mfc0`
+/// when clear.
+const SRC_MFC_MFC1: u32 = 1 << 8;
+/// clk-exynos4.c:619: the divider of `sclk_mfc`, bits 0 to 3.
+const DIV_MFC_MASK: u32 = 0xF;
+/// clk-exynos4.c:823: `CLK_MFC`, the MFC's own gate. Bits 1 to 4 are its system MMUs and PPMUs.
+const GATE_MFC: u32 = 1 << 0;
 /// clk-exynos4.c:104 `E4X12_MPLL_CON0`.
 const MPLL_CON0: usize = 0x1_0108;
 /// clk-exynos4.c:105.
@@ -226,6 +242,24 @@ impl G3dClocks {
     /// Whether the GPU's clock gate is open, without which its registers do not answer.
     pub const fn gate_open(&self) -> bool {
         self.gate & GATE_G3D != 0
+    }
+}
+
+/// Raw clock registers of the MFC, for reports.
+#[derive(Clone, Copy, Debug)]
+pub struct MfcClocks {
+    /// `SRC_MFC`.
+    pub src: u32,
+    /// `DIV_MFC`.
+    pub div: u32,
+    /// `GATE_IP_MFC`.
+    pub gate: u32,
+}
+
+impl MfcClocks {
+    /// Whether the MFC's clock gate is open, without which its registers do not answer.
+    pub const fn gate_open(&self) -> bool {
+        self.gate & GATE_MFC != 0
     }
 }
 
@@ -423,6 +457,45 @@ impl Cmu {
         input / div
     }
 
+    /// The clock registers of the MFC as they are now.
+    pub fn mfc_clocks(&self) -> MfcClocks {
+        MfcClocks { src: self.read(SRC_MFC), div: self.read(DIV_MFC), gate: self.read(GATE_IP_MFC) }
+    }
+
+    /// Rate of `sclk_mfc`, the MFC's core clock. `None` if it comes from a PLL whose rate this
+    /// module does not read: the APLL, the EPLL or the VPLL.
+    pub fn sclk_mfc_hz(&self) -> Option<u32> {
+        let src = self.read(SRC_MFC);
+        if src & (SRC_MFC_MFC1 | SRC_MFC_MFC0_APLL) != 0 {
+            return None;
+        }
+        Some(self.mout_mpll_user_t_hz() / ((self.read(DIV_MFC) & DIV_MFC_MASK) + 1))
+    }
+
+    /// Opens the MFC's clock gate. Its system MMUs' gates are left as they are.
+    pub fn open_mfc_gate(&self) {
+        self.modify(GATE_IP_MFC, 0, GATE_MFC);
+    }
+
+    /// Runs `sclk_mfc` from `mout_mpll_user_t`, divided down to the highest rate not above `hz`,
+    /// and returns the rate. The MFC must be idle.
+    ///
+    /// # Panics
+    ///
+    /// If `hz` is below what the divider reaches.
+    pub fn set_mfc_clock(&self, hz: u32) -> u32 {
+        let input = self.mout_mpll_user_t_hz();
+        let div = input.div_ceil(hz.max(1)).max(1);
+        assert!(div <= DIV_MFC_MASK + 1, "sclk_mfc rate below what the divider reaches");
+        // The divider first, if it grows: the rate only falls while the mux changes.
+        if div - 1 > self.read(DIV_MFC) & DIV_MFC_MASK {
+            self.modify(DIV_MFC, DIV_MFC_MASK, div - 1);
+        }
+        self.modify(SRC_MFC, SRC_MFC_MFC1 | SRC_MFC_MFC0_APLL, 0);
+        self.modify(DIV_MFC, DIV_MFC_MASK, div - 1);
+        input / div
+    }
+
     /// Opens the gates of the FIMD's registers and of its bus path.
     pub fn open_fimd_gates(&self) {
         self.modify(GATE_IP_LCD0, 0, GATE_LCD0_FIMD0 | GATE_LCD0_SMMU_FIMD0);
@@ -440,7 +513,7 @@ impl Cmu {
         let address = (soc::CMU_BASE + offset) as *mut u32;
         let was_masked = cpu::mask_irq();
         // SAFETY: as in `read`. Every caller changes only fields of the block it configures: the
-        // FIMD, `sdhci_3`, `pdma0`, the audio subsystem or the GPU.
+        // FIMD, `sdhci_3`, `pdma0`, the audio subsystem, the GPU or the MFC.
         unsafe {
             ptr::write_volatile(address, (ptr::read_volatile(address) & !clear) | set);
         }
