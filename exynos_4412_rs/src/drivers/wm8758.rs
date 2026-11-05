@@ -30,7 +30,11 @@ pub const BUS_SDA_DELAY_NS: u32 = 100;
 
 /// `vdd_audio`, all four supplies of the codec: `exynos4412-mehmet.dts:1144-1147,1249-1252`.
 pub const LDO_AUDIO: (u8, u16) = (25, 3300);
-/// `exynos4412-mehmet.dts:833-838`, `gpio-mehmet.h:38`: Linux drives it high.
+/// `exynos4412-mehmet.dts:833-838`, `gpio-mehmet.h:38`. The mainline DTS drives it high for
+/// good; the vendor driver (`wm8985.c`, vendor kernel) keeps it low while the outputs may not
+/// be settled, from probe (`:1145`) through every mute, and raises it only after the DAC is
+/// unmuted (`wm8985_dac_mute`, `:631-648`). This follows the vendor driver: see
+/// [`Wm8758::set_mute`].
 pub const POP_SUPPRESSOR: Pin = gpio::GPM1.pin(3);
 /// `exynos4412-mehmet.dts:826-831`, `gpio-mehmet.h:37`: the speaker amplifier, on when high.
 pub const SPEAKER_AMP: Pin = gpio::GPM1.pin(2);
@@ -42,6 +46,8 @@ pub const JACK_DETECT: Pin = gpio::GPX1.pin(6);
 const RAIL_SETTLE_MS: u64 = 10;
 /// `wm8985.c:992`: VMID charging with the anti-pop features on.
 const VMID_CHARGE_MS: u64 = 500;
+/// After [`POP_SUPPRESSOR`] goes high: the vendor driver's `msleep(100)` (`wm8985.c:646`).
+const POP_SETTLE_MS: u64 = 100;
 
 /// `wm8985.h:13-25,50,57-63,67`.
 const SOFTWARE_RESET: u8 = 0x00;
@@ -155,14 +161,15 @@ fn wait_ms(mct: Mct, ms: u64) {
     }
 }
 
-/// Turns on the codec's rail, sets its pins as Linux does, and checks that it answers. Leaves
-/// the speaker amplifier off. `pmic` is on `i2c_0`, initialized.
+/// Turns on the codec's rail, sets its pins as the vendor driver does at probe, and checks that
+/// it answers. Leaves the speaker amplifier off and [`POP_SUPPRESSOR`] low. `pmic` is on
+/// `i2c_0`, initialized.
 pub fn power_up(pmic: Max77686, mct: Mct) -> Result<Wm8758, Error> {
     let (ldo, millivolts) = LDO_AUDIO;
     pmic.enable_ldo(ldo, millivolts)?;
     wait_ms(mct, RAIL_SETTLE_MS);
     SPEAKER_AMP.set_output(false);
-    POP_SUPPRESSOR.set_output(true);
+    POP_SUPPRESSOR.set_output(false);
     JACK_DETECT.set_input(Pull::None);
     let i2c = I2c::new(Bus::I2c1);
     i2c.init(BUS_HZ, BUS_SDA_DELAY_NS)?;
@@ -210,8 +217,8 @@ impl Wm8758 {
     /// From reset to the DAC on the headphones at `db` (see
     /// [`set_headphone_db`](Self::set_headphone_db)), for 16-bit I2S at 48 kHz with MCLK
     /// divided by `mclk`. Follows the anti-pop order of `wm8985.c:975-1000`: bias and VMID
-    /// first, then the outputs, muted until they are on. Takes [`VMID_CHARGE_MS`]. MCLK should
-    /// run already.
+    /// first, then the outputs, muted until they are on, then [`POP_SUPPRESSOR`] high. Takes
+    /// [`VMID_CHARGE_MS`] and [`POP_SETTLE_MS`]. MCLK should run already.
     pub fn start_headphones(&self, mct: Mct, mclk: MclkDiv, db: i8) -> Result<(), Error> {
         self.reset()?;
         self.write(BIAS_CTRL, BIASCUT)?;
@@ -233,7 +240,9 @@ impl Wm8758 {
         self.write(POWER_3, POWER_3_PLAYING)?;
         self.write(POWER_2, LOUT1EN | ROUT1EN)?;
         self.headphone_volume(db, false)?;
-        self.set_mute(false)
+        self.set_mute(false)?;
+        wait_ms(mct, POP_SETTLE_MS);
+        Ok(())
     }
 
     /// Sets the master clock divider.
@@ -241,9 +250,19 @@ impl Wm8758 {
         self.write(CLOCK_GEN, (mclk as u16) << MCLKDIV_SHIFT)
     }
 
-    /// Mutes the DAC softly, or lets it through.
+    /// Mutes the DAC softly, or lets it through, with [`POP_SUPPRESSOR`] in the order of
+    /// `wm8985_dac_mute`: low before muting, high after unmuting. After an unmute the vendor
+    /// driver waits [`POP_SETTLE_MS`] before sound; [`start_headphones`](Self::start_headphones)
+    /// does.
     pub fn set_mute(&self, mute: bool) -> Result<(), Error> {
-        self.write(DAC_CONTROL, DACOSR128 | if mute { SOFTMUTE } else { 0 })
+        if mute {
+            POP_SUPPRESSOR.write(false);
+        }
+        self.write(DAC_CONTROL, DACOSR128 | if mute { SOFTMUTE } else { 0 })?;
+        if !mute {
+            POP_SUPPRESSOR.write(true);
+        }
+        Ok(())
     }
 
     /// Sets both headphone outputs to `db`, limited to [`OUT_MIN_DB`]..=[`OUT_MAX_DB`]. Returns

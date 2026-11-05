@@ -788,7 +788,9 @@ master clock on CDCLK, and BCLK and LRCLK. 16-bit stereo I2S at 48 kHz.
   acknowledgement can be checked. `start_headphones` follows Linux's anti-pop order: bias and
   VMID first (500 ms), then the DAC, mixers and headphone outputs, muted until they are on.
   `set_speakers` adds LOUT2/ROUT2 and the speaker amplifier (`gpm1-2`). The pop suppressor
-  (`gpm1-3`) is driven high as in Linux. The jack pin (`gpx1-6`) is high while a jack is in, as the vendor kernel has
+  (`gpm1-3`) follows the vendor driver, not the mainline DTS, which holds it high: low from
+  `power_up` through the VMID charge, high only after the DAC is unmuted (then 100 ms), low again
+  before every mute. The jack pin (`gpx1-6`) is high while a jack is in, as the vendor kernel has
   it (`det_active_high`); the mainline DTS's `GPIO_ACTIVE_LOW` is wrong for this board. It is
   valid only with the headphone outputs on: before `start_headphones` it read low with a jack
   in, and in one run followed the pull-up: nothing drives it then. With the outputs on the
