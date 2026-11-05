@@ -28,7 +28,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `wifi_async_test/`: the same chip under Embassy as an `embassy-net` device, its runner task woken by the host wake line
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
-- `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom and starts it, instead of fastboot
+- `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom, or over WiFi by HTTP, and starts it, instead of fastboot
 - `gpu_triangle_test/`: flat, shaded and textured triangles through the GP and the PPs, with shaders compiled offline by Mesa's lima compiler
 - `gpu_cube_test/`: two textured (bilinear), lit cubes turning in perspective, drawn with the `gpu` runtime: two draws a frame, depth tested by the PPs
 - `gpu_spin_test/`: a textured square turning on the screen, drawn by the GP and four PPs every frame
@@ -128,6 +128,45 @@ itself through pyserial; `--monitor` keeps printing the board's output afterward
 
 The file is the 16-byte wire header (`EXYNBOOT`, length, CRC) followed by the image
 (`uart_boot/src/cache.rs`). CACHE is never formatted by `uart_boot`; `fat_test` does that.
+
+#### Loading over WiFi
+
+Built with the WiFi firmware and a network, `uart_boot` also takes images by HTTP:
+
+```
+WIFI_FIRMWARE_DIR=<dir> WIFI_SSID=<name> WIFI_PASSWORD=<passphrase> make img APP=uart_boot
+```
+
+(flashed once, as above; the passphrase goes into the image, so do not publish it). At
+power-on:
+
+1. 3 s for the UART alone, as before, with the MMU and caches off.
+2. It joins the network, gets an address by DHCP (with the name `exynos`) and prints
+   `uart_boot: http://<address>/ (exynos): POST /boot or /save`. HTTP and the UART are served
+   together from then on; whichever starts receiving first owns the image.
+3. 5 s after the address, the saved application boots if nothing has started arriving. Holding
+   **volume up** at power-on, or having no saved application, keeps it waiting for good.
+
+Without the network, or if joining fails, step 2 is left out and the UART waits alone.
+
+Each build, from the host:
+
+```
+make bin APP=<app>
+python3 tools/httpboot.py --host <address> --wait 30 target/armv7a-none-eabihf/release/<app>.bin
+```
+
+`--wait 30` retries until the board answers, so the script can be started before the reset
+button. `--save` saves the image to CACHE first, as `uartboot.py --save` does. `make send
+APP=<app> HOST=<address>` does both steps. `httpboot.py` sends the image's CRC-32 in an
+`X-CRC32` header, which the board checks along with the zImage magic; plain
+`curl --data-binary @<app>.bin http://<address>/boot` works too, without the CRC. The answer
+comes once the image is checked (and saved), then the image starts.
+
+After WiFi, `uart_boot` has the MMU on. Before jumping, it masks interrupts, turns off the timer
+and UART interrupts it used, writes the image out to DRAM, then turns the MMU and caches off and
+cleans and invalidates the L1 data cache, so the application starts in the state the UART path
+gives it. The WiFi chip is left running; an application that uses it powers it up from reset.
 
 ## Image format
 

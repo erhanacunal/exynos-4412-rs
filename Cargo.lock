@@ -1045,6 +1045,11 @@ dependencies = [
 name = "uart_boot"
 version = "0.1.0"
 dependencies = [
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-sync",
+ "embassy-time",
  "exynos_4412_rs",
 ]
 

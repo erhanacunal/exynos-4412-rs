@@ -1,6 +1,6 @@
 //! The saved application on CACHE (p8, FAT32): `FERRITE/FERRITE.BIN`.
 //!
-//! The file is the wire header followed by the image, so the CRC that came over the UART is
+//! The file is the UART's wire header followed by the image, so the CRC it was checked against is
 //! kept with it:
 //!
 //! | Bytes | Content |
@@ -10,15 +10,17 @@
 //! | 4 | CRC-32 (IEEE, as zlib's) of the image, little-endian |
 //! | length | the image |
 //!
-//! Runs with the MMU and caches off, as the rest of `uart_boot`: memory is Strongly-ordered,
-//! so the IDMAC and the CPU see the same bytes without cache maintenance, only slower. CACHE is
-//! never formatted here: without a FAT32 on it, there is nothing to boot and nothing is saved.
+//! Runs with the MMU and caches off before WiFi, where memory is Strongly-ordered, and with them
+//! on after (`net`), where `fat::PartitionDevice` keeps the IDMAC's buffer coherent itself. CACHE
+//! is never formatted here: without a FAT32 on it, there is nothing to boot and nothing is saved.
 
 use core::cell::UnsafeCell;
 
 use exynos_4412_rs::drivers::mmc::{self, Mmc};
 use exynos_4412_rs::fat::embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
 use exynos_4412_rs::fat::{self, FixedTime, PartitionDevice};
+
+use crate::crc::crc32;
 
 /// CACHE.
 const PARTITION: u32 = 8;
@@ -37,8 +39,8 @@ type Volumes<'a> = VolumeManager<PartitionDevice<'a>, FixedTime, 4, 4, 1>;
 #[repr(C, align(32))]
 struct Buffer(UnsafeCell<[u8; DEVICE_BYTES]>);
 
-// SAFETY: one user at a time: `with_volumes` takes it for the length of one call, and this
-// program has one thread and no interrupts.
+// SAFETY: one user at a time: `with_volumes` takes it for the length of one call, which never
+// awaits, and this program runs on one core; no interrupt handler touches it.
 unsafe impl Sync for Buffer {}
 
 static DEVICE: Buffer = Buffer(UnsafeCell::new([0; DEVICE_BYTES]));
@@ -97,16 +99,6 @@ fn with_volumes<T>(f: impl FnOnce(&Volumes<'_>) -> Result<T, Error>) -> Result<T
     let result = f(&volumes);
     volumes.device(|device| device.flush())?;
     result
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    !data.iter().fold(!0u32, |mut crc, &byte| {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
-        }
-        crc
-    })
 }
 
 /// Reads the saved application into `stage` (at most `stage.len()` bytes) and checks its CRC.

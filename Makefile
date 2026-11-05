@@ -12,7 +12,7 @@ MKBOOTIMG  ?= $(HOME)/mkbootimg/mkbootimg
 # bootcmd reads 0x4FC0 sectors of 512 bytes, one 4096-byte boot.img page may precede the image.
 MAX_SIZE   := $$(( 0x4FC0 * 512 - 4096 ))
 
-.PHONY: build bin img disasm shaders clean
+.PHONY: build bin img send disasm shaders clean
 
 build:
 	cargo build --release
@@ -28,6 +28,11 @@ img: bin
 	$(MKBOOTIMG) --kernel $(BIN) --ramdisk NONE --cmdline "console=ttySAC2,115200" --pagesize 4096 -o $(IMG)
 	@echo "$(IMG): $$(stat -c %s $(IMG)) bytes"
 	@cp $(IMG) $(OUT)/$(APP).img
+
+# Sends $(BIN) to uart_boot over WiFi: make send APP=hello_world HOST=192.168.1.50. Retries for
+# 30 s, so this can start before the board is reset. Without HOST: $$EXYNOS_HOST, else `exynos`.
+send: bin
+	python3 tools/httpboot.py $(if $(HOST),--host $(HOST)) --wait 30 $(BIN)
 
 disasm: build
 	@$(TOOLS)/llvm-nm $(ELF) | grep -E ' (_start|__exynos_vectors|__image_end|__bss_start|__stacks_end)$$'

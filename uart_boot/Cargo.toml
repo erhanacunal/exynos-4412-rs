@@ -2,8 +2,13 @@
 name = "uart_boot"
 version = "0.1.0"
 edition = "2024"
-description = "Waits for an application image over UART2, checks it and starts it"
+description = "Waits for an application image over UART2 or HTTP over WiFi, checks it and starts it"
 license = "MIT"
 
 [dependencies]
-exynos_4412_rs = { path = "../exynos_4412_rs", features = ["fat"] }
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["fat", "wifi-net"] }
+embassy-executor = "0.10"
+embassy-time = "0.5"
+embassy-sync = "0.8"
+embassy-futures = "0.1"
+embassy-net = { version = "0.9", features = ["medium-ethernet", "proto-ipv4", "dhcpv4", "dhcpv4-hostname", "tcp"] }
