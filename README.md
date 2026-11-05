@@ -117,6 +117,10 @@ itself through pyserial; `--monitor` keeps printing the board's output afterward
 - Without that file, or with a bad one, it keeps waiting for the UART: a saved application that
   crashes costs one restart, never the board.
 - Holding **volume up** at power-on skips the saved application.
+- **Test mode** skips it at every power-on, until turned off: the key `s` while `uart_boot`
+  waits (or `httpboot.py --stay`, `POST /stay`) creates the empty `FERRITE/STAY` on CACHE, and
+  `a` (or `--autoboot`, `POST /autoboot`) deletes it. Every image sent then runs, however late
+  it comes. `s` also holds the current power-on.
 - `uartboot.py --save <app>.bin` replaces it: `uart_boot` saves the image only after its CRC
   checked out (`uart_boot: saved FERRITE/FERRITE.BIN`), then starts it. Without `--save` an
   image runs from RAM only, as before.
@@ -144,8 +148,9 @@ power-on:
 2. It joins the network, gets an address by DHCP (with the name `exynos`) and prints
    `uart_boot: http://<address>/ (exynos): POST /boot or /save`. HTTP and the UART are served
    together from then on; whichever starts receiving first owns the image.
-3. 5 s after the address, the saved application boots if nothing has started arriving. Holding
-   **volume up** at power-on, or having no saved application, keeps it waiting for good.
+3. 5 s after the address, the saved application boots if nothing has started arriving and no
+   HTTP connection has come. Holding **volume up** at power-on, test mode (above), or having no
+   saved application keeps it waiting for good.
 
 Without the network, or if joining fails, step 2 is left out and the UART waits alone.
 
@@ -157,7 +162,8 @@ python3 tools/httpboot.py --host <address> --wait 30 target/armv7a-none-eabihf/r
 ```
 
 `--wait 30` retries until the board answers, so the script can be started before the reset
-button. `--save` saves the image to CACHE first, as `uartboot.py --save` does. `make send
+button. `--stay` turns test mode on first (it stays on across restarts, `--autoboot` ends it), so
+`--stay --wait 30 <app>.bin` is the way to run test applications next to a saved one. `--save` saves the image to CACHE first, as `uartboot.py --save` does. `make send
 APP=<app> HOST=<address>` does both steps. `httpboot.py` sends the image's CRC-32 in an
 `X-CRC32` header, which the board checks along with the zImage magic; plain
 `curl --data-binary @<app>.bin http://<address>/boot` works too, without the CRC. The answer

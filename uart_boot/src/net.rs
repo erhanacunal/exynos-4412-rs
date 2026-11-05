@@ -8,6 +8,8 @@
 //! | `GET /` | a page saying what is here |
 //! | `POST /boot` (or `PUT`) | runs the body from RAM, like `EXYNBOOT` |
 //! | `POST /save` (or `PUT`) | saves the body to CACHE, then runs it, like `EXYNSAVE` |
+//! | `POST /stay` | test mode on: the saved application no longer boots by itself (key `s`) |
+//! | `POST /autoboot` | test mode off, from the next power-on (key `a`) |
 //!
 //! The body is a `.bin`, or a `boot.img` whose kernel is then taken. It needs a
 //! `Content-Length`; `Expect: 100-continue` is answered. An `X-CRC32` header (8 hex digits, the
@@ -26,7 +28,8 @@
 //!
 //! [`STAGE`](crate::STAGE) has one image. Whoever starts receiving first, HTTP or the UART, claims
 //! it ([`Claim`]); the other is turned away until that one fails. The saved application boots,
-//! [`HTTP_WINDOW`] after the address came, only if no one holds the claim.
+//! [`HTTP_WINDOW`] after the address came, only if no one holds the claim, no connection came,
+//! and test mode is off (see [`crate`]).
 //!
 //! # State
 //!
@@ -243,7 +246,7 @@ fn join(mct: Mct) -> Result<Option<Joined>, Error> {
 
 /// Joins WiFi and serves images until one starts. Returns only if WiFi did not come up, with
 /// the MMU, the GIC and interrupts on; the console stays buffered.
-pub fn run(mct: Mct, args: BootArgs, stay: bool) {
+pub fn run(mct: Mct, args: BootArgs) {
     println!("uart_boot: joining WiFi");
     console::flush();
     mmu::enable();
@@ -278,7 +281,7 @@ pub fn run(mct: Mct, args: BootArgs, stay: bool) {
         for _ in 0..HTTP_SERVERS {
             spawner.spawn(http_task(stack).unwrap());
         }
-        spawner.spawn(boot_task(stack, stay).unwrap());
+        spawner.spawn(boot_task(stack).unwrap());
     })
 }
 
@@ -295,7 +298,7 @@ async fn net_task(mut runner: embassy_net::Runner<'static, wifi::Device<'static>
 
 /// Starts what comes ready, or the saved application once the window is over.
 #[embassy_executor::task]
-async fn boot_task(stack: Stack<'static>, stay: bool) {
+async fn boot_task(stack: Stack<'static>) {
     let up = with_timeout(DHCP_TIMEOUT, stack.wait_config_up()).await.is_ok();
     match stack.config_v4() {
         Some(config) if up => {
@@ -305,7 +308,7 @@ async fn boot_task(stack: Stack<'static>, stay: bool) {
         }
         _ => println!("uart_boot: no address by DHCP; waiting for an image (UART)"),
     }
-    let mut autoboot = (!stay).then(|| Instant::now() + if up { HTTP_WINDOW } else { Duration::from_ticks(0) });
+    let mut autoboot = (!crate::stay()).then(|| Instant::now() + if up { HTTP_WINDOW } else { Duration::from_ticks(0) });
     let len = loop {
         let Some(at) = autoboot else {
             break READY.wait().await;
@@ -314,6 +317,10 @@ async fn boot_task(stack: Stack<'static>, stay: bool) {
             Either::First(len) => break len,
             Either::Second(()) => {
                 autoboot = None;
+                if crate::stay() {
+                    println!("uart_boot: not booting {}: held", crate::cache::FILE);
+                    continue;
+                }
                 // An image on its way goes first.
                 let Some(claim) = Claim::take() else {
                     continue;
@@ -413,6 +420,8 @@ async fn http_task(stack: Stack<'static>) {
         if socket.accept(HTTP_PORT).await.is_err() {
             continue;
         }
+        // Someone is about to send: the saved application waits.
+        crate::hold();
         let ready = match serve(&mut socket).await {
             Ok(ready) => ready,
             Err(error) => {
@@ -530,6 +539,7 @@ async fn answer(socket: &mut TcpSocket<'_>, status: &str, body: &[u8]) -> TcpRes
 
 const USAGE: &[u8] = b"uart_boot on the Exynos 4412\n\
 POST (or PUT) a .bin to /boot to run it, to /save to save it to CACHE and run it.\n\
+POST /stay: test mode, nothing boots by itself; POST /autoboot ends it.\n\
 Optional header X-CRC32: <8 hex digits>, the CRC-32 of the body.\n\
 curl --data-binary @app.bin http://<this address>/boot\n";
 
@@ -562,6 +572,16 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<Option<usize>> {
         b"/save" => Some(Request::Save),
         _ => None,
     };
+    if method == b"POST" && (path == b"/stay" || path == b"/autoboot") {
+        let on = path == b"/stay";
+        let body: &[u8] = match (crate::set_test_mode(on), on) {
+            (true, true) => b"Test mode on: nothing boots by itself\n",
+            (true, false) => b"Test mode off: the saved application boots from the next power-on\n",
+            (false, _) => b"Test mode ERROR: see the console\n",
+        };
+        answer(socket, "200 OK", body).await?;
+        return Ok(None);
+    }
     match (method, request_kind) {
         (b"POST" | b"PUT", Some(kind)) => {
             let length = header(head, b"content-length").and_then(parse_decimal);

@@ -26,6 +26,8 @@ use crate::crc::crc32;
 const PARTITION: u32 = 8;
 pub const DIR: &str = "FERRITE";
 pub const FILE: &str = "FERRITE.BIN";
+/// Present: test mode, the saved application is not booted (see [`crate::stay`]). Empty.
+pub const STAY_FILE: &str = "STAY";
 pub const HEADER_MAGIC: &[u8; 8] = b"EXYNBOOT";
 const HEADER_BYTES: usize = 16;
 /// Read-ahead and single blocks, plus a 32 KiB run for writes: this loader writes one file.
@@ -132,6 +134,48 @@ pub fn load(stage: &mut [u8]) -> Result<usize, Error> {
             return Err(Error::Crc { want, got });
         }
         Ok(len)
+    })
+}
+
+/// Whether [`STAY_FILE`] is there. A CACHE without `FERRITE`, or without FAT32, says no.
+pub fn stay() -> Result<bool, Error> {
+    let found = with_volumes(|volumes| {
+        let volume = volumes.open_volume(VolumeIdx(0))?;
+        let root = volume.open_root_dir()?;
+        let dir = root.open_dir(DIR)?;
+        dir.find_directory_entry(STAY_FILE)?;
+        Ok(())
+    });
+    match found {
+        Ok(()) => Ok(true),
+        Err(Error::NotFound | Error::NoFat) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Creates [`STAY_FILE`] (`on`), making `FERRITE` if needed, or deletes it.
+pub fn set_stay(on: bool) -> Result<(), Error> {
+    with_volumes(|volumes| {
+        let volume = volumes.open_volume(VolumeIdx(0))?;
+        let root = volume.open_root_dir()?;
+        if on {
+            match root.make_dir_in_dir(DIR) {
+                Ok(()) | Err(FsError::DirAlreadyExists) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let dir = root.open_dir(DIR)?;
+            dir.open_file_in_dir(STAY_FILE, Mode::ReadWriteCreateOrTruncate)?.close()?;
+            return Ok(());
+        }
+        let dir = match root.open_dir(DIR) {
+            Ok(dir) => dir,
+            Err(FsError::NotFound) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        match dir.delete_entry_in_dir(STAY_FILE) {
+            Ok(()) | Err(FsError::NotFound) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     })
 }
 

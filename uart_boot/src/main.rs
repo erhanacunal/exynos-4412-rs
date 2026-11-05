@@ -29,8 +29,12 @@
 //!    started. Without one, or with a bad one, this keeps waiting: a broken saved application
 //!    never locks the board out.
 //!
-//! Holding volume up at power-on skips the saved application altogether. Without WiFi in the
-//! build, or when joining fails, step 2 is left out and the UART waits on its own, polled.
+//! Holding volume up at power-on skips the saved application altogether, and so does test mode:
+//! with `FERRITE/STAY` on CACHE, every image sent is run and nothing boots by itself. Test mode
+//! is turned on with the key `s` or `POST /stay`, off with `a` or `POST /autoboot`; either
+//! lasts across restarts. An HTTP connection, or `s`, also cancels the autoboot of this power-on
+//! only. Without WiFi in the build, or when joining fails, step 2 is left out and the UART waits
+//! on its own, polled.
 //!
 //! # Starting an image
 //!
@@ -40,7 +44,7 @@
 //! the MMU on, [`start`] masks the interrupts, writes the image out to DRAM and turns the MMU and
 //! the caches off first: the application finds the state the UART path leaves.
 //!
-//! Keys while waiting: `f` restart into fastboot, `r` restart.
+//! Keys while waiting: `f` restart into fastboot, `r` restart, `s` test mode on, `a` off.
 
 #![no_std]
 #![no_main]
@@ -50,6 +54,7 @@ mod crc;
 mod net;
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use exynos_4412_rs::drivers::gpio::{self, Pin, Pull};
 use exynos_4412_rs::drivers::power::{self, BootMode};
@@ -81,6 +86,37 @@ const VOLUME_UP: Pin = gpio::GPX3.pin(4);
 const HANDOVER_MS: u64 = 300;
 const COUNTS_PER_MS: u64 = soc::MCT_CLOCK_HZ as u64 / 1000;
 
+/// Set: the saved application is not booted this power-on. Only loaded and stored, which work
+/// with the MMU off.
+static STAY: AtomicBool = AtomicBool::new(false);
+
+/// Whether the saved application stays unbooted this power-on.
+fn stay() -> bool {
+    STAY.load(Ordering::Relaxed)
+}
+
+/// No autoboot this power-on.
+fn hold() {
+    STAY.store(true, Ordering::Relaxed);
+}
+
+/// Turns test mode on or off on CACHE; on also holds this power-on. Prints the outcome.
+fn set_test_mode(on: bool) -> bool {
+    if on {
+        hold();
+    }
+    console::flush();
+    match cache::set_stay(on) {
+        Ok(()) if on => println!("uart_boot: test mode on ({}/{}): nothing boots by itself", cache::DIR, cache::STAY_FILE),
+        Ok(()) => println!("uart_boot: test mode off: {}/{} boots from the next power-on", cache::DIR, cache::FILE),
+        Err(error) => {
+            println!("uart_boot: test mode ERROR {:?}", error);
+            return false;
+        }
+    }
+    true
+}
+
 /// What the host asked for with its magic.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Request {
@@ -99,11 +135,17 @@ impl Request {
     }
 }
 
-/// Acts on a key typed while waiting. Neither magic holds an `f` or an `r`.
+/// Acts on a key typed while waiting. Neither magic holds an `f`, `r`, `s` or `a`.
 fn key(byte: u8) {
     match byte {
         b'f' => power::restart(BootMode::Fastboot),
         b'r' => power::restart(BootMode::Normal),
+        b's' => {
+            set_test_mode(true);
+        }
+        b'a' => {
+            set_test_mode(false);
+        }
         _ => {}
     }
 }
@@ -361,27 +403,33 @@ fn main(args: BootArgs) -> ! {
     mct.start();
     VOLUME_UP.set_input(Pull::Up);
     wait_ms(mct, 5); // the pull-up settles
-    let stay = !VOLUME_UP.read();
+    let held = !VOLUME_UP.read();
     let wifi = net::configured();
-    println!("\nuart_boot: send a .bin (minicom Ctrl-A S, uartboot) to {:#x}; keys f fastboot, r restart", STAGE);
-    if stay {
+    println!("\nuart_boot: send a .bin (minicom Ctrl-A S, uartboot) to {:#x}; keys f r s a", STAGE);
+    if held {
+        hold();
         println!("uart_boot: volume up held: not booting {}/{}", cache::DIR, cache::FILE);
-    } else if wifi {
-        println!("uart_boot: WiFi in {} ms, then HTTP, then {}/{}", AUTOBOOT_MS, cache::DIR, cache::FILE);
-    } else {
+    } else if matches!(cache::stay(), Ok(true)) {
+        hold();
+        println!("uart_boot: test mode ({}/{}): not booting {}; key a ends it", cache::DIR, cache::STAY_FILE, cache::FILE);
+    }
+    if wifi {
+        let then = if stay() { "" } else { ", then FERRITE/FERRITE.BIN" };
+        println!("uart_boot: WiFi in {} ms, then HTTP{}", AUTOBOOT_MS, then);
+    } else if !stay() {
         println!("uart_boot: booting {}/{} in {} ms unless an image arrives", cache::DIR, cache::FILE, AUTOBOOT_MS);
     }
     // The UART alone, for this long; `None`: for good.
-    let mut window = (wifi || !stay).then_some(AUTOBOOT_MS);
+    let mut window = (wifi || !stay()).then_some(AUTOBOOT_MS);
     loop {
         let Some(request) = wait_magic(mct, window) else {
             window = None;
             if wifi {
                 // Returns only if WiFi did not come up.
-                net::run(mct, args, stay);
+                net::run(mct, args);
                 println!("uart_boot: no WiFi, UART only");
             }
-            if !stay && let Some(len) = load_saved() {
+            if !stay() && let Some(len) = load_saved() {
                 start(mct, len, &args);
             }
             println!("uart_boot: waiting for an image");

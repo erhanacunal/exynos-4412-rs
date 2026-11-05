@@ -11,6 +11,13 @@ skipped. The image goes with its CRC-32 in `X-CRC32`, which the board checks.
     httpboot.py --host 192.168.1.50 --save IMAGE    save it to CACHE, then run it
     httpboot.py --wait 30 IMAGE                     retry for up to 30 s: start the script,
                                                     then power on or reset the board
+    httpboot.py --stay [IMAGE]                      test mode on first: FERRITE/FERRITE.BIN no
+                                                    longer boots by itself, across restarts
+    httpboot.py --autoboot                          test mode off, from the next power-on
+
+Any connection during the 5 s also holds the saved application for that power-on, so with
+--wait the image is never beaten by it. Keys on the console do the same as --stay and
+--autoboot: `s` and `a`.
 
 The host defaults to $EXYNOS_HOST, else `exynos`, the name uart_boot gives DHCP (many routers
 resolve it, often as `exynos.lan` or `exynos.local`). Plain curl works too, without the CRC:
@@ -73,6 +80,18 @@ def connect(host, wait_s):
             time.sleep(RETRY_S)
 
 
+def post(host, path, wait_s):
+    """A POST without a body, such as /stay; True if the board said 200."""
+    connection = http.client.HTTPConnection(host, PORT, timeout=ANSWER_TIMEOUT_S)
+    connection.sock = connect(host, wait_s)
+    connection.sock.settimeout(ANSWER_TIMEOUT_S)
+    connection.request("POST", path, body=b"", headers={"Content-Length": "0"})
+    response = connection.getresponse()
+    answer = response.read().decode("utf-8", "replace").strip()
+    log("httpboot: %s: %d %s: %s" % (path, response.status, response.reason, answer))
+    return response.status == 200
+
+
 def send(host, path, data, wait_s):
     crc = zlib.crc32(data) & 0xFFFFFFFF
     connection = http.client.HTTPConnection(host, PORT, timeout=ANSWER_TIMEOUT_S)
@@ -94,15 +113,24 @@ def send(host, path, data, wait_s):
 
 def main():
     parser = argparse.ArgumentParser(description="Send an image to uart_boot over HTTP.")
-    parser.add_argument("image", help="a make bin output, <app>.bin, or a boot.img")
+    parser.add_argument("image", nargs="?", help="a make bin output, <app>.bin, or a boot.img")
     parser.add_argument("--host", default=os.environ.get("EXYNOS_HOST", "exynos"),
                         help="the board's address or name (default $EXYNOS_HOST, else exynos)")
     parser.add_argument("--save", action="store_true", help="save it to CACHE as the application to boot, then run it")
     parser.add_argument("--wait", type=float, default=0.0, metavar="SECONDS",
                         help="retry connecting for this long, while the board starts")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--stay", action="store_true", help="test mode on before sending: nothing boots by itself")
+    mode.add_argument("--autoboot", action="store_true", help="test mode off, from the next power-on")
     args = parser.parse_args()
-    data = load(args.image)
-    ok = send(args.host, "/save" if args.save else "/boot", data, args.wait)
+    if args.image is None and not (args.stay or args.autoboot):
+        parser.error("give an IMAGE, --stay or --autoboot")
+    data = load(args.image) if args.image else None
+    ok = True
+    if args.stay or args.autoboot:
+        ok = post(args.host, "/stay" if args.stay else "/autoboot", args.wait)
+    if ok and data is not None:
+        ok = send(args.host, "/save" if args.save else "/boot", data, args.wait)
     sys.exit(0 if ok else 1)
 
 
