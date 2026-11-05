@@ -29,7 +29,8 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `wifi_test/`: BCM4334 WiFi chip bring-up over SDIO: loads firmware, scans, joins a WPA2 network, DHCP, ping, TCP and a small HTTP server
 - `wifi_async_test/`: the same chip under Embassy as an `embassy-net` device, its runner task woken by the host wake line
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
-- `mfc_test/`: MFC test: firmware start, then H.264 decoding checked picture by picture (GPL, links `exynos_4412_mfc`)
+- `mfc_test/`: MFC test: firmware start, then H.264 decoding checked picture by picture, then played on the panel (GPL, links `exynos_4412_mfc`)
+- `mfc_play/`: plays an H.264 stream on the panel, over and over (GPL, links `exynos_4412_mfc`)
 - `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom, or over WiFi by HTTP, and starts it, instead of fastboot
 - `gpu_triangle_test/`: flat, shaded and textured triangles through the GP and the PPs, with shaders compiled offline by Mesa's lima compiler
 - `gpu_cube_test/`: two textured (bilinear), lit cubes turning in perspective, drawn with the `gpu` runtime: two draws a frame, depth tested by the PPs
@@ -1879,7 +1880,26 @@ groups, which `exynos_4412_mfc::tiles::Plane` reads.
 The test stream, `mfc_test/data/pcm320x240.h264`, comes from `tools/h264_pcm.py`. It has only
 I_PCM and P_Skip macroblocks, so a correct decoder gives exactly the pictures drawn, and the
 script also writes their CRC-32s. On the board all 30 pictures match: about 3.9 ms for an IDR
-picture and 1.4 ms for a P picture, at 320x240.
+picture and 1.4 ms for a P picture, at 320x240. Once all match, `mfc_test` plays the stream on
+the panel at three times its size, 30 fps.
+
+### Playing a video: mfc_play
+
+`mfc_play` plays an H.264 stream on the panel, over and over. `exynos_4412_mfc::annexb` cuts it
+into pictures, and the decoder puts them in display order, B-frames included.
+`exynos_4412_mfc::convert` draws each one with the CPU right after a vsync: it detiles the
+picture, converts BT.601 YCbCr to RGB and scales it up by a whole number. A portrait picture
+that only fits turned is turned a quarter turn clockwise. The stream is built into the image;
+an MP4 file's video track comes out with `tools/mp4_annexb.py`:
+
+```
+python3 tools/mp4_annexb.py video.mp4 video.h264
+MFC_FIRMWARE=<path>/s5p-mfc.fw MFC_VIDEO=video.h264 MFC_FPS=24 make bin APP=mfc_play
+```
+
+Without `MFC_VIDEO` it plays `mfc_test`'s stream. Port B gets 64 MiB here: a 720p frame buffer
+takes about 1.2 MiB of it. On the board a 720x1280 High profile stream with B-frames plays at
+24 fps, turned to fill 1280x720.
 
 ## QEMU
 

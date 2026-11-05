@@ -21,10 +21,13 @@
 //!
 //! [`Mfc::init`]: power, clock, reset, firmware into port A, its start, `SYS_INIT`, and its
 //! version (`s5p_mfc_init_hw`, `s5p_mfc_ctrl.c`). [`h264::Decoder`]: H.264 decoding, one
-//! instance at a time, polled.
+//! instance at a time, polled; [`annexb`] cuts a stream into what it takes. [`convert`]: a
+//! picture onto the framebuffer.
 
 #![no_std]
 
+pub mod annexb;
+pub mod convert;
 pub mod h264;
 pub mod regs;
 pub mod tiles;

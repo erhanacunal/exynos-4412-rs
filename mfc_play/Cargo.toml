@@ -1,0 +1,10 @@
+[package]
+name = "mfc_play"
+version = "0.1.0"
+edition = "2024"
+description = "Plays an H.264 stream on the panel through the MFC, over and over"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }
+exynos_4412_mfc = { path = "../exynos_4412_mfc" }

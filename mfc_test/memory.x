@@ -2,13 +2,14 @@
  * ORIGIN is the load address, the only place the application sets it. It must match
  * the board's bootcmd: mmc read 0 40008000 10040 4FC0; bootm 40008000 41000000
  *
- * DRAM is 0x40000000 + 0x7EA00000 (exynos4412-mehmet.dts, memory@40000000). 4 MiB is
- * far more than this program needs. It keeps the image, .bss and stacks at the bottom
- * of DRAM, below the 0x41000000 that bootcmd passes as the ramdisk address and far
- * from the top of DRAM, where U-Boot conventionally relocates itself. The exact U-Boot
- * address is unknown: its source is not available.
+ * DRAM is 0x40000000 + 0x7EA00000 (exynos4412-mehmet.dts, memory@40000000). 12 MiB
+ * holds the image with its embedded stream and the 4 MiB framebuffer in .bss, inside
+ * the first 16 MiB of DRAM that the uncached view covers (mmu::DRAM_UNCACHED). It ends
+ * below the 0x41000000 that bootcmd passes as the ramdisk address and far from the top
+ * of DRAM, where U-Boot conventionally relocates itself. The exact U-Boot address is
+ * unknown: its source is not available.
  */
 MEMORY
 {
-    RAM : ORIGIN = 0x40008000, LENGTH = 4M
+    RAM : ORIGIN = 0x40008000, LENGTH = 12M
 }
