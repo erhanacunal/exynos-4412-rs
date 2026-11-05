@@ -1937,15 +1937,14 @@ vendor kernel's `fimg2d4x_regs.h`; which registers each operation sets follows l
 exclusive. Written XRGB pixels get 0xFF as their top byte.
 
 `g2d_test` checks the result pixel by pixel and times the CPU doing the same (1280x800, uncached
-framebuffers). On the first run fill, copy and nearest scaling differed in every pixel the G2D
-wrote, the 200x100 fill in exactly its own: the top byte, compared then. The test now compares
-colours only and prints the first pixel written; that run is still to come (TODO(verify)):
+framebuffers). The colours are compared, not the top byte: asked `0x00123456`, the G2D writes
+`0xff123456`. Every check passes:
 
 | Operation | G2D | CPU | Result |
 |---|---|---|---|
-| Fill 1280x800 | 1.28 ms (3.2 GB/s) | 2.1 ms | top byte only? |
-| Copy 1280x800 | 1.73 ms (2.4 GB/s) | 65.4 ms | top byte only? |
-| Scale 320x200 to 1280x800, nearest | 1.29 ms | 59.7 ms | top byte only? |
+| Fill 1280x800 | 1.28 ms (3.2 GB/s) | 2.1 ms | right |
+| Copy 1280x800 | 1.73 ms (2.4 GB/s) | 65.4 ms | right |
+| Scale 320x200 to 1280x800, nearest | 1.29 ms | 59.7 ms | right |
 | Scale 320x200 to 1280x800, bilinear | 5.28 ms | | 0 out of range |
 | Blend 128x128 ARGB, global alpha 255 or 128 | 53 us | 3.4 ms | worst error 2 |
 | Blend 128x128 scaled to 384x384, bilinear | 0.77 ms | | by eye |
