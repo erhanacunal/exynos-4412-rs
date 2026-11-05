@@ -521,8 +521,8 @@ not present. The bank table is the same as Linux `pinctrl-exynos-arm.c:355-414`.
   The power key gave exactly 8 edges in 4 presses. The driver has no filter; edge-driven code must do its
   own filtering. 5 ms polling showed no bounce in this test.
 - **State from U-Boot:** `gpd0-1` comes as `Output` and high, not in its PWM function. That is why the
-  Since then, `entry!` turns it off before `main`, so `gpio_test` shows it low.
-  backlight blinks directly with this pin.
+  backlight blinks directly with this pin. Since then, `entry!` turns it off before `main`, so
+  `gpio_test` shows it low; `display::set_brightness` puts it in its PWM function (see Display).
 
 ## I2C
 
@@ -645,7 +645,7 @@ polled. `display_test` shows it working.
 
 - **Order:** `Fimd::power_on` (domain, clocks, stops whatever U-Boot left running),
   `configure_pins`, draw and `flush`, `Fimd::start`, `set_lvds(true)`, wait `LVDS_SETTLE_MS`,
-  `set_backlight(true)`.
+  `set_backlight(true)` (half brightness) or `set_brightness(level)`.
 - **Caches:** The FIMD reads DRAM and does not see the caches. `Framebuffer::new` therefore draws
   through `mmu::DRAM_UNCACHED`, the uncached view of the first 16 MiB of DRAM, when the buffer is
   there, on whole cache lines, and the MMU is on: each write goes to DRAM, and `flush` and
@@ -656,8 +656,14 @@ polled. `display_test` shows it working.
   pixel at a time. `write_span` copies a span of a line prepared in ordinary memory.
 - **Clock:** `sclk_fimd0` runs from `mout_mpll_user_t`, undivided, as in the vendor kernel, and the
   FIMD divides it to the pixel clock: 800 MHz / 12 = 66.67 MHz, about 58 frames per second.
+- **Brightness:** `set_brightness(0..=255)` runs PWM channel 1 (`drivers::pwm`, `TOUT1` on
+  `gpd0-1`) at the device tree's 62.5 us period, high for the share asked; 0 and 255 make the pin
+  a plain output. `set_backlight(true)` turns it on at `DEFAULT_BRIGHTNESS`, 128: full brightness
+  drains the battery fast. The vendor kernel runs the channel with its output inverter on, so the
+  output is high for `TCNTB - TCMPB` ticks. `mfc_play` and `g2d_test` step through the device
+  tree's `brightness-levels` with `+` and `-`; verified by eye.
 - **Not present:** Other windows, System MMU, display interrupts (they come through the interrupt
-  combiner), brightness control (the backlight pin needs the PWM; here it is fully on or off).
+  combiner).
 
 Every application starts with the panel off: `entry!` calls `display::panel_off` before `main`,
 which turns off the backlight, then the LVDS transmitter, both left on by U-Boot. This saves the
@@ -1916,6 +1922,38 @@ size. `Fimc::power_on` (camera power domain `0x1002_3C00`, gates, `sclk_fimc` at
 the MPLL, reset), `configure` once per size, then `start` and `wait` per picture, polled on
 `CISTATUS`. FIMC 3 has no rotator. The registers come from Linux's `exynos4-is/fimc-reg.h`;
 nothing here uses its System MMU.
+
+## 2D accelerator (G2D)
+
+`drivers::g2d` drives FIMG2D 4.1 at `0x1080_0000` (`exynos4412.dtsi:298-305`): solid fills,
+copies between images, scaled with nearest or bilinear filtering when the sizes differ, and
+Porter-Duff "over" blending of an image with alpha (straight or premultiplied) times a global
+alpha. Images are XRGB8888, ARGB8888 or RGB565, by physical address, so uncached framebuffers or
+cleaned memory. `G2d::power_on` (gates `GATE_IP_DMC` 23-24, `sclk_fimg2d` at 200 MHz from
+`sclk_mpll`; no power domain), then per operation `fill`, `copy` or `blend`, which start it,
+and `wait`, polled on `INTC_PEND`. The register map comes from Linux's `exynos_drm_g2d.c` and the
+vendor kernel's `fimg2d4x_regs.h`; which registers each operation sets follows libdrm's
+`exynos_fimg2d.c` (MIT, `THIRD_PARTY_NOTICES.md`). Rectangles' right and bottom edges are
+exclusive. Written XRGB pixels get 0xFF as their top byte.
+
+`g2d_test` checks the result pixel by pixel and times the CPU doing the same (1280x800, uncached
+framebuffers). On the first run fill, copy and nearest scaling differed in every pixel the G2D
+wrote, the 200x100 fill in exactly its own: the top byte, compared then. The test now compares
+colours only and prints the first pixel written; that run is still to come (TODO(verify)):
+
+| Operation | G2D | CPU | Result |
+|---|---|---|---|
+| Fill 1280x800 | 1.28 ms (3.2 GB/s) | 2.1 ms | top byte only? |
+| Copy 1280x800 | 1.73 ms (2.4 GB/s) | 65.4 ms | top byte only? |
+| Scale 320x200 to 1280x800, nearest | 1.29 ms | 59.7 ms | top byte only? |
+| Scale 320x200 to 1280x800, bilinear | 5.28 ms | | 0 out of range |
+| Blend 128x128 ARGB, global alpha 255 or 128 | 53 us | 3.4 ms | worst error 2 |
+| Blend 128x128 scaled to 384x384, bilinear | 0.77 ms | | by eye |
+| Blend 1280x800 at half | 2.77 ms | 68.3 ms | worst error 1 |
+
+The demo, a bilinear full-screen background and 12 blended sprites from 64 to 256 pixels, takes
+6.8 ms per frame and keeps the panel's 58 frames per second, the CPU idle. The CPU's copies are
+slow because they read uncached memory.
 
 ## QEMU
 

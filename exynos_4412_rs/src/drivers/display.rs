@@ -28,6 +28,7 @@ use tock_registers::registers::{ReadOnly, ReadWrite};
 
 use super::cmu::Cmu;
 use super::gpio::{self, Drive, Function, Pin, Pull};
+use super::pwm;
 use crate::{cpu, mmu, soc};
 
 register_structs! {
@@ -165,9 +166,16 @@ pub const LVDS_PDN: Pin = gpio::GPM1.pin(0);
 /// How long the vendor kernel waits after releasing [`LVDS_PDN`], in milliseconds: `willow`
 /// `arch/arm/mach-exynos/setup-fb-s5p.c:221`.
 pub const LVDS_SETTLE_MS: u32 = 300;
-/// Backlight control. It is a PWM pin (`exynos4412-mehmet.dts`, `backlight`), used here as a
-/// plain output, so full brightness or off. Verified by `gpio_test`.
+/// Backlight control, high for light: `TOUT1`, PWM channel 1 (`exynos4412-mehmet.dts`,
+/// `backlight` and `pwm1_out`). Verified by `gpio_test`.
 pub const BACKLIGHT: Pin = gpio::GPD0.pin(1);
+/// The backlight's PWM channel and period, 16 kHz: `exynos4412-mehmet.dts`, `pwms = <&pwm 1
+/// 62500 1>`, and `willow` `mach-mehmet.c:3760`.
+const BACKLIGHT_PWM: usize = 1;
+const BACKLIGHT_PERIOD_NS: u32 = 62_500;
+/// The brightness [`set_backlight`] turns on at: level 5 of the device tree's
+/// `brightness-levels`, half of full. Full brightness drains the battery fast.
+pub const DEFAULT_BRIGHTNESS: u8 = 128;
 
 /// Why the display did not start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,9 +272,25 @@ pub fn set_lvds(on: bool) {
     LVDS_PDN.set_output(on);
 }
 
-/// Turns the backlight on, at full brightness, or off.
+/// Turns the backlight on, at [`DEFAULT_BRIGHTNESS`], or off.
 pub fn set_backlight(on: bool) {
-    BACKLIGHT.set_output(on);
+    set_brightness(if on { DEFAULT_BRIGHTNESS } else { 0 });
+}
+
+/// Sets the backlight's brightness, 0 (off) to 255 (full): the share of each 62.5 us period
+/// that [`BACKLIGHT`] is high. 0 and 255 make it a plain output, low or high, the PWM stopped;
+/// anything else puts it in its `TOUT1` function (`pwm1_out`, `exynos4412-pinctrl.dtsi:299-304`).
+/// If the PWM cannot run (the rate of `aclk100` unknown), any level but 0 is full.
+pub fn set_brightness(level: u8) {
+    let high_ns = (u64::from(BACKLIGHT_PERIOD_NS) * u64::from(level) / 255) as u32;
+    if level != 0 && level != 255 && pwm::start(BACKLIGHT_PWM, BACKLIGHT_PERIOD_NS, high_ns).is_ok() {
+        BACKLIGHT.set_pull(Pull::None);
+        BACKLIGHT.set_drive(Drive::Level1);
+        BACKLIGHT.set_function(Function::Alt(2));
+        return;
+    }
+    BACKLIGHT.set_output(level != 0);
+    pwm::stop(BACKLIGHT_PWM);
 }
 
 /// Turns the backlight off, then the LVDS transmitter: the reverse of the order they go on.

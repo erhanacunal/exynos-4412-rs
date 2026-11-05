@@ -1,0 +1,9 @@
+[package]
+name = "g2d_test"
+version = "0.1.0"
+edition = "2024"
+description = "G2D (FIMG2D 4.1) test for exynos_4412_rs: fill, copy, scale and blend, against the CPU"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }

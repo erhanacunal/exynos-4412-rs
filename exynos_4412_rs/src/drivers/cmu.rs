@@ -100,6 +100,8 @@ const SRC_MFC_MFC1: u32 = 1 << 8;
 const DIV_MFC_MASK: u32 = 0xF;
 /// clk-exynos4.c:823: `CLK_MFC`, the MFC's own gate. Bits 1 to 4 are its system MMUs and PPMUs.
 const GATE_MFC: u32 = 1 << 0;
+/// clk-exynos4.c:750: `CLK_PWM`, the PWM timers' gate.
+const GATE_PERIL_PWM: u32 = 1 << 24;
 /// clk-exynos4.c:42,56,66,88: the camera block's clocks, the FIMCs' among them.
 const SRC_CAM: usize = 0xC220;
 const SRC_MASK_CAM: usize = 0xC320;
@@ -126,6 +128,18 @@ const SRC_TOP0_SCLK_EPLL: u32 = 1 << 4;
 const SRC_TOP1_MPLL_USER_T: u32 = 1 << 12;
 /// clk-exynos4.c:540: `sclk_mpll` selects `fout_mpll` when set (clk-exynos4.c:280).
 const SRC_DMC_MPLL: u32 = 1 << 12;
+/// clk-exynos4.c:108,109.
+const DIV_DMC1: usize = 0x1_0504;
+const GATE_IP_DMC: usize = 0x1_0900;
+/// clk-exynos4.c:582: `mout_g2d0` selects `sclk_apll` when set, `sclk_mpll` when clear.
+const SRC_DMC_G2D0_APLL: u32 = 1 << 20;
+/// clk-exynos4.c:584,287: `mout_g2d` selects `mout_g2d1` (EPLL or VPLL) when set.
+const SRC_DMC_G2D1: u32 = 1 << 28;
+/// clk-exynos4.c:706: the divider of `sclk_fimg2d`, bits 0 to 3.
+const DIV_DMC1_G2D_MASK: u32 = 0xF;
+/// clk-exynos4.c:1003-1004: `CLK_G2D` and `CLK_SMMU_G2D`.
+const GATE_DMC_G2D: u32 = 1 << 23;
+const GATE_DMC_SMMU_G2D: u32 = 1 << 24;
 /// clk-exynos4.c:630: `aclk100` divides by this field, plus 1.
 const DIV_TOP_ACLK100_SHIFT: u32 = 4;
 /// clk-exynos4.c:858: `CLK_I2C0` is bit 6, and the next seven follow up to clk-exynos4.c:872.
@@ -357,12 +371,13 @@ impl Cmu {
         Some(self.mout_mpll_user_t_hz() / (((self.read(DIV_TOP) >> DIV_TOP_ACLK100_SHIFT) & 0xF) + 1))
     }
 
+    /// `sclk_mpll`, the MPLL as the DMC block sees it (clk-exynos4.c:540).
+    fn sclk_mpll_hz(&self) -> u32 {
+        if self.read(SRC_DMC) & SRC_DMC_MPLL != 0 { self.fout_mpll_hz() } else { soc::FIN_PLL_HZ }
+    }
+
     fn mout_mpll_user_t_hz(&self) -> u32 {
-        let mpll = if self.read(SRC_DMC) & SRC_DMC_MPLL != 0 {
-            self.fout_mpll_hz()
-        } else {
-            soc::FIN_PLL_HZ
-        };
+        let mpll = self.sclk_mpll_hz();
         if self.read(SRC_TOP1) & SRC_TOP1_MPLL_USER_T != 0 {
             mpll
         } else {
@@ -562,6 +577,46 @@ impl Cmu {
         input / div
     }
 
+    /// Raw clock registers of the G2D, for reports: `SRC_DMC`, `DIV_DMC1` and `GATE_IP_DMC`.
+    pub fn g2d_clocks(&self) -> [u32; 3] {
+        [self.read(SRC_DMC), self.read(DIV_DMC1), self.read(GATE_IP_DMC)]
+    }
+
+    /// Rate of `sclk_fimg2d`, the G2D's core clock. `None` if it comes from a PLL whose rate
+    /// this module does not read: the APLL, the EPLL or the VPLL.
+    pub fn sclk_fimg2d_hz(&self) -> Option<u32> {
+        let src = self.read(SRC_DMC);
+        if src & (SRC_DMC_G2D1 | SRC_DMC_G2D0_APLL) != 0 {
+            return None;
+        }
+        Some(self.sclk_mpll_hz() / ((self.read(DIV_DMC1) & DIV_DMC1_G2D_MASK) + 1))
+    }
+
+    /// Opens the gates of the G2D's registers and of its System MMU, which stays off but is on
+    /// its path to memory.
+    pub fn open_g2d_gates(&self) {
+        self.modify(GATE_IP_DMC, 0, GATE_DMC_G2D | GATE_DMC_SMMU_G2D);
+    }
+
+    /// Runs `sclk_fimg2d` from `sclk_mpll`, divided down to the highest rate not above `hz`,
+    /// and returns the rate. The G2D must be idle.
+    ///
+    /// # Panics
+    ///
+    /// If `hz` is below what the divider reaches.
+    pub fn set_g2d_clock(&self, hz: u32) -> u32 {
+        let input = self.sclk_mpll_hz();
+        let div = input.div_ceil(hz.max(1)).max(1);
+        assert!(div <= DIV_DMC1_G2D_MASK + 1, "sclk_fimg2d rate below what the divider reaches");
+        // The divider first, if it grows: the rate only falls while the mux changes.
+        if div - 1 > self.read(DIV_DMC1) & DIV_DMC1_G2D_MASK {
+            self.modify(DIV_DMC1, DIV_DMC1_G2D_MASK, div - 1);
+        }
+        self.modify(SRC_DMC, SRC_DMC_G2D1 | SRC_DMC_G2D0_APLL, 0);
+        self.modify(DIV_DMC1, DIV_DMC1_G2D_MASK, div - 1);
+        input / div
+    }
+
     /// Opens the gates of the FIMD's registers and of its bus path.
     pub fn open_fimd_gates(&self) {
         self.modify(GATE_IP_LCD0, 0, GATE_LCD0_FIMD0 | GATE_LCD0_SMMU_FIMD0);
@@ -579,7 +634,8 @@ impl Cmu {
         let address = (soc::CMU_BASE + offset) as *mut u32;
         let was_masked = cpu::mask_irq();
         // SAFETY: as in `read`. Every caller changes only fields of the block it configures: the
-        // FIMD, `sdhci_3`, `pdma0`, the audio subsystem, the GPU, the MFC or a FIMC.
+        // FIMD, `sdhci_3`, `pdma0`, the audio subsystem, the GPU, the MFC, a FIMC, the G2D or the
+        // PWM timers.
         unsafe {
             ptr::write_volatile(address, (ptr::read_volatile(address) & !clear) | set);
         }
@@ -640,6 +696,16 @@ impl Cmu {
     /// `E4X12_GATE_IP_MAUDIO`, for reports.
     pub fn audio_gates(&self) -> u32 {
         self.read(GATE_IP_MAUDIO)
+    }
+
+    /// Opens the PWM timers' clock gate.
+    pub fn open_pwm_gate(&self) {
+        self.modify(GATE_IP_PERIL, 0, GATE_PERIL_PWM);
+    }
+
+    /// Whether the PWM timers' clock gate is open, without which their registers do not answer.
+    pub fn pwm_gate_open(&self) -> bool {
+        self.read(GATE_IP_PERIL) & GATE_PERIL_PWM != 0
     }
 
     /// Opens the clock gate of the I2C controller `bus`, below 8.

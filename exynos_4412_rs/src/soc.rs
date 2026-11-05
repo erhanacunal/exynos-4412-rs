@@ -129,6 +129,12 @@ pub const MFC_IRQ: u16 = 32 + 94;
 /// `reg`.
 pub const PD_MFC_BASE: usize = 0x1002_3C40;
 
+/// `exynos4412.dtsi:298-305`, `g2d: g2d@10800000`: the 2D graphics accelerator (FIMG2D 4.1).
+pub const G2D_BASE: usize = 0x1080_0000;
+
+/// `exynos4.dtsi:658-670`, `pwm: pwm@139d0000`: the PWM timers.
+pub const PWM_BASE: usize = 0x139D_0000;
+
 /// `exynos4.dtsi:214-264`: the four FIMCs (camera interface, scaler and colour converter).
 pub const FIMC_BASE: [usize; 4] = [0x1180_0000, 0x1181_0000, 0x1182_0000, 0x1183_0000];
 /// Their interrupts, `GIC_SPI 84` to `87` (`exynos4.dtsi:217`, and so on).

@@ -13,12 +13,13 @@
 //! If the FIMC cannot take the picture, the CPU draws it (`exynos_4412_mfc::convert`): scaled
 //! up by the largest whole number that fits, or turned at its size.
 //!
-//! Keys: `r` restart, `f` restart into fastboot.
+//! Keys: `+` and `-` the backlight's brightness, `r` restart, `f` restart into fastboot.
 
 #![no_std]
 #![no_main]
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use exynos_4412_mfc::annexb::{header, pictures};
 use exynos_4412_mfc::convert::{self, MAX_SCALE};
@@ -66,10 +67,22 @@ unsafe impl Sync for Pixels {}
 const BUFFERS: usize = 3;
 static PIXEL_STORE: Pixels = Pixels(UnsafeCell::new([[0; PIXELS]; BUFFERS]));
 
+/// The device tree's `brightness-levels` (`exynos4412-mehmet.dts`, `backlight`), and the one
+/// in use, the default at first.
+const BRIGHTNESS: [u8; 10] = [0, 17, 32, 64, 96, 128, 160, 192, 224, 255];
+static LEVEL: AtomicUsize = AtomicUsize::new(5);
+
 fn key() {
     match console::uart().try_read_byte() {
         Some(b'r') => power::restart(BootMode::Normal),
         Some(b'f') => power::restart(BootMode::Fastboot),
+        Some(key @ (b'+' | b'=' | b'-')) => {
+            let level = LEVEL.load(Ordering::Relaxed);
+            let level = if key == b'-' { level.saturating_sub(1).max(1) } else { (level + 1).min(BRIGHTNESS.len() - 1) };
+            LEVEL.store(level, Ordering::Relaxed);
+            display::set_brightness(BRIGHTNESS[level]);
+            println!("Brightness {}", BRIGHTNESS[level]);
+        }
         _ => {}
     }
 }
@@ -102,7 +115,7 @@ fn start_panel(mct: Mct) -> Result<[Framebuffer; BUFFERS], display::Error> {
     display::set_lvds(true);
     let end = mct.count() + u64::from(LVDS_SETTLE_MS) * 1000 * COUNTS_PER_US;
     while mct.count() < end {}
-    display::set_backlight(true);
+    display::set_brightness(BRIGHTNESS[LEVEL.load(Ordering::Relaxed)]);
     Ok(framebuffers)
 }
 
@@ -395,7 +408,7 @@ fn main(_args: BootArgs) -> ! {
             wait_keys();
         }
     };
-    println!("Playing; keys: r restart, f fastboot");
+    println!("Playing; keys: + - brightness, r restart, f fastboot");
     console::flush();
     let fimc = Fimc::new(FIMC);
     let fimc = match fimc.power_on(fimc::DEFAULT_HZ, mct) {
