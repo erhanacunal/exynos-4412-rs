@@ -21,8 +21,8 @@
 //!
 //! [`Mfc::init`]: power, clock, reset, firmware into port A, its start, `SYS_INIT`, and its
 //! version (`s5p_mfc_init_hw`, `s5p_mfc_ctrl.c`). [`h264::Decoder`]: H.264 decoding, one
-//! instance at a time, polled; [`annexb`] cuts a stream into what it takes. [`convert`]: a
-//! picture onto the framebuffer.
+//! instance at a time, each answer awaited asleep until the interrupt; [`annexb`] cuts a
+//! stream into what it takes. [`convert`]: a picture onto the framebuffer.
 
 #![no_std]
 
@@ -36,7 +36,7 @@ use core::ptr;
 
 use exynos_4412_rs::drivers::mfc::{self, PowerDomainTimeout};
 use exynos_4412_rs::drivers::timer::Mct;
-use exynos_4412_rs::{mmu, soc};
+use exynos_4412_rs::{mmu, sleep, soc};
 
 /// `s5p_mfc_common.h:51`: how long the controller and the command register get.
 const BUS_TIMEOUT_MS: u64 = 500;
@@ -274,7 +274,8 @@ impl Mfc {
         Ok(())
     }
 
-    /// Waits for the firmware's answer, polled where Linux takes the interrupt, and clears it as
+    /// Waits for the firmware's answer, asleep until the MFC's interrupt, which Linux takes
+    /// (`s5p_mfc_irq`), and clears it as
     /// `s5p_mfc_clear_int_flags_v5` does. Any other answer is an error.
     pub(crate) fn wait_answer(&self, want: u32) -> Result<u32, Error> {
         let answer = self.answer(want)?;
@@ -286,16 +287,12 @@ impl Mfc {
 
     /// Waits for any answer and clears it. `want` is only for the timeout's error.
     pub(crate) fn answer(&self, want: u32) -> Result<Answer, Error> {
-        let begin = self.mct.count();
-        let got = loop {
-            let got = read(regs::RISC2HOST_CMD) & regs::RISC2HOST_CMD_MASK;
-            if got != regs::R2H_CMD_EMPTY {
-                break got;
-            }
-            if self.elapsed_ms(begin) > ANSWER_TIMEOUT_MS {
-                return Err(Error::AnswerTimeout { want, got });
-            }
-        };
+        let deadline = self.mct.count() + ANSWER_TIMEOUT_MS * COUNTS_PER_MS;
+        let answered = || read(regs::RISC2HOST_CMD) & regs::RISC2HOST_CMD_MASK != regs::R2H_CMD_EMPTY;
+        if !sleep::until(self.mct, &[soc::MFC_IRQ], Some(deadline), answered) {
+            return Err(Error::AnswerTimeout { want, got: regs::R2H_CMD_EMPTY });
+        }
+        let got = read(regs::RISC2HOST_CMD) & regs::RISC2HOST_CMD_MASK;
         let error = read(regs::RISC2HOST_ARG2);
         let arg1 = read(regs::RISC2HOST_ARG1);
         write(regs::RISC_HOST_INT, 0);
@@ -309,8 +306,7 @@ impl Mfc {
     }
 
     fn wait_ms(&self, ms: u64) {
-        let begin = self.mct.count();
-        while self.elapsed_ms(begin) < ms {}
+        sleep::for_us(self.mct, ms * 1000);
     }
 }
 

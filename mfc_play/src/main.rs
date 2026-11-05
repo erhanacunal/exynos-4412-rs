@@ -13,6 +13,10 @@
 //! If the FIMC cannot take the picture, the CPU draws it (`exynos_4412_mfc::convert`): scaled
 //! up by the largest whole number that fits, or turned at its size.
 //!
+//! Whatever the CPU waits for, the decoder, the FIMC, the vsync or the next picture's time, it
+//! waits asleep (`exynos_4412_rs::sleep`); the line of each pass gives the share of its time
+//! the CPU slept.
+//!
 //! Keys: `+` and `-` the backlight's brightness, `r` restart, `f` restart into fastboot.
 
 #![no_std]
@@ -31,7 +35,7 @@ use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::drivers::mfc;
 use exynos_4412_rs::drivers::power::{self, BootMode};
 use exynos_4412_rs::drivers::timer::Mct;
-use exynos_4412_rs::{BootArgs, console, mmu, println, soc};
+use exynos_4412_rs::{BootArgs, console, mmu, print, println, sleep, soc};
 
 exynos_4412_rs::entry!(main);
 
@@ -73,7 +77,11 @@ const BRIGHTNESS: [u8; 10] = [0, 17, 32, 64, 96, 128, 160, 192, 224, 255];
 static LEVEL: AtomicUsize = AtomicUsize::new(5);
 
 fn key() {
-    match console::uart().try_read_byte() {
+    handle_key(console::uart().try_read_byte());
+}
+
+fn handle_key(key: Option<u8>) {
+    match key {
         Some(b'r') => power::restart(BootMode::Normal),
         Some(b'f') => power::restart(BootMode::Fastboot),
         Some(key @ (b'+' | b'=' | b'-')) => {
@@ -87,11 +95,21 @@ fn key() {
     }
 }
 
+/// One line of what woke the CPU since the last one: interrupt ID x times.
+fn print_wakes() {
+    print!("Wakes:");
+    sleep::take_wakes(|id, count| match id {
+        Some(id) => print!(" {}x{}", id, count),
+        None => print!(" none x{}", count),
+    });
+    println!();
+}
+
 fn wait_keys() -> ! {
     println!("Keys: r restart, f fastboot");
     console::flush();
     loop {
-        key();
+        handle_key(sleep::read_key(Mct::new(), None));
     }
 }
 
@@ -114,7 +132,7 @@ fn start_panel(mct: Mct) -> Result<[Framebuffer; BUFFERS], display::Error> {
     fimd.start(&PANEL, &framebuffers[0])?;
     display::set_lvds(true);
     let end = mct.count() + u64::from(LVDS_SETTLE_MS) * 1000 * COUNTS_PER_US;
-    while mct.count() < end {}
+    sleep::until_count(mct, end);
     display::set_brightness(BRIGHTNESS[LEVEL.load(Ordering::Relaxed)]);
     Ok(framebuffers)
 }
@@ -233,9 +251,8 @@ impl Player {
         if self.mct.count() > self.due {
             pass.late += 1;
         }
-        while self.mct.count() < self.due {
-            key();
-        }
+        sleep::until_count(self.mct, self.due);
+        key();
         self.due = self.due.max(self.mct.count()) + 1_000_000 * COUNTS_PER_US / FPS;
         let fimd = Fimd::new();
         // The last one shown must be on the panel before another takes its place, or it would
@@ -285,7 +302,7 @@ impl Player {
 
     /// Plays the stream once: each picture drawn while the next one decodes.
     fn pass(&mut self, mfc: &mut Mfc, number: u32) -> Result<(), PlayError> {
-        let begin = self.mct.count();
+        let (begin, slept) = (self.mct.count(), sleep::slept());
         let mut decoder = Decoder::open(mfc, CONFIG)?;
         let sequence = decoder.header(header(STREAM))?;
         let how = self.how(&sequence);
@@ -325,10 +342,12 @@ impl Player {
             self.show(&mut decoder, &sequence, how, &decoded, &mut pass)?;
         }
         drop(decoder);
-        let ms = (self.mct.count() - begin) / COUNTS_PER_US / 1000;
+        let span = self.mct.count() - begin;
+        let ms = span / COUNTS_PER_US / 1000;
+        let idle = (sleep::slept() - slept) * 100 / span.max(1);
         let (decoded, shown) = (pass.decoded.max(1), pass.shown.max(1));
         println!(
-            "Pass {}: {}/{} shown, {} ms; wait {}/{} us, draw {}/{} us (avg/max); late {}, warn {}",
+            "Pass {}: {}/{} shown, {} ms; wait {}/{} us, draw {}/{} us (avg/max); late {}, warn {}; idle {}%",
             number,
             pass.shown,
             pass.decoded,
@@ -338,8 +357,10 @@ impl Player {
             pass.draw_us / shown,
             pass.draw_max,
             pass.late,
-            pass.warnings
+            pass.warnings,
+            idle
         );
+        print_wakes();
         console::flush();
         Ok(())
     }

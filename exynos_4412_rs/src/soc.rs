@@ -129,8 +129,20 @@ pub const MFC_IRQ: u16 = 32 + 94;
 /// `reg`.
 pub const PD_MFC_BASE: usize = 0x1002_3C40;
 
-/// `exynos4412.dtsi:298-305`, `g2d: g2d@10800000`: the 2D graphics accelerator (FIMG2D 4.1).
+/// `exynos4412.dtsi:298-305`, `g2d: g2d@10800000`: the 2D graphics accelerator (FIMG2D 4.1),
+/// and its interrupt, `GIC_SPI 89`.
 pub const G2D_BASE: usize = 0x1080_0000;
+/// The G2D's interrupt.
+pub const G2D_IRQ: u16 = 32 + 89;
+
+/// `exynos4.dtsi:171-176`, `combiner: interrupt-controller@10440000`: the interrupt combiner,
+/// whose group `n` of eight sources reaches the GIC as `GIC_SPI n` (`exynos4412.dtsi:575-596`).
+pub const COMBINER_BASE: usize = 0x1044_0000;
+/// The FIMD's interrupts: combiner group 11, sources 0 to 2 `fifo`, `vsync` and `lcd_sys`
+/// (`exynos4.dtsi:707-710`), so `GIC_SPI 11`.
+pub const FIMD_COMBINER_GROUP: usize = 11;
+/// The FIMD's combiner group at the GIC.
+pub const FIMD_IRQ: u16 = 32 + 11;
 
 /// `exynos4.dtsi:658-670`, `pwm: pwm@139d0000`: the PWM timers.
 pub const PWM_BASE: usize = 0x139D_0000;

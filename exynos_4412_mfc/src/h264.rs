@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-//! H.264 decoding: one instance, its commands polled.
+//! H.264 decoding: one instance, its answers awaited asleep until the MFC's interrupt.
 //!
 //! The order follows Linux 5.15.198's `s5p_mfc_try_run_v5` (`s5p_mfc_opr_v5.c`) through an
 //! instance's states: `OPEN_INSTANCE` (`s5p_mfc_open_inst_cmd_v5`, `s5p_mfc_cmd_v5.c`), the

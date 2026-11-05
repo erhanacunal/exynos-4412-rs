@@ -55,6 +55,7 @@ pub mod time;
 pub mod touch;
 pub mod wav;
 
+pub mod sleep;
 pub mod smp;
 pub mod wpa;
 

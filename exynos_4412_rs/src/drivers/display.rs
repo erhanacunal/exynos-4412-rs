@@ -1,9 +1,10 @@
 //! FIMD display controller, the board's panel and a framebuffer to draw in.
 //!
 //! This drives one full-screen window in 32-bit XRGB format, with the output going straight
-//! to the RGB pins. Vsync is polled. Not here: the other windows, the System MMU (off, so the
-//! FIMD reads physical addresses), interrupts, which come through the interrupt combiner,
-//! and backlight dimming, which needs the PWM.
+//! to the RGB pins. Waits for a vsync sleep until the frame interrupt, through the interrupt
+//! combiner ([`sleep::until`]), or poll if the MCT is not running. Not here: the other windows
+//! and the System MMU (off, so the FIMD reads physical addresses). The backlight's brightness
+//! is a PWM: [`set_brightness`].
 //!
 //! Register offsets and fields are verified against Linux 5.15.198
 //! `include/video/samsung_fimd.h`, cited as `samsung_fimd.h:<line>`. `exynos_drm_fimd.c` is
@@ -29,7 +30,8 @@ use tock_registers::registers::{ReadOnly, ReadWrite};
 use super::cmu::Cmu;
 use super::gpio::{self, Drive, Function, Pin, Pull};
 use super::pwm;
-use crate::{cpu, mmu, soc};
+use super::timer::Mct;
+use crate::{cpu, mmu, sleep, soc};
 
 register_structs! {
     Registers {
@@ -66,6 +68,11 @@ register_structs! {
         /// samsung_fimd.h:302 `VIDW_BUF_SIZE(0)`.
         (0x100 => buf_size: ReadWrite<u32>),
         (0x104 => _reserved6),
+        /// samsung_fimd.h:318.
+        (0x130 => vidintcon0: ReadWrite<u32>),
+        /// samsung_fimd.h:363: pending interrupts, cleared by writing 1.
+        (0x134 => vidintcon1: ReadWrite<u32>),
+        (0x138 => _reserved6b),
         /// samsung_fimd.h:406 `WINxMAP(0)`.
         (0x180 => win0map: ReadWrite<u32>),
         (0x184 => _reserved7),
@@ -99,6 +106,25 @@ const VIDCON1_LINECNT_MASK: u32 = 0x7FF;
 const VIDCON1_VSTATUS_SHIFT: u32 = 13;
 /// samsung_fimd.h:80 `VIDCON1_VSTATUS_VSYNC`, as the field's value.
 const VSTATUS_VSYNC: u32 = 0;
+/// samsung_fimd.h:328-342,361: the frame interrupt, at the start of vsync, and the interrupts'
+/// enable. The video interrupt at `FRAMESEL1` stays off.
+const VIDINTCON0_FRAMESEL0_MASK: u32 = 3 << 15;
+const VIDINTCON0_FRAMESEL0_VSYNC: u32 = 1 << 15;
+const VIDINTCON0_FRAMESEL1_MASK: u32 = 3 << 13;
+const VIDINTCON0_INT_FRAME: u32 = 1 << 12;
+const VIDINTCON0_INT_ENABLE: u32 = 1 << 0;
+/// samsung_fimd.h:365.
+const VIDINTCON1_INT_FRAME: u32 = 1 << 1;
+/// The FIMD's `vsync` source in its combiner group (`exynos4.dtsi:709-710`), the one Linux
+/// takes for the frame interrupt (`exynos_drm_fimd.c`, `fimd_probe`).
+const COMBINER_VSYNC_SOURCE: usize = 1;
+/// Linux `drivers/irqchip/exynos-combiner.c:21,61,194`: each four groups share registers at
+/// `(group / 4) * 0x10`, a byte per group, a bit per source.
+const COMBINER_ENABLE_SET: usize = 0x0;
+/// How long a wait for the next frame may take, in microseconds: six frames.
+const FRAME_TIMEOUT_US: u64 = 100_000;
+const COUNTS_PER_US: u64 = soc::MCT_CLOCK_HZ as u64 / 1_000_000;
+
 /// The VCLK keeps running during blanking, as the vendor kernel has it: `willow`
 /// `arch/arm/plat-s5p/include/plat/regs-fb-s5p.h:196` `VCLK_RUN_VDEN_DIS`, used by
 /// `drivers/video/samsung/s3cfb_fimd6x.c:267`. samsung_fimd.h:84 is the same field, without
@@ -676,8 +702,17 @@ impl Fimd {
         Ok(())
     }
 
-    /// Waits until the FIMD scans `framebuffer`: see [`show`](Self::show).
+    /// Waits until the FIMD scans `framebuffer`: see [`show`](Self::show). Asleep until each
+    /// frame interrupt ([`sleep::until`]) when the MCT runs, polled otherwise.
     pub fn wait_shown(&self, framebuffer: &Framebuffer) -> Result<(), Error> {
+        let wanted = framebuffer.address() as u32;
+        if let Some(deadline) = self.frame_interrupt() {
+            let shown = sleep::until(Mct::new(), &[soc::FIMD_IRQ], Some(deadline), || {
+                self.regs().vidintcon1.set(VIDINTCON1_INT_FRAME);
+                self.scan_address() == wanted
+            });
+            return if shown { Ok(()) } else { Err(Error::NoVsync) };
+        }
         let mut polls = 0;
         while self.scan_address() != framebuffer.address() as u32 {
             polls += 1;
@@ -686,6 +721,27 @@ impl Fimd {
             }
         }
         Ok(())
+    }
+
+    /// Turns on the frame interrupt, at the start of each vsync, and lets it through the
+    /// combiner, if the MCT runs to time the wait out. Returns the wait's deadline then.
+    fn frame_interrupt(&self) -> Option<u64> {
+        let mct = Mct::new();
+        if !mct.is_running() {
+            return None;
+        }
+        let regs = self.regs();
+        let wanted = VIDINTCON0_FRAMESEL0_VSYNC | VIDINTCON0_INT_FRAME | VIDINTCON0_INT_ENABLE;
+        let now = regs.vidintcon0.get();
+        if now & (VIDINTCON0_FRAMESEL0_MASK | VIDINTCON0_FRAMESEL1_MASK | wanted) != wanted {
+            regs.vidintcon0.set((now & !(VIDINTCON0_FRAMESEL0_MASK | VIDINTCON0_FRAMESEL1_MASK)) | wanted);
+        }
+        let group = soc::FIMD_COMBINER_GROUP;
+        let enable = (soc::COMBINER_BASE + group / 4 * 0x10 + COMBINER_ENABLE_SET) as *mut u32;
+        // SAFETY: the combiner's enable-set register of the FIMD's group, device memory that
+        // stays mapped; writing 1 enables that source only, the others are untouched.
+        unsafe { ptr::write_volatile(enable, 1 << ((group % 4) * 8 + COMBINER_VSYNC_SOURCE)) };
+        Some(mct.count() + FRAME_TIMEOUT_US * COUNTS_PER_US)
     }
 
     /// The FIMD's line counter, which moves only while it scans.
@@ -702,6 +758,16 @@ impl Fimd {
     /// Waits for the next start of vsync.
     pub fn wait_vsync(&self) -> Result<(), Error> {
         let regs = self.regs();
+        if let Some(deadline) = self.frame_interrupt() {
+            regs.vidintcon1.set(VIDINTCON1_INT_FRAME);
+            let pending = || regs.vidintcon1.get() & VIDINTCON1_INT_FRAME != 0;
+            return if sleep::until(Mct::new(), &[soc::FIMD_IRQ], Some(deadline), pending) {
+                regs.vidintcon1.set(VIDINTCON1_INT_FRAME);
+                Ok(())
+            } else {
+                Err(Error::NoVsync)
+            };
+        }
         let in_vsync = || (regs.vidcon1.get() >> VIDCON1_VSTATUS_SHIFT) & 0x3 == VSTATUS_VSYNC;
         let mut polls = 0;
         while in_vsync() {

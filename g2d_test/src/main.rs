@@ -3,6 +3,9 @@
 //! the same. Then a demo until reset: a scaled background and bouncing, half-transparent
 //! sprites, drawn by the G2D alone into one of two framebuffers while the panel shows the other.
 //!
+//! The CPU sleeps while it waits for the G2D or a vsync (`exynos_4412_rs::sleep`); the demo's
+//! lines give the share of time it slept.
+//!
 //! Keys: `+` and `-` the backlight's brightness, `r` restart, `f` restart into fastboot.
 
 #![no_std]
@@ -16,7 +19,7 @@ use exynos_4412_rs::drivers::g2d::{self, Alpha, Filter, Format, G2d, Rect, Surfa
 use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::drivers::power::{self, BootMode};
 use exynos_4412_rs::drivers::timer::Mct;
-use exynos_4412_rs::{BootArgs, console, mmu, println, soc};
+use exynos_4412_rs::{BootArgs, console, mmu, print, println, sleep, soc};
 
 exynos_4412_rs::entry!(main);
 
@@ -59,7 +62,11 @@ fn verdict(ok: bool) -> &'static str {
 }
 
 fn key(level: &mut usize) {
-    match console::uart().try_read_byte() {
+    handle_key(level, console::uart().try_read_byte());
+}
+
+fn handle_key(level: &mut usize, key: Option<u8>) {
+    match key {
         Some(b'r') => power::restart(BootMode::Normal),
         Some(b'f') => power::restart(BootMode::Fastboot),
         Some(key @ (b'+' | b'=' | b'-')) => {
@@ -71,12 +78,22 @@ fn key(level: &mut usize) {
     }
 }
 
+/// One line of what woke the CPU since the last one: interrupt ID x times.
+fn print_wakes() {
+    print!("Wakes:");
+    sleep::take_wakes(|id, count| match id {
+        Some(id) => print!(" {}x{}", id, count),
+        None => print!(" none x{}", count),
+    });
+    println!();
+}
+
 fn halt(what: &str) -> ! {
     println!("{} (MISMATCH); keys: r restart, f fastboot", what);
     console::flush();
     let mut level = 5;
     loop {
-        key(&mut level);
+        handle_key(&mut level, sleep::read_key(Mct::new(), None));
     }
 }
 
@@ -205,7 +222,7 @@ fn start_panel(mct: Mct, first: &mut Framebuffer) {
     }
     display::set_lvds(true);
     let end = mct.count() + u64::from(LVDS_SETTLE_MS) * 1000 * COUNTS_PER_US;
-    while mct.count() < end {}
+    sleep::until_count(mct, end);
     display::set_brightness(BRIGHTNESS[5]);
 }
 
@@ -462,10 +479,12 @@ fn demo(mct: Mct, g2d: G2d, images: &mut Images) -> ! {
             alpha: [255, 192, 128][i as usize % 3],
         };
     }
+    sleep::take_wakes(|_, _| {});
     println!("Demo: {} sprites; keys: + - brightness, r restart, f fastboot", balls.len());
     console::flush();
     let (mut front, mut frames, mut total, mut slowest) = (0, 0u32, 0u64, 0u64);
     let mut report = mct.count() + 2 * u64::from(soc::MCT_CLOCK_HZ);
+    let mut slept = sleep::slept();
     let mut level = 5;
     loop {
         let back = 1 - front;
@@ -487,8 +506,10 @@ fn demo(mct: Mct, g2d: G2d, images: &mut Images) -> ! {
         }
         front = back;
         if mct.count() >= report {
-            println!("{} frames/s; draw avg/max {}/{} us", frames / 2, total / u64::from(frames), slowest);
-            (frames, total, slowest) = (0, 0, 0);
+            let idle = (sleep::slept() - slept) * 100 / (2 * u64::from(soc::MCT_CLOCK_HZ));
+            println!("{} frames/s; draw avg/max {}/{} us; idle {}%", frames / 2, total / u64::from(frames), slowest, idle);
+            print_wakes();
+            (frames, total, slowest, slept) = (0, 0, 0, sleep::slept());
             report += 2 * u64::from(soc::MCT_CLOCK_HZ);
         }
         key(&mut level);
@@ -503,6 +524,11 @@ fn main(_args: BootArgs) -> ! {
     L2c::new().enable();
 
     let mut images = images();
+    // The CPU's fill once before anything sleeps, to compare with the one in `test_fill`.
+    let start = mct.count();
+    images.screens[1].fill_rect(0, 0, W, H, FILL_B);
+    images.screens[1].flush();
+    println!("CPU fill before any sleep: {} us", elapsed_us(mct, start));
     start_panel(mct, &mut images.screens[0]);
     let g2d = G2d::new();
     let hz = g2d.power_on(g2d::DEFAULT_HZ);

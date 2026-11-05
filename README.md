@@ -1951,8 +1951,32 @@ framebuffers). The colours are compared, not the top byte: asked `0x00123456`, t
 | Blend 1280x800 at half | 2.77 ms | 68.3 ms | worst error 1 |
 
 The demo, a bilinear full-screen background and 12 blended sprites from 64 to 256 pixels, takes
-6.8 ms per frame and keeps the panel's 58 frames per second, the CPU idle. The CPU's copies are
+6.8 ms per frame and keeps the panel's 58 frames per second; the CPU sleeps 99% of the time
+(see Sleeping instead of polling). The CPU's copies are
 slow because they read uncached memory.
+
+## Sleeping instead of polling
+
+`exynos_4412_rs::sleep::until` waits for a device asleep: the core stops in `wfi` with IRQs
+masked in the CPSR, the device's interrupt enabled only in the GIC, which wakes it anyway; no
+handler runs. A `ready` check after each wake-up clears what the device flagged. Timeouts are
+the MCT's comparator 0, left armed from one wait to the next, as each write to it waits for the
+MCT's clock domain. `until_count` and `for_us` sleep for a time, `read_key` until a key on the
+console (UART receive interrupt). `slept` counts the time asleep and `take_wakes` which
+interrupt woke the core, read from the GIC's highest-pending register without taking it.
+
+The G2D, FIMC and MFC waits, the FIMD's vsync waits (its frame interrupt at the start of vsync,
+through the interrupt combiner, group 11 = `GIC_SPI 11`; polled if the MCT is not running) and
+`mfc_play`'s frame pacing all sleep this way.
+
+- **U-Boot's interrupts:** U-Boot leaves the GIC on with interrupts of its own enabled, among them
+  `gpx0-3`'s (ID 51), whose line stays high: `wfi` then returned at once, 800,000 times a second,
+  and the CPU slept 29% of the time instead of 99%. `until` therefore runs `Gic::init` once if the
+  program has not, which `Gic::is_initialized` tells.
+- **Measured:** `g2d_test`'s demo sleeps 99% of the time at 58 frames per second, woken per 2 s
+  1508 times by the G2D (13 operations a frame), 116 by the vsync, 19 by the alarm. `mfc_play`
+  sleeps 96-97% at 24 fps, one late picture per pass as before; per pass, 860 wake-ups by FIMC 0
+  and 860 by the pacing alarm.
 
 ## QEMU
 

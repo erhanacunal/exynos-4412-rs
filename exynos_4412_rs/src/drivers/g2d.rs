@@ -1,7 +1,7 @@
 //! The 2D graphics accelerator at [`soc::G2D_BASE`], FIMG2D 4.1: fills rectangles, copies them
 //! between images, scaled on the way if the sizes differ, and blends them over what is there by
 //! their alpha, all in memory and without the CPU. One operation runs at a time; the CPU starts
-//! it and later waits for its end ([`G2d::is_done`]), polled.
+//! it and later waits for its end ([`G2d::wait`]), asleep until the G2D's interrupt.
 //!
 //! Registers and fields: Linux 5.15.198 `drivers/gpu/drm/exynos/exynos_drm_g2d.c:30-112` has
 //! the ones its command list checker needs; the rest come from the vendor kernel's map,
@@ -20,7 +20,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::drivers::cmu::Cmu;
 use crate::drivers::display::Framebuffer;
 use crate::drivers::timer::Mct;
-use crate::soc;
+use crate::{sleep, soc};
 
 /// `sclk_fimg2d` here: 200 MHz, from the 800 MHz MPLL. The vendor kernel asks for 201 MHz
 /// (`willow` `arch/arm/mach-exynos/mach-mehmet.c:2963`), which divides down to the same.
@@ -343,17 +343,15 @@ impl G2d {
         self.read(INTC_PEND) & INT_BLIT != 0
     }
 
-    /// Waits up to `timeout_us` for the end of the operation started last. Returns at once if
-    /// none runs.
+    /// Waits up to `timeout_us` for the end of the operation started last, asleep until its
+    /// interrupt ([`sleep::until`]). Returns at once if none runs.
     pub fn wait(&self, mct: Mct, timeout_us: u64) -> Result<(), Error> {
         if !RUNNING.load(Ordering::Acquire) {
             return Ok(());
         }
-        let begin = mct.count();
-        while !self.is_done() {
-            if mct.count() - begin > timeout_us * COUNTS_PER_US {
-                return Err(Error::Timeout(self.read(INTC_PEND)));
-            }
+        let deadline = mct.count() + timeout_us * COUNTS_PER_US;
+        if !sleep::until(mct, &[soc::G2D_IRQ], Some(deadline), || self.is_done()) {
+            return Err(Error::Timeout(self.read(INTC_PEND)));
         }
         self.write(INTC_PEND, INT_BLIT);
         RUNNING.store(false, Ordering::Release);

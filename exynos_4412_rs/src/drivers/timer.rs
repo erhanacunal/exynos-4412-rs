@@ -102,6 +102,11 @@ impl Mct {
         }
     }
 
+    /// Whether the global counter runs: [`start`](Self::start) has been called.
+    pub fn is_running(&self) -> bool {
+        self.regs().g_tcon.get() & TCON_START != 0
+    }
+
     /// Reads the 64-bit global counter, which counts at [`soc::MCT_CLOCK_HZ`].
     pub fn count(&self) -> u64 {
         let regs = self.regs();

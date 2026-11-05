@@ -19,6 +19,7 @@
 //! finishing and sending interrupts is safe from all cores at once.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use tock_registers::interfaces::{Readable, Writeable};
 use tock_registers::registers::{ReadOnly, ReadWrite, WriteOnly};
@@ -33,8 +34,8 @@ register_structs! {
         /// arm-gic.h:43 `GIC_DIST_CTR`. Bits 4:0 give the number of 32-interrupt banks, minus 1.
         (0x004 => typer: ReadOnly<u32>),
         (0x008 => _reserved0),
-        /// arm-gic.h:46 `GIC_DIST_ENABLE_SET`.
-        (0x100 => isenabler: [WriteOnly<u32>; 32]),
+        /// arm-gic.h:46 `GIC_DIST_ENABLE_SET`. Reads give the enabled state.
+        (0x100 => isenabler: [ReadWrite<u32>; 32]),
         /// arm-gic.h:47 `GIC_DIST_ENABLE_CLEAR`.
         (0x180 => icenabler: [WriteOnly<u32>; 32]),
         /// arm-gic.h:48 `GIC_DIST_PENDING_SET`. Reads give the pending state.
@@ -71,7 +72,10 @@ register_structs! {
         (0x0C => iar: ReadOnly<u32>),
         /// arm-gic.h:14 `GIC_CPU_EOI`.
         (0x10 => eoir: WriteOnly<u32>),
-        (0x14 => @END),
+        (0x14 => _reserved1),
+        /// arm-gic.h:16 `GIC_CPU_HIGHPRI`: the highest priority pending interrupt, not taken.
+        (0x18 => hppir: ReadOnly<u32>),
+        (0x1C => @END),
     }
 }
 
@@ -118,6 +122,9 @@ impl AckedIrq {
     }
 }
 
+/// Whether [`Gic::init`] has run.
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+
 /// Handle to the GIC. Holds no state.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Gic;
@@ -145,6 +152,7 @@ impl Gic {
     /// Interrupts are delivered once enabled with [`enable`](Self::enable) and
     /// unmasked with [`cpu::enable_irq`].
     pub fn init(&self) {
+        INITIALIZED.store(true, Ordering::Release);
         let dist = self.dist();
 
         dist.ctlr.set(0);
@@ -229,6 +237,25 @@ impl Gic {
             asm!("dsb", options(nostack, preserves_flags));
         }
         self.dist().sgir.set((1 << (SGIR_TARGET_SHIFT + target as u32)) | u32::from(id));
+    }
+
+    /// Whether this program has run [`init`](Self::init). U-Boot leaves the GIC on with its
+    /// own interrupts enabled, so the GIC being on does not tell.
+    pub fn is_initialized(&self) -> bool {
+        INITIALIZED.load(Ordering::Acquire)
+    }
+
+    /// Whether an interrupt is enabled.
+    pub fn is_enabled(&self, id: u16) -> bool {
+        let index = id as usize;
+        self.dist().isenabler[index / 32].get() & (1 << (index % 32)) != 0
+    }
+
+    /// The ID of the highest priority interrupt pending for this core, without taking it;
+    /// `None` if none is.
+    pub fn highest_pending(&self) -> Option<u16> {
+        let id = (self.cpu().hppir.get() & IAR_ID_MASK) as u16;
+        (id != SPURIOUS_ID).then_some(id)
     }
 
     /// Disables an interrupt.

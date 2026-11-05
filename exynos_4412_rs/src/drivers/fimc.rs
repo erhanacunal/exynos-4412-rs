@@ -2,7 +2,7 @@
 //! used here from memory to memory. A picture in two-plane YCbCr 4:2:0 (NV12), linear or in the
 //! MFC's 64x32 tiles (NV12MT), goes in; it comes out as `0x00RRGGBB` pixels, scaled to any size
 //! and turned by quarter turns, into a framebuffer, say. The FIMC works alone once started: the
-//! CPU only waits for the end ([`Fimc::is_done`]), polled.
+//! CPU only waits for the end ([`Fimc::wait`]), asleep until the FIMC's interrupt.
 //!
 //! Registers and fields: Linux 5.15.198 `drivers/media/platform/exynos4-is/fimc-reg.h`, cited by
 //! line. What each setting is for, and the scaler's ratios, follow what that driver programs
@@ -14,7 +14,7 @@ use core::ptr;
 
 use crate::drivers::cmu::Cmu;
 use crate::drivers::timer::Mct;
-use crate::soc;
+use crate::{sleep, soc};
 
 /// `sclk_fimc` here: 160 MHz, from the 800 MHz MPLL. Linux asks for 166 MHz
 /// (`fimc-core.c:1136`, `lclk_frequency` of `fimc_drvdata_exynos4x12`), which the MPLL divides down to the same.
@@ -410,14 +410,12 @@ impl Fimc {
         self.read(CISTATUS) & CISTATUS_FRAME_END != 0
     }
 
-    /// Waits up to `timeout_us` for the picture's end, then stops the input DMA for the next
-    /// [`start`](Self::start).
+    /// Waits up to `timeout_us` for the picture's end, asleep until the FIMC's interrupt
+    /// ([`sleep::until`]), then stops the input DMA for the next [`start`](Self::start).
     pub fn wait(&self, mct: Mct, timeout_us: u64) -> Result<(), Error> {
-        let begin = mct.count();
-        while !self.is_done() {
-            if mct.count() - begin > timeout_us * COUNTS_PER_US {
-                return Err(Error::Timeout(self.status()));
-            }
+        let deadline = mct.count() + timeout_us * COUNTS_PER_US;
+        if !sleep::until(mct, &[soc::FIMC_IRQ[self.index]], Some(deadline), || self.is_done()) {
+            return Err(Error::Timeout(self.status()));
         }
         self.modify(CISTATUS, CISTATUS_FRAME_END, 0);
         self.modify(CIGCTRL, 0, CIGCTRL_IRQ_CLR);
