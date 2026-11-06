@@ -14,6 +14,8 @@ skipped. The image goes with its CRC-32 in `X-CRC32`, which the board checks.
     httpboot.py --stay [IMAGE]                      test mode on first: FERRITE/FERRITE.BIN no
                                                     longer boots by itself, across restarts
     httpboot.py --autoboot                          test mode off, from the next power-on
+    httpboot.py --flash FLASH.BIN [IMAGE]           save FILE as it is as FERRITE/FLASH.BIN,
+                                                    the application's data; then IMAGE if given
 
 Any connection during the 5 s also holds the saved application for that power-on, so with
 --wait the image is never beaten by it. Keys on the console do the same as --stay and
@@ -92,6 +94,14 @@ def post(host, path, wait_s):
     return response.status == 200
 
 
+def load_flash(path):
+    with open(path, "rb") as file:
+        data = file.read()
+    if not data:
+        raise SystemExit("httpboot: %s is empty" % path)
+    return data
+
+
 def send(host, path, data, wait_s):
     crc = zlib.crc32(data) & 0xFFFFFFFF
     connection = http.client.HTTPConnection(host, PORT, timeout=ANSWER_TIMEOUT_S)
@@ -122,15 +132,23 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--stay", action="store_true", help="test mode on before sending: nothing boots by itself")
     mode.add_argument("--autoboot", action="store_true", help="test mode off, from the next power-on")
+    parser.add_argument("--flash", metavar="FILE",
+                        help="save FILE, as it is, as the application's data FERRITE/FLASH.BIN first")
     args = parser.parse_args()
-    if args.image is None and not (args.stay or args.autoboot):
-        parser.error("give an IMAGE, --stay or --autoboot")
+    if args.image is None and not (args.stay or args.autoboot or args.flash):
+        parser.error("give an IMAGE, --flash FILE, --stay or --autoboot")
     data = load(args.image) if args.image else None
+    flash = load_flash(args.flash) if args.flash else None
     ok = True
+    wait = args.wait
     if args.stay or args.autoboot:
-        ok = post(args.host, "/stay" if args.stay else "/autoboot", args.wait)
+        ok = post(args.host, "/stay" if args.stay else "/autoboot", wait)
+        wait = 0.0
+    if ok and flash is not None:
+        ok = send(args.host, "/flash", flash, wait)
+        wait = 0.0
     if ok and data is not None:
-        ok = send(args.host, "/save" if args.save else "/boot", data, args.wait)
+        ok = send(args.host, "/save" if args.save else "/boot", data, wait)
     sys.exit(0 if ok else 1)
 
 

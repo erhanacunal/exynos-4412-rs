@@ -1,4 +1,5 @@
-//! The saved application on CACHE (p8, FAT32): `FERRITE/FERRITE.BIN`.
+//! The saved application on CACHE (p8, FAT32): `FERRITE/FERRITE.BIN`; and the application's
+//! data file next to it, `FERRITE/FLASH.BIN`, written as sent ([`save_flash`]).
 //!
 //! The file is the UART's wire header followed by the image, so the CRC it was checked against is
 //! kept with it:
@@ -26,6 +27,8 @@ use crate::crc::crc32;
 const PARTITION: u32 = 8;
 pub const DIR: &str = "FERRITE";
 pub const FILE: &str = "FERRITE.BIN";
+/// The application's data, which it reads itself: saved as it came, with no header.
+pub const FLASH_FILE: &str = "FLASH.BIN";
 /// Present: test mode, the saved application is not booted (see [`crate::stay`]). Empty.
 pub const STAY_FILE: &str = "STAY";
 pub const HEADER_MAGIC: &[u8; 8] = b"EXYNBOOT";
@@ -179,8 +182,8 @@ pub fn set_stay(on: bool) -> Result<(), Error> {
     })
 }
 
-/// Saves `image`, whose CRC is `crc`, as the application to boot, making `FERRITE` if needed.
-pub fn save(image: &[u8], crc: u32) -> Result<(), Error> {
+/// Writes `parts`, one after the other, as `FERRITE/<name>`, making `FERRITE` if needed.
+fn write_file(name: &str, parts: &[&[u8]]) -> Result<(), Error> {
     with_volumes(|volumes| {
         let volume = volumes.open_volume(VolumeIdx(0))?;
         let root = volume.open_root_dir()?;
@@ -189,14 +192,25 @@ pub fn save(image: &[u8], crc: u32) -> Result<(), Error> {
             Err(error) => return Err(error.into()),
         }
         let dir = root.open_dir(DIR)?;
-        let file = dir.open_file_in_dir(FILE, Mode::ReadWriteCreateOrTruncate)?;
-        let mut header = [0u8; HEADER_BYTES];
-        header[..8].copy_from_slice(HEADER_MAGIC);
-        header[8..12].copy_from_slice(&(image.len() as u32).to_le_bytes());
-        header[12..16].copy_from_slice(&crc.to_le_bytes());
-        file.write(&header)?;
-        file.write(image)?;
+        let file = dir.open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)?;
+        for part in parts {
+            file.write(part)?;
+        }
         file.close()?;
         Ok(())
     })
+}
+
+/// Saves `image`, whose CRC is `crc`, as the application to boot, making `FERRITE` if needed.
+pub fn save(image: &[u8], crc: u32) -> Result<(), Error> {
+    let mut header = [0u8; HEADER_BYTES];
+    header[..8].copy_from_slice(HEADER_MAGIC);
+    header[8..12].copy_from_slice(&(image.len() as u32).to_le_bytes());
+    header[12..16].copy_from_slice(&crc.to_le_bytes());
+    write_file(FILE, &[&header, image])
+}
+
+/// Saves `data` as [`FLASH_FILE`], as it is: the caller has checked its CRC.
+pub fn save_flash(data: &[u8]) -> Result<(), Error> {
+    write_file(FLASH_FILE, &[data])
 }

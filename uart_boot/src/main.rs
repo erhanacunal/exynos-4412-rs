@@ -8,7 +8,7 @@
 //!
 //! | Bytes | Content |
 //! |---|---|
-//! | 8 | `EXYNBOOT` (run from RAM) or `EXYNSAVE` (save to CACHE, then run) |
+//! | 8 | `EXYNBOOT` (run from RAM), `EXYNSAVE` (save to CACHE, then run) or `EXYNFLSH` (data) |
 //! | 4 | length, little-endian |
 //! | 4 | CRC-32 (IEEE, as zlib's) of the image, little-endian |
 //! | length | the image |
@@ -17,6 +17,11 @@
 //! `uart_boot: ERROR ...`. A gap of [`GAP_MS`] in the image gives it up. After `EXYNSAVE` and
 //! `CRC OK` comes `uart_boot: saved FERRITE/FERRITE.BIN` or `uart_boot: save ERROR ...`; the
 //! image is started either way.
+//!
+//! `EXYNFLSH` carries the application's data file instead, any bytes: after `CRC OK` they are
+//! saved as they came, as `FERRITE/FLASH.BIN` (`uart_boot: saved FERRITE/FLASH.BIN`), nothing
+//! starts, and `uart_boot` waits for an image (`uart_boot: waiting again`), the autoboot of this
+//! power-on cancelled: the application can follow.
 //!
 //! # At power-on
 //!
@@ -73,6 +78,8 @@ const MAX_LEN: usize = 64 << 20;
 const MAGIC_BOOT: &[u8; 8] = b"EXYNBOOT";
 /// Save the image to CACHE as the application to boot, then run it.
 const MAGIC_SAVE: &[u8; 8] = b"EXYNSAVE";
+/// Save the data to CACHE as the application's `FLASH.BIN`; run nothing.
+const MAGIC_FLASH: &[u8; 8] = b"EXYNFLSH";
 /// Every image starts with a zImage header: `startup.s`, `_start`.
 const ZIMAGE_MAGIC_OFFSET: usize = 0x24;
 const ZIMAGE_MAGIC: u32 = 0x016f_2818;
@@ -123,6 +130,8 @@ fn set_test_mode(on: bool) -> bool {
 enum Request {
     Boot,
     Save,
+    /// The application's data file: [`MAGIC_FLASH`].
+    Flash,
 }
 
 impl Request {
@@ -131,12 +140,13 @@ impl Request {
         match window {
             MAGIC_BOOT => Some(Self::Boot),
             MAGIC_SAVE => Some(Self::Save),
+            MAGIC_FLASH => Some(Self::Flash),
             _ => None,
         }
     }
 }
 
-/// Acts on a key typed while waiting. Neither magic holds an `f`, `r`, `s` or `a`.
+/// Acts on a key typed while waiting. No magic holds an `f`, `r`, `s` or `a`.
 fn key(byte: u8) {
     match byte {
         b'f' => power::restart(BootMode::Fastboot),
@@ -200,9 +210,10 @@ fn wait_magic(mct: Mct, deadline_ms: Option<u64>) -> Option<Request> {
     }
 }
 
-/// Whether `len`, from a header, is a length this takes. Says why not.
-fn length_ok(len: usize) -> bool {
-    let ok = (ZIMAGE_MAGIC_OFFSET + 4..=MAX_LEN).contains(&len);
+/// Whether `len`, from a header for `request`, is a length this takes. Says why not.
+fn length_ok(request: Request, len: usize) -> bool {
+    let min = if request == Request::Flash { 1 } else { ZIMAGE_MAGIC_OFFSET + 4 };
+    let ok = (min..=MAX_LEN).contains(&len);
     if !ok {
         println!("uart_boot: ERROR length {} out of range", len);
     }
@@ -210,10 +221,10 @@ fn length_ok(len: usize) -> bool {
 }
 
 /// One image after its magic: its length and CRC if it arrived whole and right.
-fn receive(mct: Mct) -> Result<(usize, u32), &'static str> {
+fn receive(mct: Mct, request: Request) -> Result<(usize, u32), &'static str> {
     let len = word(mct).ok_or("no length")? as usize;
     let want = word(mct).ok_or("no CRC")?;
-    if !length_ok(len) {
+    if !length_ok(request, len) {
         return Err("length");
     }
     println!("uart_boot: receiving {} bytes", len);
@@ -229,18 +240,18 @@ fn receive(mct: Mct) -> Result<(usize, u32), &'static str> {
         unsafe { ((STAGE + offset) as *mut u8).write_volatile(byte) };
         crc = crc::update(crc, &[byte]);
     }
-    check(len, crc::finish(crc), want)?;
+    check(request, len, crc::finish(crc), want)?;
     Ok((len, want))
 }
 
 /// Checks the `len` bytes at [`STAGE`], whose CRC is `got`, against the `want` that came with
-/// them, and for the zImage magic. Prints the verdict.
-fn check(len: usize, got: u32, want: u32) -> Result<(), &'static str> {
+/// them, and for the zImage magic unless they are [`Request::Flash`] data. Prints the verdict.
+fn check(request: Request, len: usize, got: u32, want: u32) -> Result<(), &'static str> {
     if got != want {
         println!("uart_boot: ERROR CRC {:#010x}, sent {:#010x}", got, want);
         return Err("CRC");
     }
-    if len < ZIMAGE_MAGIC_OFFSET + 4 || !has_zimage_magic() {
+    if request != Request::Flash && (len < ZIMAGE_MAGIC_OFFSET + 4 || !has_zimage_magic()) {
         return Err("magic");
     }
     println!("uart_boot: CRC OK");
@@ -273,6 +284,22 @@ fn save(len: usize, crc: u32) -> bool {
     match cache::save(staged(len), crc) {
         Ok(()) => {
             println!("uart_boot: saved {}/{}", cache::DIR, cache::FILE);
+            true
+        }
+        Err(error) => {
+            println!("uart_boot: save ERROR {:?}", error);
+            false
+        }
+    }
+}
+
+/// Saves the `len` bytes at [`STAGE`] as the application's data, `FERRITE/FLASH.BIN`. Prints
+/// the outcome.
+fn save_flash(len: usize) -> bool {
+    console::flush();
+    match cache::save_flash(staged(len)) {
+        Ok(()) => {
+            println!("uart_boot: saved {}/{}, {} bytes", cache::DIR, cache::FLASH_FILE, len);
             true
         }
         Err(error) => {
@@ -443,7 +470,13 @@ fn main(args: BootArgs) -> ! {
         };
         // An image is coming: no WiFi or autoboot after it either, even if it fails.
         window = None;
-        match receive(mct) {
+        match receive(mct, request) {
+            Ok((len, _)) if request == Request::Flash => {
+                save_flash(len);
+                hold();
+                println!("uart_boot: waiting again");
+                console::flush();
+            }
             Ok((len, crc)) => {
                 if request == Request::Save {
                     save(len, crc);

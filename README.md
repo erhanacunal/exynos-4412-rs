@@ -138,6 +138,12 @@ itself through pyserial; `--monitor` keeps printing the board's output afterward
 The file is the 16-byte wire header (`EXYNBOOT`, length, CRC) followed by the image
 (`uart_boot/src/cache.rs`). CACHE is never formatted by `uart_boot`; `fat_test` does that.
 
+The application's data file, `FERRITE/FLASH.BIN`, is replaced the same way: `uartboot.py --flash
+FLASH.BIN` (magic `EXYNFLSH`) or `httpboot.py --flash FLASH.BIN` (`POST /flash`). Any bytes are
+taken; once their CRC checks out they are written as they came, with no header, and nothing
+runs: `uart_boot` waits for an image again, the autoboot of this power-on cancelled. An image can
+follow in the same call: `--flash FLASH.BIN --save <app>.bin`.
+
 #### Loading over WiFi
 
 Built with the WiFi firmware and a network, `uart_boot` also takes images by HTTP:

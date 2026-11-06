@@ -29,6 +29,12 @@ within 3 s of power-on (hold volume up to stay in uart_boot instead). To replace
     uartboot.py --port COM5 --wait 30 IMAGE    wait up to 30 s for uart_boot: start the script,
                                                then power on or reset the board
 
+The application's data file, FERRITE/FLASH.BIN on CACHE, is written as it is sent (any bytes,
+CRC-checked); nothing runs after it, so an image can follow in the same call:
+
+    uartboot.py --port COM5 --flash FLASH.BIN            the data alone; uart_boot waits again
+    uartboot.py --port COM5 --flash FLASH.BIN --save IMAGE   the data, then the application
+
 The header goes out when uart_boot prints its banner, not blindly: stray bytes in U-Boot's
 countdown would stop its autoboot. --debug prints every byte received.
 """
@@ -42,6 +48,7 @@ import zlib
 
 MAGIC = b"EXYNBOOT"
 MAGIC_SAVE = b"EXYNSAVE"
+MAGIC_FLASH = b"EXYNFLSH"
 ANDROID_MAGIC = b"ANDROID!"
 ZIMAGE_MAGIC_OFFSET = 0x24
 ZIMAGE_MAGIC = 0x016F2818
@@ -186,12 +193,21 @@ def no_answer(link):
     raise SystemExit("uartboot: no answer from uart_boot; " + hint)
 
 
-def send(link, path, baud, save=False, wait=0.0, reset=False):
-    data = load(path)
+def load_flash(path):
+    with open(path, "rb") as file:
+        data = file.read()
+    if not data:
+        raise SystemExit("uartboot: %s is empty" % path)
+    return data
+
+
+def send(link, path, baud, save=False, wait=0.0, reset=False, flash=False):
+    data = load_flash(path) if flash else load(path)
     crc = zlib.crc32(data) & 0xFFFFFFFF
-    log("uartboot: %s, %d bytes, CRC %08x%s" % (os.path.basename(path), len(data), crc,
-                                                ", to be saved on CACHE" if save else ""))
-    header = (MAGIC_SAVE if save else MAGIC) + struct.pack("<II", len(data), crc)
+    note = ", to be saved as FERRITE/FLASH.BIN" if flash else ", to be saved on CACHE" if save else ""
+    log("uartboot: %s, %d bytes, CRC %08x%s" % (os.path.basename(path), len(data), crc, note))
+    magic = MAGIC_FLASH if flash else MAGIC_SAVE if save else MAGIC
+    header = magic + struct.pack("<II", len(data), crc)
     # uart_boot may be sitting there waiting already: it answers at once.
     link.write(header)
     quick = FIRST_TRY_S if (wait > 0 or reset) else ANSWER_TIMEOUT_S
@@ -231,6 +247,13 @@ def send(link, path, baud, save=False, wait=0.0, reset=False):
     log("\nuartboot: sent in %.1f s" % (time.monotonic() - begin))
     if result != "CRC OK":
         raise SystemExit("uartboot: the board did not take the image")
+    if flash:
+        result = answer(link, ["saved", "save ERROR"], SAVE_TIMEOUT_S)
+        if result != "saved":
+            raise SystemExit("uartboot: FLASH.BIN was NOT saved on CACHE")
+        # uart_boot listens again once it says so.
+        answer(link, ["waiting again"], ANSWER_TIMEOUT_S)
+        return
     if save:
         result = answer(link, ["saved", "save ERROR"], SAVE_TIMEOUT_S)
         if result != "saved":
@@ -262,10 +285,14 @@ def main():
                         help="wait this long for uart_boot to start (power on or reset the board meanwhile)")
     parser.add_argument("--reset", "-r", action="store_true",
                         help="if uart_boot does not answer, restart the running ferrite application first")
+    parser.add_argument("--flash", "-F", metavar="FILE",
+                        help="first save FILE, as it is, as the application's data FERRITE/FLASH.BIN")
     parser.add_argument("--debug", "-d", action="store_true", help="print every byte received")
-    parser.add_argument("image", help="<app>.bin or boot.img")
+    parser.add_argument("image", nargs="?", help="<app>.bin or boot.img")
     # minicom passes the file name last, possibly after options of its own.
     args, _ = parser.parse_known_args()
+    if args.image is None and args.flash is None:
+        parser.error("give an IMAGE, --flash FILE, or both")
     global DEBUG
     DEBUG = args.debug
 
@@ -276,7 +303,13 @@ def main():
     else:
         link = StdioLink()
     try:
-        send(link, args.image, args.baud, save=args.save, wait=args.wait, reset=args.reset)
+        if args.flash:
+            send(link, args.flash, args.baud, wait=args.wait, reset=args.reset, flash=True)
+        if args.image:
+            # After FLASH.BIN, uart_boot is already listening: no waiting or restart.
+            first = args.flash is None
+            send(link, args.image, args.baud, save=args.save, wait=args.wait if first else 0.0,
+                 reset=args.reset and first)
         if args.monitor and args.port:
             monitor(link)
     finally:

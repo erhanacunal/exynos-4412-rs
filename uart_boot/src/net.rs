@@ -8,10 +8,11 @@
 //! | `GET /` | a page saying what is here |
 //! | `POST /boot` (or `PUT`) | runs the body from RAM, like `EXYNBOOT` |
 //! | `POST /save` (or `PUT`) | saves the body to CACHE, then runs it, like `EXYNSAVE` |
+//! | `POST /flash` (or `PUT`) | saves the body, any bytes, as `FERRITE/FLASH.BIN`; runs nothing, like `EXYNFLSH` |
 //! | `POST /stay` | test mode on: the saved application no longer boots by itself (key `s`) |
 //! | `POST /autoboot` | test mode off, from the next power-on (key `a`) |
 //!
-//! The body is a `.bin`, or a `boot.img` whose kernel is then taken. It needs a
+//! For `/boot` and `/save`, the body is a `.bin`, or a `boot.img` whose kernel is then taken. It needs a
 //! `Content-Length`; `Expect: 100-continue` is answered. An `X-CRC32` header (8 hex digits, the
 //! CRC-32 of the body as sent) is checked when present: TCP's own checksums are weak, and
 //! `tools/httpboot.py` always sends it. The answer comes once the image is checked (and saved),
@@ -363,7 +364,11 @@ async fn uart_task() {
             println!("uart_boot: waiting again");
             continue;
         };
-        match receive_uart(&rx).await {
+        match receive_uart(&rx, request).await {
+            Ok((len, _)) if request == Request::Flash => {
+                crate::save_flash(len);
+                println!("uart_boot: waiting again");
+            }
             Ok((len, crc)) => {
                 if request == Request::Save {
                     crate::save(len, crc);
@@ -386,10 +391,10 @@ async fn word(rx: &UartRx) -> Option<u32> {
 }
 
 /// [`crate::receive`], from the UART's ring.
-async fn receive_uart(rx: &UartRx) -> Result<(usize, u32), &'static str> {
+async fn receive_uart(rx: &UartRx, request: Request) -> Result<(usize, u32), &'static str> {
     let len = word(rx).await.ok_or("no length")? as usize;
     let want = word(rx).await.ok_or("no CRC")?;
-    if !crate::length_ok(len) {
+    if !crate::length_ok(request, len) {
         return Err("length");
     }
     println!("uart_boot: receiving {} bytes", len);
@@ -404,7 +409,7 @@ async fn receive_uart(rx: &UartRx) -> Result<(usize, u32), &'static str> {
             }
         }
     }
-    crate::check(len, crc::crc32(stage), want)?;
+    crate::check(request, len, crc::crc32(stage), want)?;
     Ok((len, want))
 }
 
@@ -539,6 +544,7 @@ async fn answer(socket: &mut TcpSocket<'_>, status: &str, body: &[u8]) -> TcpRes
 
 const USAGE: &[u8] = b"uart_boot on the Exynos 4412\n\
 POST (or PUT) a .bin to /boot to run it, to /save to save it to CACHE and run it.\n\
+POST (or PUT) data to /flash to save it as FERRITE/FLASH.BIN; nothing runs.\n\
 POST /stay: test mode, nothing boots by itself; POST /autoboot ends it.\n\
 Optional header X-CRC32: <8 hex digits>, the CRC-32 of the body.\n\
 curl --data-binary @app.bin http://<this address>/boot\n";
@@ -570,6 +576,7 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<Option<usize>> {
     let request_kind = match path {
         b"/boot" => Some(Request::Boot),
         b"/save" => Some(Request::Save),
+        b"/flash" => Some(Request::Flash),
         _ => None,
     };
     if method == b"POST" && (path == b"/stay" || path == b"/autoboot") {
@@ -605,7 +612,7 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<Option<usize>> {
     }
 }
 
-/// Takes the body of a `/boot` or `/save` into the stage. `early` is what came with the head.
+/// Takes the body of a `/boot`, `/save` or `/flash` into the stage. `early` is what came with the head.
 async fn upload(
     socket: &mut TcpSocket<'_>,
     kind: Request,
@@ -655,6 +662,17 @@ async fn upload(
         return Ok(None);
     }
 
+    if kind == Request::Flash {
+        // Data, not an image: saved as it came, and the stage is free again (`claim` drops).
+        let (status, body): (&str, &[u8]) = if crate::save_flash(length) {
+            ("200 OK", b"CRC OK, saved FERRITE/FLASH.BIN\n")
+        } else {
+            ("500 Internal Server Error", b"Save FAILED (see the console)\n")
+        };
+        answer(socket, status, body).await?;
+        return Ok(None);
+    }
+
     let (len, crc) = match kernel_of(stage) {
         Some(len) => (len, crc::crc32(&stage[..len])),
         None => {
@@ -662,7 +680,7 @@ async fn upload(
             return Ok(None);
         }
     };
-    if crate::check(len, crc, crc).is_err() {
+    if crate::check(kind, len, crc, crc).is_err() {
         answer(socket, "400 Bad Request", b"No zImage magic at 0x24: send a .bin from make bin\n").await?;
         return Ok(None);
     }
@@ -677,6 +695,7 @@ async fn upload(
                 (Request::Boot, _) => "",
                 (Request::Save, true) => ", saved",
                 (Request::Save, false) => ", save FAILED (see the console)",
+                (Request::Flash, _) => "",
             }
         ),
     );
