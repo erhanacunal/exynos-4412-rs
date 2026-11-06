@@ -44,6 +44,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `cpufreq_test/`: `cpufreq::set_arm_mhz`: the CPU clock from 200 MHz to 1.4 GHz with `vdd_arm` (BUCK2), measured, timed and checked
 - `standby_test/`: light standby on the power key: screen off, CPU at 200 MHz and 0.9 V, asleep until the next press
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
+- `tmu_test/`: the chip's temperature from the TMU, every second, with the CPU clock changed from the UART
 - `charger_test/`: MAX8903 charger: input power, charging and fault pins, charging enabled and disabled from the UART
 
 ## Build
@@ -963,6 +964,40 @@ Observed on the board:
 | `d` | enable off, still charging |
 | DC unplugged | DC no, charging no: `Discharging` |
 | DC plugged back, enable off | `NotCharging`, then charging 100 ms later |
+
+## Temperature
+
+`drivers::tmu` reads the TMU, the chip's one temperature sensor: the CPU cores and the GPU share
+it, as the board's one `cpu-thermal` zone does. `Tmu::new` opens its gate (`tmu_apbif`), reloads
+the fused calibration, turns the sensor on with Linux's 4412 settings and waits for a reading.
+`Tmu::celsius` converts as Linux does: one point, the code fused at 25 °C, 1 °C a code, and 55 if
+the fused code is outside 40-100. No interrupts or thresholds are set, and the hardware trip is
+left as U-Boot left it. The supply, LDO10, is on from U-Boot.
+
+The other devices give little: the gyroscope (L3G4200D) has an 8-bit temperature with no
+calibrated offset, good for changes only; the fuel gauge, the PMIC, the codec and the touch and
+light sensors have none to read.
+
+`tmu_test` on the board: `make img APP=tmu_test`. It prints the registers as U-Boot left them,
+then the temperature every second; `f`, `m` and `l` set the CPU to 1400, 800 and 200 MHz, `r`
+prints the registers. First run on the board:
+
+| Check | Result |
+|---|---|
+| From U-Boot | Gate open, sensor off, hardware trip off; LDO10 on, 1800 mV |
+| `TRIMINFO` read right after the reload | `0x000def95`, the value from before: 25 °C code 149, out of range, so 55 was used |
+| `TRIMINFO` a moment later | `0x00000033`: 25 °C code 51, no 85 °C code |
+| CPU0 polling at 1000 MHz, 23 s | Code 74 throughout: 48 °C with code 51 |
+
+`Tmu::new` now waits for the reload before reading `TRIMINFO`. Second run:
+
+| Check | Result |
+|---|---|
+| `TRIMINFO` from U-Boot | `0x000def85`: not the same as the first run, so not a calibration |
+| Reload | Request bit cleared after 4 us; `TRIMINFO` `0x00000033`, 25 °C code 51, fused |
+| CPU0 polling at 1000 MHz | 47 °C at first, then 48 °C (code 74) |
+
+Not yet checked: the temperature following the CPU clock.
 
 ## eMMC
 

@@ -23,6 +23,7 @@ pub mod scu;
 pub mod sdhci;
 pub mod sdio;
 pub mod timer;
+pub mod tmu;
 pub mod uart;
 pub mod wm8758;
 pub mod wifi_device;

@@ -14,9 +14,9 @@
 //!
 //! [`Cmu::enable_i2c`], [`Cmu::open_fimd_gates`], [`Cmu::set_fimd_clock`],
 //! [`Cmu::set_mmc3_clock`], [`Cmu::open_audio_gates`], [`Cmu::open_pdma0_gate`],
-//! [`Cmu::open_g3d_gate`], [`Cmu::set_g3d_clock`] and [`Cmu::set_arm_clock`] are
-//! read-modify-writes of registers shared with other peripherals. They mask IRQs on the
-//! calling core. Use them from one core at a time.
+//! [`Cmu::open_g3d_gate`], [`Cmu::set_g3d_clock`], [`Cmu::open_tmu_gate`] and
+//! [`Cmu::set_arm_clock`] are read-modify-writes of registers shared with other peripherals.
+//! They mask IRQs on the calling core. Use them from one core at a time.
 
 use core::ptr;
 
@@ -114,6 +114,8 @@ const GATE_IP_FSYS: usize = 0xC940;
 const DIV_TOP: usize = 0xC510;
 /// clk-exynos4.c:99.
 const GATE_IP_PERIL: usize = 0xC950;
+/// clk-exynos4.c:30: `E4X12_GATE_IP_PERIR`.
+const GATE_IP_PERIR: usize = 0x8960;
 /// clk-exynos4.c:45.
 const SRC_G3D: usize = 0xC22C;
 /// clk-exynos4.c:69.
@@ -147,6 +149,8 @@ const DIV_MFC_MASK: u32 = 0xF;
 const GATE_MFC: u32 = 1 << 0;
 /// clk-exynos4.c:750: `CLK_PWM`, the PWM timers' gate.
 const GATE_PERIL_PWM: u32 = 1 << 24;
+/// clk-exynos4.c:1005: `CLK_TMU_APBIF`, the register clock of the TMU.
+const GATE_PERIR_TMU_APBIF: u32 = 1 << 17;
 /// clk-exynos4.c:42,56,66,88: the camera block's clocks, the FIMCs' among them.
 const SRC_CAM: usize = 0xC220;
 const SRC_MASK_CAM: usize = 0xC320;
@@ -820,8 +824,8 @@ impl Cmu {
         let address = (soc::CMU_BASE + offset) as *mut u32;
         let was_masked = cpu::mask_irq();
         // SAFETY: as in `read`. Every caller changes only fields of the block it configures: the
-        // FIMD, `sdhci_3`, `pdma0`, the audio subsystem, the GPU, the MFC, a FIMC, the G2D or the
-        // PWM timers.
+        // FIMD, `sdhci_3`, `pdma0`, the audio subsystem, the GPU, the MFC, a FIMC, the G2D, the
+        // PWM timers or the TMU.
         unsafe {
             ptr::write_volatile(address, (ptr::read_volatile(address) & !clear) | set);
         }
@@ -1002,6 +1006,16 @@ impl Cmu {
     /// Whether the PWM timers' clock gate is open, without which their registers do not answer.
     pub fn pwm_gate_open(&self) -> bool {
         self.read(GATE_IP_PERIL) & GATE_PERIL_PWM != 0
+    }
+
+    /// Opens the clock gate of the TMU's registers, `tmu_apbif`.
+    pub fn open_tmu_gate(&self) {
+        self.modify(GATE_IP_PERIR, 0, GATE_PERIR_TMU_APBIF);
+    }
+
+    /// Whether the TMU's clock gate is open.
+    pub fn tmu_gate_open(&self) -> bool {
+        self.read(GATE_IP_PERIR) & GATE_PERIR_TMU_APBIF != 0
     }
 
     /// Opens the clock gate of the I2C controller `bus`, below 8.

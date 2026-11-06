@@ -144,6 +144,9 @@ pub const FIMD_COMBINER_GROUP: usize = 11;
 /// The FIMD's combiner group at the GIC.
 pub const FIMD_IRQ: u16 = 32 + 11;
 
+/// `exynos4412.dtsi:811-819`, `tmu`: the thermal management unit.
+pub const TMU_BASE: usize = 0x100C_0000;
+
 /// `exynos4.dtsi:658-670`, `pwm: pwm@139d0000`: the PWM timers.
 pub const PWM_BASE: usize = 0x139D_0000;
 
