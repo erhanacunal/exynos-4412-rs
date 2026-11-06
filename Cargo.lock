@@ -54,6 +54,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "battery_test"
+version = "0.1.0"
+dependencies = [
+ "exynos_4412_rs",
+]
+
+[[package]]
 name = "bitbybit"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

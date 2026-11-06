@@ -11,6 +11,7 @@ pub mod i2s;
 pub mod i2c;
 pub mod l2c;
 pub mod mali;
+pub mod max17040;
 pub mod max77686;
 pub mod max8903;
 pub mod mfc;

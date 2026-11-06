@@ -45,6 +45,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `standby_test/`: light standby on the power key: screen off, CPU at 200 MHz and 0.9 V, asleep until the next press
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 - `tmu_test/`: the chip's temperature from the TMU, every second, with the CPU clock changed from the UART
+- `battery_test/`: MAX17040 fuel gauge: the battery's voltage and charge every 5 s, beside the charger's state
 - `charger_test/`: MAX8903 charger: input power, charging and fault pins, charging enabled and disabled from the UART
 
 ## Build
@@ -964,6 +965,26 @@ Observed on the board:
 | `d` | enable off, still charging |
 | DC unplugged | DC no, charging no: `Discharging` |
 | DC plugged back, enable off | `NotCharging`, then charging 100 ms later |
+
+## MAX17040 fuel gauge
+
+`drivers::max17040` reads the battery's fuel gauge on `i2c_3` at `0x36`: the voltage (`VCELL`,
+1.25 mV a step) and the charge the chip estimates from it (`SOC`). It has no current sense, no
+temperature and, on this board, no alert line. Nothing is written: `RCOMP` stays as the chip has it,
+as in the vendor kernel, and reset and quick-start are left out, since they throw the estimate away.
+
+- **Charge scale:** `SOC` counts 1/512 %, as the vendor driver reads it, not the 1/256 % of
+  mainline Linux: on the board its high byte read 179. `Reading::percent` gives whole percent
+  as the vendor kernel does, `permille` tenths.
+
+`battery_test` on the board: `make img APP=battery_test`. It prints `VERSION` and `CONFIG`, then
+every 5 s, or on `s`, the voltage, `SOC` and the charge beside the charger's state. Observed:
+
+| Check | Result |
+|---|---|
+| `VERSION`, `CONFIG` | `0x0002`, `0x8200`: `RCOMP` `0x82`, not the default `0x97` |
+| Charging, 30 s | 4148-4153 mV; `SOC` `0xb3c8`, then `0xb409`: 89.9 %, then 90.0 % |
+| High byte of `SOC` | 179: not a percentage, so the mainline scale does not fit |
 
 ## Temperature
 
