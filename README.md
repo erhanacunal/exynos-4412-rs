@@ -41,6 +41,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `async_test/`: Embassy on all four cores: timers, tasks, and channels between the cores
 - `mmc_async_test/`: async eMMC: reads and writes awaited on the controller's interrupt, from CPU0 and CPU1
 - `uart_tx_test/`: buffered console: `print!` sent on the UART's transmit interrupt, the ring overflowing, two cores printing, flush before a panic and a restart
+- `cpufreq_test/`: `cpufreq::set_arm_mhz`: the CPU clock from 200 MHz to 1.4 GHz with `vdd_arm` (BUCK2), measured, timed and checked
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 
 ## Build
@@ -1977,6 +1978,34 @@ through the interrupt combiner, group 11 = `GIC_SPI 11`; polled if the MCT is no
   1508 times by the G2D (13 operations a frame), 116 by the vsync, 19 by the alarm. `mfc_play`
   sleeps 96-97% at 24 fps, one late picture per pass as before; per pass, 860 wake-ups by FIMC 0
   and 860 by the pacing alarm.
+
+## CPU clock
+
+U-Boot leaves the CPU at 1 GHz. `cpufreq::set_arm_mhz` moves all four cores to another rate at
+run time, one of `cmu::ARM_POINTS` (200 MHz to 1.4 GHz, every 100 MHz); nothing changes at boot.
+
+- **Clock:** `Cmu::set_arm_clock` follows `clk-cpu.c`: the CPU runs from the MPLL (800 MHz),
+  divided down if that is faster than the old or the new rate, takes the new dividers, the APLL
+  is set and locks, and the CPU moves back. PLL settings, dividers and voltages are Linux's
+  (`exynos4x12_apll_rates`, `e4412_armclk_d`, `cpu0_opp_table`). 1.5 GHz (`turbo-mode`) is left out.
+- **Voltage:** `vdd_arm` is BUCK2. The voltage goes into the DVS register the pins `gpl0-0..2`
+  choose (`max77686::selected_dvs`): `DVS1`, as U-Boot leaves them inputs, read low. It is raised
+  before a faster clock, with the ramp time plus 100 µs, and lowered after a slower one.
+- **Not covered:** per-chip ASV voltages, and temperature: no TMU driver throttles the CPU.
+
+`make img APP=cpufreq_test`: the registers and BUCK2 as U-Boot left them, then 1200, 1400, 800,
+200, 1000 and 1400 MHz, each measured with the cycle counter against the MCT, its voltage read
+back and an integer workload timed and checked; then 10 s at 1.4 GHz. On the board:
+
+| Check | Result |
+|---|---|
+| As U-Boot left it | APLL `0xa07d0300`, 1 GHz, measured 999.998 MHz; BUCK2 `DVS1` 1.200 V, `DVS2` to `DVS8` 1.100 V; pins `lll`: `DVS1` |
+| Each step | rate, measured rate (within 5 ppm), voltage read back and workload result all OK |
+| Workload | 30.0 ms at 1 GHz, 25.0 ms at 1.2 GHz, 21.4 ms at 1.4 GHz, 37.5 ms at 800 MHz, 150 ms at 200 MHz |
+| Voltages | 1.1875 V at 1.2 GHz, 1.2875 V at 1.4 GHz, 1.000 V at 800 MHz, 0.900 V at 200 MHz, 1.0875 V at 1 GHz |
+| Soak, 10 s at 1.4 GHz | 467 runs, 0 wrong |
+
+U-Boot runs 1 GHz at 1.2 V; Linux's table, which `set_arm_mhz` applies, at 1.0875 V.
 
 ## QEMU
 

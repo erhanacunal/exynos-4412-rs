@@ -167,3 +167,25 @@ pub fn halt() -> ! {
         }
     }
 }
+
+/// Starts this core's cycle counter, `PMCCNTR`, from 0, counting every cycle of the core clock:
+/// `PMCR.E` and `PMCR.C`, `PMCR.D` clear, then `PMCNTENSET.C` (ARMv7-A ARM, B4.1.117-118).
+/// Each core has its own.
+pub fn start_cycle_counter() {
+    // SAFETY: writes to the PMU's control registers at PL1 only start and reset its counters.
+    unsafe {
+        asm!(
+            "mcr p15, 0, {pmcr}, c9, c12, 0",
+            "mcr p15, 0, {enable}, c9, c12, 1",
+            "isb",
+            pmcr = in(reg) 0b101u32,
+            enable = in(reg) 1u32 << 31,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+}
+
+cp15_read!(
+    /// This core's cycle counter, `PMCCNTR`: see [`start_cycle_counter`].
+    read_cycle_counter, "c9", "0", "c13", "0"
+);

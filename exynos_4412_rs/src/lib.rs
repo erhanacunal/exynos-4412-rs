@@ -34,6 +34,7 @@
 
 pub mod console;
 pub mod cpu;
+pub mod cpufreq;
 pub mod crypto;
 pub mod drivers;
 #[cfg(feature = "embassy")]

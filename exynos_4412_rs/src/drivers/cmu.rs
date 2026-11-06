@@ -1,7 +1,8 @@
 //! Clock management unit: reads the clock of the peripheral bus and opens clock gates.
 //!
-//! The only PLL it changes is the EPLL, for audio: see [`Cmu::set_epll`]. Nothing else here
-//! runs from the EPLL. The only muxes and dividers it changes are those of the FIMD, of
+//! It changes two PLLs. The EPLL, for audio: see [`Cmu::set_epll`]; nothing else here runs from
+//! the EPLL. And the APLL, with the CPU's mux and dividers, for the CPU clock: see
+//! [`Cmu::set_arm_clock`], which leaves the voltage to [`crate::cpufreq`]. The only muxes and dividers it changes are those of the FIMD, of
 //! `sclk_mmc3` and of `sclk_g3d`, which nothing else uses: see [`Cmu::set_fimd_clock`],
 //! [`Cmu::set_mmc3_clock`] and [`Cmu::set_g3d_clock`]. The rest stay as U-Boot set them.
 //!
@@ -13,7 +14,7 @@
 //!
 //! [`Cmu::enable_i2c`], [`Cmu::open_fimd_gates`], [`Cmu::set_fimd_clock`],
 //! [`Cmu::set_mmc3_clock`], [`Cmu::open_audio_gates`], [`Cmu::open_pdma0_gate`],
-//! [`Cmu::open_g3d_gate`] and [`Cmu::set_g3d_clock`] are
+//! [`Cmu::open_g3d_gate`], [`Cmu::set_g3d_clock`] and [`Cmu::set_arm_clock`] are
 //! read-modify-writes of registers shared with other peripherals. They mask IRQs on the
 //! calling core. Use them from one core at a time.
 
@@ -42,6 +43,50 @@ const PLL36XX_LOCKED: u32 = 1 << 29;
 const PLL36XX_LOCK_FACTOR: u32 = 3000;
 /// `clk-pll.c:20` `PLL_TIMEOUT_US`.
 const PLL_TIMEOUT_US: u64 = 20_000;
+
+/// clk-exynos4.c:111.
+const APLL_LOCK: usize = 0x1_4000;
+/// clk-exynos4.c:113.
+const APLL_CON0: usize = 0x1_4100;
+/// clk-exynos4.c:115, and `E4210_SRC_CPU` of `clk-cpu.c`, whose offsets are from here.
+const SRC_CPU: usize = 0x1_4200;
+/// `clk-cpu.c` `E4210_STAT_CPU`, `SRC_CPU` + 0x200.
+const MUX_STAT_CPU: usize = 0x1_4400;
+/// clk-exynos4.c:116.
+const DIV_CPU0: usize = 0x1_4500;
+/// clk-exynos4.c:117.
+const DIV_CPU1: usize = 0x1_4504;
+/// `clk-cpu.c` `E4210_DIV_STAT_CPU0` and `E4210_DIV_STAT_CPU1`.
+const DIV_STAT_CPU0: usize = 0x1_4600;
+const DIV_STAT_CPU1: usize = 0x1_4604;
+/// clk-exynos4.c:420: `mout_apll` selects `fout_apll` when set, `fin_pll` when clear.
+const SRC_CPU_APLL: u32 = 1 << 0;
+/// clk-exynos4.c:542: `mout_core` selects `mout_mpll_user_c` when set, `mout_apll` when clear.
+const SRC_CPU_CORE_MPLL: u32 = 1 << 16;
+/// clk-exynos4.c:543: `mout_hpm`, the same choice for `sclk_hpm`.
+const SRC_CPU_HPM_MPLL: u32 = 1 << 20;
+/// clk-exynos4.c:517: `mout_mpll_user_c` selects the MPLL when set, `fin_pll` when clear.
+const SRC_CPU_MPLL_USER_C: u32 = 1 << 24;
+/// `clk-cpu.c` `wait_until_mux_stable(..., 16, value)`: the 3-bit state of `mout_core`.
+const MUX_STAT_CORE_SHIFT: u32 = 16;
+const MUX_STAT_CORE_APLL: u32 = 1;
+const MUX_STAT_CORE_MPLL: u32 = 2;
+/// `clk-cpu.c` `E4210_DIV0_RATIO0_MASK`: `div_core`, DIV_CPU0 bits 2:0 (clk-exynos4.c:600).
+const DIV_CPU0_CORE: u32 = 7;
+/// clk-exynos4.c:606: `div_core2`, after `div_core`.
+const DIV_CPU0_CORE2_SHIFT: u32 = 28;
+/// `clk-cpu.c` `E4210_DIV0_ATB_MASK`.
+const DIV_CPU0_ATB: u32 = 7 << 16;
+/// `clk-cpu.c` `E4210_DIV1_HPM_MASK | E4210_DIV1_COPY_MASK`.
+const DIV_CPU1_HPM_COPY: u32 = 0x77;
+/// `clk-pll.c:208-217`: the APLL is a `pll_35xx` (clk-exynos4.c:1158).
+const PLL35XX_LOCK_FACTOR: u32 = 270;
+const PLL35XX_PMS_MASK: u32 = (0x3FF << 16) | (0x3F << 8) | 7;
+const PLL35XX_MP_MASK: u32 = (0x3FF << 16) | (0x3F << 8);
+const PLL35XX_ENABLE: u32 = 1 << 31;
+const PLL35XX_LOCKED: u32 = 1 << 29;
+/// `clk-cpu.c` `wait_until_mux_stable` and `wait_until_divider_stable`: 10 ms.
+const CPU_CLOCK_TIMEOUT_US: u64 = 10_000;
 
 /// clk-exynos4.c:40.
 const SRC_TOP0: usize = 0xC210;
@@ -253,6 +298,147 @@ impl Epll {
 /// The EPLL did not lock within [`PLL_TIMEOUT_US`] of being set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EpllTimeout(pub Epll);
+
+/// `E4210_CPU_DIV0`, clk-exynos4.c:1192-1194, with its arguments in the same order.
+const fn cpu_div0(apll: u32, pclk_dbg: u32, atb: u32, periph: u32, corem1: u32, corem0: u32) -> u32 {
+    (apll << 24) | (pclk_dbg << 20) | (atb << 16) | (periph << 12) | (corem1 << 8) | (corem0 << 4)
+}
+
+/// `E4412_CPU_DIV1`, clk-exynos4.c:1208-1209.
+const fn cpu_div1(cores: u32, hpm: u32, copy: u32) -> u32 {
+    (cores << 8) | (hpm << 4) | copy
+}
+
+/// One operating point of the CPU: the APLL's settings, the CPU's dividers, and the voltage
+/// of `vdd_arm` it needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArmPoint {
+    /// The CPU clock, `armclk`, in MHz.
+    pub mhz: u32,
+    /// The APLL's feedback divider, input divider and output shift (`clk-pll.c:210-215`).
+    pub m: u16,
+    /// See `m`.
+    pub p: u8,
+    /// See `m`.
+    pub s: u8,
+    /// `DIV_CPU0`, `div_core` and `div_core2` at 0: `armclk` is the APLL.
+    pub div0: u32,
+    /// `DIV_CPU1`.
+    pub div1: u32,
+    /// `opp-microvolt` of the same `opp-hz`.
+    pub microvolts: u32,
+}
+
+impl ArmPoint {
+    /// The rate in Hz.
+    pub const fn hz(&self) -> u32 {
+        self.mhz * 1_000_000
+    }
+}
+
+const fn point(mhz: u32, (m, p, s): (u16, u8, u8), div0: u32, div1: u32, microvolts: u32) -> ArmPoint {
+    ArmPoint { mhz, m, p, s, div0, div1, microvolts }
+}
+
+/// The operating points from 200 MHz to 1.4 GHz. The PLL settings are `exynos4x12_apll_rates`
+/// (clk-exynos4.c:1103-1121), the dividers `e4412_armclk_d` (clk-exynos4.c:1211-1229), the
+/// voltages `cpu0_opp_table` (exynos4412.dtsi:96-171). 1.5 GHz is left out: the DTS marks it
+/// `turbo-mode`, at 1.35 V. 1.6 and 1.7 GHz have no OPP.
+pub const ARM_POINTS: [ArmPoint; 13] = [
+    point(200, (100, 3, 2), cpu_div0(1, 1, 1, 0, 3, 1), cpu_div1(0, 0, 3), 900_000),
+    point(300, (200, 4, 2), cpu_div0(1, 1, 2, 0, 4, 2), cpu_div1(1, 0, 3), 900_000),
+    point(400, (100, 3, 1), cpu_div0(1, 1, 3, 0, 4, 2), cpu_div1(1, 0, 3), 925_000),
+    point(500, (125, 3, 1), cpu_div0(1, 1, 3, 0, 4, 2), cpu_div1(2, 0, 3), 950_000),
+    point(600, (200, 4, 1), cpu_div0(1, 1, 3, 0, 4, 2), cpu_div1(2, 0, 3), 975_000),
+    point(700, (175, 3, 1), cpu_div0(1, 1, 3, 0, 4, 2), cpu_div1(3, 0, 3), 987_500),
+    point(800, (100, 3, 0), cpu_div0(1, 1, 3, 0, 5, 2), cpu_div1(3, 0, 3), 1_000_000),
+    point(900, (150, 4, 0), cpu_div0(1, 1, 3, 0, 5, 2), cpu_div1(4, 0, 3), 1_037_500),
+    point(1000, (125, 3, 0), cpu_div0(1, 1, 4, 0, 5, 2), cpu_div1(4, 0, 4), 1_087_500),
+    point(1100, (275, 6, 0), cpu_div0(2, 1, 4, 0, 6, 3), cpu_div1(5, 0, 4), 1_137_500),
+    point(1200, (200, 4, 0), cpu_div0(2, 1, 5, 0, 7, 3), cpu_div1(5, 0, 5), 1_187_500),
+    point(1300, (325, 6, 0), cpu_div0(2, 1, 5, 0, 7, 3), cpu_div1(6, 0, 5), 1_250_000),
+    point(1400, (175, 3, 0), cpu_div0(2, 1, 6, 0, 7, 3), cpu_div1(6, 0, 6), 1_287_500),
+];
+
+/// The operating point of `mhz`, if [`ARM_POINTS`] has one.
+pub fn arm_point(mhz: u32) -> Option<ArmPoint> {
+    ARM_POINTS.iter().copied().find(|point| point.mhz == mhz)
+}
+
+/// Raw clock registers of the CPU, for reports: see [`Cmu::arm_clocks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArmClocks {
+    /// `APLL_CON0`.
+    pub apll_con0: u32,
+    /// `SRC_CPU`.
+    pub src: u32,
+    /// `MUX_STAT_CPU`.
+    pub mux_stat: u32,
+    /// `DIV_CPU0`.
+    pub div0: u32,
+    /// `DIV_CPU1`.
+    pub div1: u32,
+    /// `fout_mpll`, for `mout_mpll_user_c`.
+    pub mpll_hz: u32,
+}
+
+impl ArmClocks {
+    /// `fout_apll`, 0 if the APLL does not run: `clk-pll.c:219-235`.
+    pub const fn fout_apll_hz(&self) -> u32 {
+        if self.apll_con0 & PLL35XX_ENABLE == 0 {
+            return 0;
+        }
+        let m = ((self.apll_con0 >> 16) & 0x3FF) as u64;
+        let p = ((self.apll_con0 >> 8) & 0x3F) as u64;
+        let s = self.apll_con0 & 7;
+        if p == 0 {
+            return 0;
+        }
+        ((soc::FIN_PLL_HZ as u64 * m / p) >> s) as u32
+    }
+
+    /// Whether the APLL runs and has locked.
+    pub const fn apll_locked(&self) -> bool {
+        self.apll_con0 & (PLL35XX_ENABLE | PLL35XX_LOCKED) == PLL35XX_ENABLE | PLL35XX_LOCKED
+    }
+
+    /// `mout_mpll_user_c`, the CPU's other parent.
+    pub const fn mpll_user_c_hz(&self) -> u32 {
+        if self.src & SRC_CPU_MPLL_USER_C != 0 { self.mpll_hz } else { soc::FIN_PLL_HZ }
+    }
+
+    /// Whether `mout_core` is `mout_apll`, and `mout_apll` the APLL.
+    pub const fn on_apll(&self) -> bool {
+        self.src & (SRC_CPU_APLL | SRC_CPU_CORE_MPLL) == SRC_CPU_APLL
+    }
+
+    /// `armclk`: `mout_core` through `div_core` and `div_core2` (clk-exynos4.c:600,606).
+    pub const fn armclk_hz(&self) -> u32 {
+        let parent = if self.src & SRC_CPU_CORE_MPLL != 0 {
+            self.mpll_user_c_hz()
+        } else if self.src & SRC_CPU_APLL != 0 {
+            self.fout_apll_hz()
+        } else {
+            soc::FIN_PLL_HZ
+        };
+        let core = (self.div0 & DIV_CPU0_CORE) + 1;
+        let core2 = ((self.div0 >> DIV_CPU0_CORE2_SHIFT) & 7) + 1;
+        parent / core / core2
+    }
+}
+
+/// Why [`Cmu::set_arm_clock`] did not finish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArmClockError {
+    /// The CPU did not run from a locked APLL to begin with; nothing was changed.
+    NotOnApll(ArmClocks),
+    /// The MPLL is too fast to stand in for the old rate with a divider of at most 8; nothing
+    /// was changed.
+    AltTooFast(ArmClocks),
+    /// A mux or a divider did not settle, or the APLL did not lock, within the time Linux
+    /// allows. Names the step; holds the registers as they were then.
+    Timeout(&'static str, ArmClocks),
+}
 
 /// Raw clock registers of the GPU, for reports.
 #[derive(Clone, Copy, Debug)]
@@ -680,6 +866,116 @@ impl Cmu {
                 return Err(EpllTimeout(epll));
             }
         }
+    }
+
+    /// The CPU's clock registers.
+    pub fn arm_clocks(&self) -> ArmClocks {
+        ArmClocks {
+            apll_con0: self.read(APLL_CON0),
+            src: self.read(SRC_CPU),
+            mux_stat: self.read(MUX_STAT_CPU),
+            div0: self.read(DIV_CPU0),
+            div1: self.read(DIV_CPU1),
+            mpll_hz: self.fout_mpll_hz(),
+        }
+    }
+
+    fn write(&self, offset: usize, value: u32) {
+        // SAFETY: as in `read`; only `set_arm_clock` writes this way, to the CPU's own registers.
+        unsafe { ptr::write_volatile((soc::CMU_BASE + offset) as *mut u32, value) }
+    }
+
+    /// Waits until `done` holds of register `offset`, at most [`CPU_CLOCK_TIMEOUT_US`].
+    fn wait_cpu(&self, mct: Mct, offset: usize, step: &'static str, done: impl Fn(u32) -> bool) -> Result<(), ArmClockError> {
+        let end = mct.count() + CPU_CLOCK_TIMEOUT_US * u64::from(soc::MCT_CLOCK_HZ / 1_000_000);
+        loop {
+            if done(self.read(offset)) {
+                return Ok(());
+            }
+            if mct.count() > end {
+                return Err(ArmClockError::Timeout(step, self.arm_clocks()));
+            }
+        }
+    }
+
+    /// Runs the CPU at `point`, the way Linux does (`clk-cpu.c:149-259`,
+    /// `exynos_cpuclk_pre_rate_change` and `_post_rate_change` around `clk-pll.c:248-292`):
+    /// the CPU moves to `mout_mpll_user_c`, divided down if that is faster than the old or the
+    /// new rate, takes the new dividers, the APLL is set and locks, and the CPU moves back. All
+    /// four cores run from this clock and keep running throughout. IRQs are masked on the
+    /// calling core meanwhile, some tens of microseconds. Returns the new `armclk` in Hz.
+    ///
+    /// The voltage is not changed here: raise `vdd_arm` before a higher rate and lower it only
+    /// after a lower one. [`crate::cpufreq::set_arm_mhz`] does both.
+    ///
+    /// One difference from Linux: when `sclk_hpm` comes from the MPLL, Linux keeps `DIV_HPM`
+    /// and `DIV_COPY` and clears `DIV_CORES`; this keeps the first two and still writes
+    /// `DIV_CORES` from the table.
+    pub fn set_arm_clock(&self, point: ArmPoint, mct: Mct) -> Result<u32, ArmClockError> {
+        let was_masked = cpu::mask_irq();
+        let result = self.set_arm_clock_masked(point, mct);
+        cpu::restore_irq(was_masked);
+        result
+    }
+
+    fn set_arm_clock_masked(&self, point: ArmPoint, mct: Mct) -> Result<u32, ArmClockError> {
+        let now = self.arm_clocks();
+        if !now.on_apll() || !now.apll_locked() {
+            return Err(ArmClockError::NotOnApll(now));
+        }
+        let pms = (u32::from(point.m) << 16) | (u32::from(point.p) << 8) | u32::from(point.s);
+        let old_hz = now.armclk_hz();
+        let new_hz = point.hz();
+        let alt_hz = now.mpll_user_c_hz();
+
+        let mut div0 = point.div0;
+        let mut div1 = point.div1;
+        if now.src & SRC_CPU_HPM_MPLL != 0 {
+            div1 = (div1 & !DIV_CPU1_HPM_COPY) | (now.div1 & DIV_CPU1_HPM_COPY);
+        }
+
+        // clk-cpu.c:188-204: while on the MPLL, armclk and the ATB clock stay at or below the
+        // lower of the two rates.
+        if alt_hz > old_hz || old_hz > new_hz {
+            let lower = old_hz.min(new_hz);
+            let alt_div = alt_hz.div_ceil(lower) - 1;
+            if alt_div > DIV_CPU0_CORE {
+                return Err(ArmClockError::AltTooFast(now));
+            }
+            let alt = alt_div | DIV_CPU0_ATB;
+            let mask = DIV_CPU0_CORE | DIV_CPU0_ATB;
+            self.write(DIV_CPU0, (now.div0 & !mask) | alt);
+            self.wait_cpu(mct, DIV_STAT_CPU0, "safe divider", |stat| stat & mask == 0)?;
+            div0 |= alt;
+        }
+
+        // clk-cpu.c:206-219: onto the MPLL, then the new dividers.
+        self.write(SRC_CPU, self.read(SRC_CPU) | SRC_CPU_CORE_MPLL);
+        self.wait_cpu(mct, MUX_STAT_CPU, "mux to MPLL", |stat| (stat >> MUX_STAT_CORE_SHIFT) & 7 == MUX_STAT_CORE_MPLL)?;
+        self.write(DIV_CPU0, div0);
+        self.wait_cpu(mct, DIV_STAT_CPU0, "DIV_CPU0", |stat| stat == 0)?;
+        self.write(DIV_CPU1, div1);
+        self.wait_cpu(mct, DIV_STAT_CPU1, "DIV_CPU1", |stat| stat == 0)?;
+
+        // clk-pll.c:263-289: only S changes in place; otherwise lock time, PMS, and the lock.
+        let con0 = self.read(APLL_CON0);
+        if con0 & PLL35XX_PMS_MASK != pms {
+            if con0 & PLL35XX_MP_MASK == pms & PLL35XX_MP_MASK {
+                self.write(APLL_CON0, (con0 & !PLL35XX_PMS_MASK) | pms);
+            } else {
+                self.write(APLL_LOCK, u32::from(point.p) * PLL35XX_LOCK_FACTOR);
+                self.write(APLL_CON0, (con0 & !PLL35XX_PMS_MASK) | pms);
+                self.wait_cpu(mct, APLL_CON0, "APLL lock", |con| con & PLL35XX_LOCKED != 0)?;
+            }
+        }
+
+        // clk-cpu.c:245-255: back onto the APLL, then div_core 0 and the table's ATB divider.
+        self.write(SRC_CPU, self.read(SRC_CPU) & !SRC_CPU_CORE_MPLL);
+        self.wait_cpu(mct, MUX_STAT_CPU, "mux to APLL", |stat| (stat >> MUX_STAT_CORE_SHIFT) & 7 == MUX_STAT_CORE_APLL)?;
+        let mask = DIV_CPU0_CORE | DIV_CPU0_ATB;
+        self.write(DIV_CPU0, (self.read(DIV_CPU0) & !mask) | (point.div0 & DIV_CPU0_ATB));
+        self.wait_cpu(mct, DIV_STAT_CPU0, "final divider", |stat| stat & mask == 0)?;
+        Ok(self.arm_clocks().armclk_hz())
     }
 
     /// Opens the gates of the audio subsystem's registers and of I2S0's.

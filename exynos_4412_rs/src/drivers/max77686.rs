@@ -21,9 +21,11 @@
 //! that the voltage is one the LDO can produce. The caller must take the voltage from the
 //! DTS. Of the bucks, only the voltage of BUCK5 to BUCK9 can be set, and the GPIO control of
 //! BUCK8, BUCK9 and LDO20 to LDO22 (`max77686-regulator.c:103-107`) is not covered. BUCK2 to
-//! BUCK4 can only be read, [`Max77686::dvs_buck`]: each has eight voltage registers, and pins
-//! of the SoC choose which one counts.
+//! BUCK4 each have eight voltage registers, and pins of the SoC choose which one counts:
+//! [`Max77686::dvs_buck`] reads them, [`selected_dvs`] tells which one the pins choose, and
+//! [`Max77686::set_dvs_microvolts`] sets one. The pins themselves are left as they are.
 
+use crate::drivers::gpio;
 use crate::drivers::i2c::{self, I2c};
 use crate::drivers::timer::Mct;
 use crate::soc;
@@ -58,6 +60,14 @@ const DVS_BUCKS: core::ops::RangeInclusive<u8> = 2..=4;
 /// max77686-regulator.c:33-34.
 const DVS_MIN_MICROVOLTS: u32 = 600_000;
 const DVS_STEP_MICROVOLTS: u32 = 12_500;
+/// max77686-regulator.c:63: `vsel_mask` of BUCK2 to BUCK4.
+const DVS_VSEL_MASK: u8 = 0xFF;
+/// max77686-regulator.c:65,255-257: the ramp rate in `CTRL1` bits 7:6, in microvolts per
+/// microsecond.
+const DVS_RAMP_SHIFT: u32 = 6;
+const DVS_RAMP_TABLE: [u32; 4] = [13_750, 27_500, 55_000, 100_000];
+/// `exynos4412-mehmet.dts:755-781`: `gpl0-0` to `gpl0-2` choose the DVS register.
+const DVS_SELECT_PINS: u8 = 3;
 /// max77686-regulator.c:59: where BUCK2 to BUCK4 keep their mode in `CTRL1`.
 const OPMODE_BUCK234_SHIFT: u32 = 4;
 /// Number of LDOs: max77686-regulator.c:68.
@@ -86,7 +96,8 @@ pub enum Error {
     Bus(i2c::Error),
     /// There is no LDO with this number.
     NoSuchLdo,
-    /// This is not one of BUCK5 to BUCK9.
+    /// This is not one of the bucks the call takes: BUCK5 to BUCK9, or BUCK2 to BUCK4 for the
+    /// DVS calls.
     NoSuchBuck,
     /// The regulator cannot produce this voltage.
     BadVoltage,
@@ -254,6 +265,19 @@ impl DvsBuck {
     pub const fn microvolts(&self, index: usize) -> u32 {
         DVS_MIN_MICROVOLTS + self.dvs[index] as u32 * DVS_STEP_MICROVOLTS
     }
+
+    /// How fast the output moves to a new voltage, in microvolts per microsecond.
+    pub const fn ramp_microvolts_per_us(&self) -> u32 {
+        DVS_RAMP_TABLE[((self.ctrl1 >> DVS_RAMP_SHIFT) & 3) as usize]
+    }
+}
+
+/// The index of the DVS register the pins `gpl0-0` to `gpl0-2` choose, 0 for `DVS1`: `gpl0-0`
+/// is the lowest bit (`exynos4412-mehmet.dts:755-781`: `gpl0-0` high and the rest low select
+/// `DVS2`), and `gpl0-1` and `gpl0-2` are taken to be the next two. Read whether the pins are
+/// inputs or outputs; U-Boot leaves them inputs, read low, which selects `DVS1`.
+pub fn selected_dvs() -> usize {
+    (0..DVS_SELECT_PINS).filter(|&number| gpio::GPL0.pin(number).read()).map(|number| 1 << number).sum()
 }
 
 impl Max77686 {
@@ -269,6 +293,25 @@ impl Max77686 {
             *value = self.read(REG_BUCK2_DVS1 + offset + index as u8)?;
         }
         Ok(DvsBuck { ctrl1, dvs })
+    }
+
+    /// Sets `DVS(index + 1)` of BUCK `number`, from 2 to 4, to `microvolts`, and checks that it
+    /// took. If the pins choose that register, the output starts moving at once, at
+    /// [`DvsBuck::ramp_microvolts_per_us`]. See the [module documentation](self).
+    pub fn set_dvs_microvolts(&self, number: u8, index: usize, microvolts: u32) -> Result<(), Error> {
+        if !DVS_BUCKS.contains(&number) {
+            return Err(Error::NoSuchBuck);
+        }
+        let above_min = microvolts.checked_sub(DVS_MIN_MICROVOLTS).ok_or(Error::BadVoltage)?;
+        let vsel = above_min / DVS_STEP_MICROVOLTS;
+        if index >= 8 || above_min % DVS_STEP_MICROVOLTS != 0 || vsel > u32::from(DVS_VSEL_MASK) {
+            return Err(Error::BadVoltage);
+        }
+        let register = REG_BUCK2_DVS1 + (number - 2) * 10 + index as u8;
+        let wrote = vsel as u8;
+        self.i2c.write(ADDRESS, &[register, wrote])?;
+        let read = self.read(register)?;
+        if read == wrote { Ok(()) } else { Err(Error::ReadBack { wrote, read }) }
     }
 }
 
