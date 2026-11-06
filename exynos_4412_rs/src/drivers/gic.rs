@@ -213,6 +213,15 @@ impl Gic {
         write_byte_field(&self.dist().itargetsr[index / 4], index % 4, 1 << target);
     }
 
+    /// Routes an SPI to every core in `mask` (bit n = CPU n, at least one). The GIC signals it
+    /// to all of them; the first to acknowledge takes it, and a core with IRQs masked in the CPSR
+    /// is still woken from `wfi` by it.
+    pub fn set_targets(&self, id: u16, mask: u8) {
+        assert!(id >= FIRST_SPI && mask != 0 && u32::from(mask) >> soc::CPU_COUNT == 0);
+        let index = id as usize;
+        write_byte_field(&self.dist().itargetsr[index / 4], index % 4, u32::from(mask));
+    }
+
     /// Whether an interrupt is pending and whether it is active, in this core's view.
     pub fn state(&self, id: u16) -> (bool, bool) {
         let index = id as usize;
