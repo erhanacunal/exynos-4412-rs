@@ -22,6 +22,7 @@
 //! One core at a time. The system register update masks IRQs on the calling core.
 
 use core::ptr;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use tock_registers::interfaces::{Readable, Writeable};
 use tock_registers::register_structs;
@@ -308,6 +309,7 @@ pub fn set_backlight(on: bool) {
 /// anything else puts it in its `TOUT1` function (`pwm1_out`, `exynos4412-pinctrl.dtsi:299-304`).
 /// If the PWM cannot run (the rate of `aclk100` unknown), any level but 0 is full.
 pub fn set_brightness(level: u8) {
+    BRIGHTNESS.store(level, Ordering::Relaxed);
     let high_ns = (u64::from(BACKLIGHT_PERIOD_NS) * u64::from(level) / 255) as u32;
     if level != 0 && level != 255 && pwm::start(BACKLIGHT_PWM, BACKLIGHT_PERIOD_NS, high_ns).is_ok() {
         BACKLIGHT.set_pull(Pull::None);
@@ -317,6 +319,14 @@ pub fn set_brightness(level: u8) {
     }
     BACKLIGHT.set_output(level != 0);
     pwm::stop(BACKLIGHT_PWM);
+}
+
+/// The last level [`set_brightness`] set, 0 before any.
+static BRIGHTNESS: AtomicU8 = AtomicU8::new(0);
+
+/// The level the backlight was last set to: 0 (off) to 255.
+pub fn brightness() -> u8 {
+    BRIGHTNESS.load(Ordering::Relaxed)
 }
 
 /// Turns the backlight off, then the LVDS transmitter: the reverse of the order they go on.
@@ -602,6 +612,18 @@ impl Fimd {
     pub fn stop(&self) {
         let regs = self.regs();
         regs.vidcon0.set(regs.vidcon0.get() & !(VIDCON0_ENVID | VIDCON0_ENVID_F));
+    }
+
+    /// Whether the output runs: accessible, with `ENVID` set.
+    pub fn is_running(&self) -> bool {
+        self.is_accessible() && self.regs().vidcon0.get() & VIDCON0_ENVID != 0
+    }
+
+    /// Starts the output again after [`stop`](Self::stop), with the timing and the window
+    /// [`start`](Self::start) set, which the stop kept.
+    pub fn resume(&self) {
+        let regs = self.regs();
+        regs.vidcon0.set(regs.vidcon0.get() | VIDCON0_ENVID | VIDCON0_ENVID_F);
     }
 
     /// Configures the output and window 0 for `timing`, shows `framebuffer` and starts. Returns

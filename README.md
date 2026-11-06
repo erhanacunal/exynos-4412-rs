@@ -42,6 +42,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `mmc_async_test/`: async eMMC: reads and writes awaited on the controller's interrupt, from CPU0 and CPU1
 - `uart_tx_test/`: buffered console: `print!` sent on the UART's transmit interrupt, the ring overflowing, two cores printing, flush before a panic and a restart
 - `cpufreq_test/`: `cpufreq::set_arm_mhz`: the CPU clock from 200 MHz to 1.4 GHz with `vdd_arm` (BUCK2), measured, timed and checked
+- `standby_test/`: light standby on the power key: screen off, CPU at 200 MHz and 0.9 V, asleep until the next press
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 
 ## Build
@@ -2006,6 +2007,28 @@ back and an integer workload timed and checked; then 10 s at 1.4 GHz. On the boa
 | Soak, 10 s at 1.4 GHz | 467 runs, 0 wrong |
 
 U-Boot runs 1 GHz at 1.2 V; Linux's table, which `set_arm_mhz` applies, at 1.0875 V.
+
+## Standby
+
+`standby::enter` is a light standby, as a phone's on a press of the power key: backlight, LVDS
+and the FIMD's output off, the CPU at 200 MHz and 0.9 V, the calling core asleep in `wfi` until
+the power key (`gpx1-3`, its wake-up interrupt on both edges); then the CPU rate, the FIMD (its
+settings kept, `Fimd::resume`), LVDS and the brightness come back. The chip stays powered and
+DRAM runs: not suspend to RAM, nothing needed from the bootloader. `PowerButton::poll` tells a
+short press (30 ms to 2 s, on release) from a long one (2 s, while held).
+
+Only the display and the CPU clock are handled: the program turns off and on what else it runs
+(touch, audio, WiFi, GPU). IRQs stay masked on the calling core meanwhile; an interrupt left
+enabled in the GIC still wakes it, which `Report::slept_us` shows.
+
+`make img APP=standby_test`: bars on the panel at 1.4 GHz; a short press enters standby, the
+next wakes it, and the bars move. On the board:
+
+| Check | Result |
+|---|---|
+| Standby, 5.7 s | asleep 99%, 9 wake-ups (the press's edges, and every 10 ms while held) |
+| CPU | 1.4 GHz -> 200 MHz -> 1.4 GHz |
+| Screen | back as it was; the key reads correctly in its interrupt function |
 
 ## QEMU
 

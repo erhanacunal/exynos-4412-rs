@@ -58,6 +58,7 @@ pub mod wav;
 
 pub mod sleep;
 pub mod smp;
+pub mod standby;
 pub mod wpa;
 
 /// State of the CPU when the bootloader jumped to `_start`.

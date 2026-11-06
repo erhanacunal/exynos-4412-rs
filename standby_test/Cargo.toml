@@ -1,0 +1,9 @@
+[package]
+name = "standby_test"
+version = "0.1.0"
+edition = "2024"
+description = "Power key standby test for exynos_4412_rs"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }

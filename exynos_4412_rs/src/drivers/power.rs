@@ -49,7 +49,7 @@ const POWER_FALL_POLLS: u32 = 30_000_000;
 const RESET_ATTEMPTS: u32 = 3;
 
 /// Power key: `exynos4412-mehmet.dts:70-72`, active low.
-const POWER_KEY: Pin = gpio::GPX1.pin(3);
+pub(crate) const POWER_KEY: Pin = gpio::GPX1.pin(3);
 /// Volume up key: `exynos4412-mehmet.dts:80`, active low.
 const VOLUME_UP_KEY: Pin = gpio::GPX3.pin(4);
 /// Volume down key: `exynos4412-mehmet.dts:87`, active low.
