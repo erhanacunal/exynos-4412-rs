@@ -44,6 +44,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `cpufreq_test/`: `cpufreq::set_arm_mhz`: the CPU clock from 200 MHz to 1.4 GHz with `vdd_arm` (BUCK2), measured, timed and checked
 - `standby_test/`: light standby on the power key: screen off, CPU at 200 MHz and 0.9 V, asleep until the next press
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
+- `charger_test/`: MAX8903 charger: input power, charging and fault pins, charging enabled and disabled from the UART
 
 ## Build
 
@@ -931,6 +932,37 @@ hardware press of the power key is not needed. `power_test` tries each.
 
 Tested on the board with the charger connected (`Charger: DC yes, USB no`). `PS_HOLD_CONTROL` reads
 `0x00005300` while running. Powering off with no charger was not checked from a log.
+
+## MAX8903 charger
+
+`drivers::max8903` reads the charger's pins and sets its charge enable. The chip has no bus, only
+five active-low GPIOs (`exynos4412-mehmet.dts:186-201`): `DOK` and `UOK` for power on the DC and
+USB inputs, `CHG` while charging, `FLT` after a charge timer fault, and `CEN`, the one output.
+`power::charger_connected` reads `DOK` and `UOK` through it.
+
+- **Enable:** `Max8903::new` leaves `CEN` as U-Boot left it; `Status::enabled` is `None` while
+  the pin is not an output. `set_charging` makes it one. Both Linux drivers enable charging
+  whenever an input has power.
+- **State:** `CHG` is high whenever the chip is not charging, so `NotCharging` covers a full
+  battery, charging disabled and a fault alike.
+- **Disable:** has no effect on the board. U-Boot leaves `CEN` an output driven low; driving it
+  high left `CHG` low, and charging started again on a new DC connection. The vendor kernel
+  never drives it high either (nothing calls `max8903g_charger_disable`), so `CEN` may not reach
+  the chip as the DTS says, or be held low on the board.
+- **Fault:** `restart_charging` disables charging for 10 ms and enables it again, meant to start
+  a new charge timer; given the above it may do nothing. No fault was seen.
+- **Not wired:** `DCM` and `USUS` have no GPIO on this board.
+
+`charger_test` on the board: `make img APP=charger_test`. It prints the pins, then a line each
+time one changes; `e`, `d` and `r` enable, disable and restart charging, `s` prints the state.
+Observed on the board:
+
+| Check | Result |
+|---|---|
+| At start, DC connected | DC yes, USB no, charging yes, fault no, enable on |
+| `d` | enable off, still charging |
+| DC unplugged | DC no, charging no: `Discharging` |
+| DC plugged back, enable off | `NotCharging`, then charging 100 ms later |
 
 ## eMMC
 

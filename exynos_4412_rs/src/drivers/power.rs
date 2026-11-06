@@ -18,6 +18,7 @@
 use core::ptr;
 
 use super::gpio::{self, Pin, Pull};
+use super::max8903::Max8903;
 use super::timer::Mct;
 use crate::{console, println, soc};
 
@@ -54,10 +55,6 @@ pub(crate) const POWER_KEY: Pin = gpio::GPX1.pin(3);
 const VOLUME_UP_KEY: Pin = gpio::GPX3.pin(4);
 /// Volume down key: `exynos4412-mehmet.dts:87`, active low.
 const VOLUME_DOWN_KEY: Pin = gpio::GPX3.pin(3);
-/// `nDC_OK`: `exynos4412-mehmet.dts:194`, active low.
-const DC_OK: Pin = gpio::GPX2.pin(4);
-/// `nUSB_OK`: `exynos4412-mehmet.dts:195`, active low.
-const USB_OK: Pin = gpio::GPX2.pin(6);
 
 /// How long the power key must stay down before the keys act.
 const HOLD_MS: u64 = 2000;
@@ -119,13 +116,12 @@ pub fn ps_hold_control() -> u32 {
     read(PS_HOLD_CONTROL)
 }
 
-/// Whether a charger is connected to the DC input and to USB, in that order. Configures both
-/// pins as inputs with pull-up, as `exynos4412-mehmet.dts:806-810` does. A USB cable to a PC
-/// counts as a charger.
+/// Whether a charger is connected to the DC input and to USB, in that order: the `DOK` and `UOK`
+/// pins of the [`Max8903`]. Configures its status pins as inputs with pull-up, as
+/// `exynos4412-mehmet.dts:806-810` does. A USB cable to a PC counts as a charger.
 pub fn charger_connected() -> (bool, bool) {
-    DC_OK.set_input(Pull::Up);
-    USB_OK.set_input(Pull::Up);
-    (!DC_OK.read(), !USB_OK.read())
+    let status = Max8903::new().status();
+    (status.dc, status.usb)
 }
 
 fn reset_with(inform5: Option<u32>, inform6: u32) -> ! {
