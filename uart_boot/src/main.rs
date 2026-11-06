@@ -56,6 +56,7 @@ mod net;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use exynos_4412_rs::drivers::bcm4334;
 use exynos_4412_rs::drivers::gpio::{self, Pin, Pull};
 use exynos_4412_rs::drivers::power::{self, BootMode};
 use exynos_4412_rs::drivers::timer::Mct;
@@ -300,8 +301,12 @@ fn load_saved() -> Option<usize> {
     }
 }
 
-/// Runs the image at [`STAGE`], `len` bytes, with U-Boot's registers.
+/// Runs the image at [`STAGE`], `len` bytes, with U-Boot's registers. The WiFi chip goes off
+/// first (`bcm4334::power_off`), its radio with it, whether `net` used it or not, so that it
+/// neither drains the battery nor keeps its host-wake line up; an application that uses it
+/// powers it up from reset.
 fn start(mct: Mct, len: usize, args: &BootArgs) -> ! {
+    bcm4334::power_off();
     console::flush();
     wait_ms(mct, HANDOVER_MS);
     println!("uart_boot: starting {} bytes at {:#x}", len, STAGE);
@@ -335,8 +340,8 @@ fn start(mct: Mct, len: usize, args: &BootArgs) -> ! {
 ///
 /// Interrupts are masked for good, and the sources `net` turned on are turned off where they
 /// start: the MCT's comparator 0 (Embassy's time) and the console UART's interrupts. Each
-/// application's `Gic::init` clears what is left at the GIC. The WiFi chip is left running: an
-/// application that uses it powers it up from reset.
+/// application's `Gic::init` clears what is left at the GIC. [`start`] has turned the WiFi chip
+/// off.
 ///
 /// The L2 cache is not enabled by this program, but may be by U-Boot: the image's range is
 /// cleaned through both levels, so the image is in DRAM. Then, in one block that touches no

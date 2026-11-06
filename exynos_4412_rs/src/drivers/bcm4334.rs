@@ -831,6 +831,21 @@ pub fn power_on(pmic: Max77686, mct: Mct) -> Result<(), Error> {
     Ok(())
 }
 
+/// Turns the chip off: held in reset by its enable, which stops the radio, and its 3 V supply
+/// switched off, both low as Linux leaves them with WiFi off (`wlan_pwrseq` and
+/// `wlan_lpo_regulator`, `exynos4412-mehmet.dts:175-184,203-215`). Its bus pins become inputs
+/// pulled down, so that the SD clock stops and nothing drives the chip. LDO22 stays on:
+/// Bluetooth and the SD host's I/O share it (`exynos4412-mehmet.dts:606,1145`). [`power_on`]
+/// brings it back from reset.
+pub fn power_off() {
+    WLAN_ENABLE.set_output(false);
+    LDO_ENABLE.set_output(false);
+    for pin in [SD_CLOCK, SD_COMMAND].into_iter().chain(SD_DATA) {
+        pin.set_function(Function::Input);
+        pin.set_pull(Pull::Down);
+    }
+}
+
 fn delay_us(mct: Mct, us: u64) {
     let start = mct.count();
     while mct.count() - start < us * COUNTS_PER_US {

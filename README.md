@@ -177,7 +177,9 @@ comes once the image is checked (and saved), then the image starts.
 After WiFi, `uart_boot` has the MMU on. Before jumping, it masks interrupts, turns off the timer
 and UART interrupts it used, writes the image out to DRAM, then turns the MMU and caches off and
 cleans and invalidates the L1 data cache, so the application starts in the state the UART path
-gives it. The WiFi chip is left running; an application that uses it powers it up from reset.
+gives it. On both paths, the WiFi chip is turned off before the jump (`bcm4334::power_off`):
+held in reset, its radio off, its 3 V supply's enable low and its bus pins inputs, so it draws
+nothing and its host-wake line stays low. An application that uses it powers it up from reset.
 
 ## Image format
 
