@@ -165,6 +165,37 @@ pub fn clean_dcache_range(start: usize, len: usize) {
     L2c::new().clean_range(start, len);
 }
 
+/// Writes every dirty line of this core's L1 data cache out to the L2 cache (or DRAM if that is
+/// off), keeping the lines valid: `DCCSW` on each set and way, as Linux's `v7_flush_dcache_all`
+/// walks them (`cache-v7.S`) but cleaning only. About a thousand operations for the 32 KiB
+/// cache, however much memory the caller wrote; [`clean_dcache_range`] costs one L1 and one L2
+/// operation per line instead. Follow with [`L2c::clean_all`] for a device to see the data.
+pub fn clean_l1_all() {
+    let ccsidr: u32;
+    // SAFETY: CSSELR = 0 selects the L1 data cache; reading CCSIDR has no side effect.
+    unsafe {
+        asm!("mcr p15, 2, {}, c0, c0, 0", "isb", in(reg) 0u32, options(nostack, preserves_flags));
+        asm!("mrc p15, 1, {}, c0, c0, 0", out(reg) ccsidr, options(nomem, nostack, preserves_flags));
+    }
+    let line_shift = (ccsidr & 7) + 4; // log2(bytes): LineSize is log2(words) - 2
+    let ways = ((ccsidr >> 3) & 0x3FF) + 1;
+    let sets = ((ccsidr >> 13) & 0x7FFF) + 1;
+    let way_shift = (ways - 1).leading_zeros().min(31); // way in the top bits
+    erratum_764369_barrier();
+    for way in 0..ways {
+        for set in 0..sets {
+            let sw = (way << way_shift) | (set << line_shift);
+            // SAFETY: `DCCSW` writes a line out and keeps it: no data changes for any observer.
+            unsafe { asm!("mcr p15, 0, {}, c7, c10, 2", in(reg) sw, options(nostack, preserves_flags)) };
+        }
+    }
+    // SAFETY: a barrier has no effect other than ordering: the lines have left before what
+    // follows, such as the L2 clean.
+    unsafe {
+        asm!("dsb", options(nostack, preserves_flags));
+    }
+}
+
 /// Before a device writes a range of DRAM: drops the range from the L1 cache of this core, then
 /// from the L2 cache, discarding what the CPU wrote there and did not clean. No dirty line is
 /// left to be written back over the device's data later. Some of what the CPU wrote may still

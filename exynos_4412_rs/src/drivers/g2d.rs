@@ -343,6 +343,18 @@ impl G2d {
         self.read(INTC_PEND) & INT_BLIT != 0
     }
 
+    /// Takes the end of the operation started last, without waiting: if it has ended, clears
+    /// its interrupt (which stays asserted until then) and returns true. False if it still
+    /// runs or none was started. For callers that take the interrupt themselves, or poll.
+    pub fn ack(&self) -> bool {
+        if !RUNNING.load(Ordering::Acquire) || !self.is_done() {
+            return false;
+        }
+        self.write(INTC_PEND, INT_BLIT);
+        RUNNING.store(false, Ordering::Release);
+        true
+    }
+
     /// Waits up to `timeout_us` for the end of the operation started last, asleep until its
     /// interrupt ([`sleep::until`]). Returns at once if none runs.
     pub fn wait(&self, mct: Mct, timeout_us: u64) -> Result<(), Error> {

@@ -39,6 +39,9 @@ register_structs! {
         /// cache-l2x0.h:32 `L2X0_CLEAN_LINE_PA`.
         (0x7B0 => clean_line_pa: ReadWrite<u32>),
         (0x7B4 => _reserved5),
+        /// cache-l2x0.h:33 `L2X0_CLEAN_WAY`.
+        (0x7BC => clean_way: ReadWrite<u32>),
+        (0x7C0 => _reserved7),
         /// cache-l2x0.h:51 `L310_PREFETCH_CTRL`.
         (0xF60 => prefetch_ctrl: ReadOnly<u32>),
         (0xF64 => _reserved4),
@@ -218,6 +221,32 @@ impl L2c {
         for line in (start..start + len).step_by(LINE_SIZE) {
             regs.inv_line_pa.set(line as u32);
         }
+        regs.cache_sync.set(0);
+        wait_until_zero(&regs.cache_sync, 1);
+    }
+
+    /// Writes every dirty line out to DRAM, keeping the lines valid: one background operation
+    /// over all ways (`L2X0_CLEAN_WAY`), whatever the amount of memory to clean, where
+    /// [`clean_range`](Self::clean_range) takes one operation per line. Clean the L1 caches
+    /// first ([`mmu::clean_l1_all`](crate::mmu::clean_l1_all) on each core that wrote).
+    ///
+    /// Other masters may keep using the cache meanwhile: lines they dirty during it may or may
+    /// not be written out. Linux does by-way operations only with the other cores stopped
+    /// (`cache-l2x0.c`, `l2c210_flush_all`), because of erratum 727915, a corrupting clean and
+    /// invalidate by way on r2p0; a clean only changes no data, and this controller is r3p2
+    /// ([`revision`](Self::revision) `0x08`). Does nothing if the cache is off.
+    ///
+    /// # Panics
+    ///
+    /// If the controller does not finish.
+    pub fn clean_all(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        let regs = self.regs();
+        let ways = if regs.aux_ctrl.get() & AUX_ASSOCIATIVITY_16 != 0 { 0xFFFF } else { 0xFF };
+        regs.clean_way.set(ways);
+        wait_until_zero(&regs.clean_way, ways);
         regs.cache_sync.set(0);
         wait_until_zero(&regs.cache_sync, 1);
     }
