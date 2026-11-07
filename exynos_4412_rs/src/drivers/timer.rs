@@ -121,6 +121,13 @@ impl Mct {
         }
     }
 
+    /// Reads only the low 32 bits of the global counter: one register read
+    /// instead of [`count`](Self::count)'s three. Wraps every 2^32 counts
+    /// (~179 s at 24 MHz).
+    pub fn count_low(&self) -> u32 {
+        self.regs().g_cnt_l.get()
+    }
+
     /// Starts the counter and raises [`soc::MCT_G0_IRQ`] every `period` counts.
     ///
     /// The interrupt handler must call [`clear_interrupt`](Self::clear_interrupt).
