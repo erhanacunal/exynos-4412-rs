@@ -54,6 +54,7 @@ mod panic;
 pub mod soc;
 pub mod time;
 pub mod touch;
+pub mod usb;
 pub mod wav;
 
 pub mod sleep;

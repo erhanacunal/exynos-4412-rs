@@ -949,6 +949,33 @@ impl MmcWriter {
         }
         self.card.write_blocks_dma(self.partition.start + block, data, self.rca).map_err(WriteError::Card)
     }
+
+    /// Reads whole blocks into `buffer`, from block `block` of the partition on, counted from
+    /// its start, by DMA as [`Mmc::read_blocks_dma`] does.
+    pub fn read(&self, block: u32, buffer: &mut [u8]) -> Result<(), WriteError> {
+        let blocks = (buffer.len() / BLOCK_SIZE) as u64;
+        if u64::from(block) + blocks > u64::from(self.partition.count) {
+            return Err(WriteError::OutOfRange);
+        }
+        self.card.read_blocks_dma(self.partition.start + block, buffer).map_err(WriteError::Card)
+    }
+}
+
+/// The partition as a disk for [`usb::msc`](crate::usb::msc).
+impl crate::usb::msc::BlockDevice for MmcWriter {
+    type Error = WriteError;
+
+    fn blocks(&self) -> u32 {
+        self.partition.count
+    }
+
+    fn read(&mut self, lba: u32, buffer: &mut [u8]) -> Result<(), WriteError> {
+        MmcWriter::read(self, lba, buffer)
+    }
+
+    fn write(&mut self, lba: u32, data: &[u8]) -> Result<(), WriteError> {
+        MmcWriter::write(self, lba, data)
+    }
 }
 
 fn wait_not_busy() -> Result<(), Error> {
