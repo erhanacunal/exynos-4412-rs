@@ -4,7 +4,10 @@
 //!
 //! - [`msc`]: a mass storage device (Bulk-Only Transport, SCSI) on the OTG controller
 //!   ([`otg`](crate::drivers::otg)), over any [`msc::BlockDevice`].
+//! - [`host`]: enumerating a device on the EHCI ([`ehci`](crate::drivers::ehci)), and
+//!   [`host::msc`], a flash drive as a disk.
 
+pub mod host;
 pub mod msc;
 
 /// Bit 7 of an endpoint address: the IN direction, device to host.

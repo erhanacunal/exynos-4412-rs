@@ -3,6 +3,7 @@
 pub mod bcm4334;
 pub mod cmu;
 pub mod display;
+pub mod ehci;
 pub mod fimc;
 pub mod g2d;
 pub mod gic;

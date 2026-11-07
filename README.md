@@ -47,6 +47,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `tmu_test/`: the chip's temperature from the TMU, every second, with the CPU clock changed from the UART
 - `battery_test/`: MAX17040 fuel gauge: the battery's voltage and charge every 5 s, beside the charger's state
 - `charger_test/`: MAX8903 charger: input power, charging and fault pins, charging enabled and disabled from the UART
+- `usb_host_test/`: USB host: a flash drive through an OTG adapter, enumerated, its partition table and read speed
 - `usb_msc_test/`: USB mass storage gadget: the CACHE partition as a disk on the micro-USB port, through the OTG controller
 
 ## Build
@@ -2080,6 +2081,40 @@ On the board: core `0x4F54281A` (2.81a), 15 endpoints, dedicated transmit FIFOs,
 FIFO RAM; high speed. Linux and Windows both mounted CACHE and listed its files, and the eject
 went through. LDO12 was on at 3000 mV and is left so. The only failed commands are ones the
 hosts try and do without: ATA PASS-THROUGH (`0xA1`) and INQUIRY for vital product data pages.
+
+## USB host
+
+The same port as a host, through an OTG adapter: the vendor kernel's `exynos-usb-switch.c`
+watches the ID pin (`gpx1-7`, low with an adapter) and turns the VBUS boost on with `gpx0-6`
+high; `VDD_5V0_EN` (`gpm0-0`) is set at start.
+
+- `drivers::ehci`: the EHCI at `0x1258_0000` (IRQ `GIC_SPI 70`) on port 0, high-speed devices
+  only (full and low speed belong to the companion OHCI, not driven). An async schedule of three
+  queue heads (control, bulk IN, bulk OUT) that stays in place; each transfer is a chain of
+  descriptors hung on an idle queue head, waited for asleep. Queue heads and descriptors are seen
+  through the uncached window; data buffers get cache maintenance, small or unaligned ones go
+  through a bounce buffer. From the EHCI 1.0 specification, plus the DMA bursts of `INSNREG00`
+  from Linux's `ehci-exynos.c`.
+- `usb::host`: port reset, address 1, device and configuration descriptors, the configuration set,
+  a Bulk-Only mass storage interface found; strings.
+- `usb::host::msc::Disk`: Bulk-Only Transport with INQUIRY, TEST UNIT READY (until ready),
+  READ CAPACITY, READ and WRITE (10), SYNCHRONIZE CACHE, sense data on failure and the reset
+  recovery after transport errors. It is a `BlockDevice` too.
+- `usb_host_test`: VBUS on while the adapter is in, enumeration, the drive's identity and partition
+  table, a timed read of 32 MiB; `w` writes 1 MiB at the end of the drive and restores it, only
+  where no partition is, and never on a GPT drive (its backup table is at the end).
+
+On the board, through a cable that does the adapter's job but leaves the ID pin high (VBUS turned
+on with `v`): two flash drives enumerated at high speed in about 167 ms.
+
+| Drive | Size | Read 32 MiB, 64 KiB / 1 MiB requests | Write 1 MiB |
+|---|---|---|---|
+| `14cd:1212`, MBR, FAT32 | 947 MiB | 20.0 / 18.4 MB/s | 6.1 MB/s, read back right, restored |
+| `058f:6387` (Alcor), GPT | 7681 MiB | 20.2 / 20.9 MB/s | |
+
+Neither takes SYNCHRONIZE CACHE: ILLEGAL REQUEST with INVALID COMMAND OPERATION CODE (`0x20`) or
+INVALID FIELD IN PARAMETER LIST (`0x26`). `Disk::flush` takes that as no cache to write. The ID
+pin is not verified: there was no real OTG adapter.
 
 ## Sleeping instead of polling
 
