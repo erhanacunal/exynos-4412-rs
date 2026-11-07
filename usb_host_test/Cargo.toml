@@ -6,4 +6,4 @@ description = "USB host test for exynos_4412_rs: a flash drive on the micro-USB 
 license = "MIT"
 
 [dependencies]
-exynos_4412_rs = { path = "../exynos_4412_rs" }
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["fat"] }

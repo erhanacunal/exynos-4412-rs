@@ -4,7 +4,9 @@
 //! Waits for the adapter (the ID pin `gpx1-7` low), then turns VBUS on (`gpx0-6`) and the EHCI,
 //! and waits for a device. Enumerates it and prints what it is. A mass storage device is opened:
 //! INQUIRY, capacity, the partition table, then a timed read of the first 32 MiB, in 64 KiB and
-//! in 1 MiB requests. Nothing is written unless asked: `w` writes 1 MiB at the end of the drive,
+//! in 1 MiB requests. Then the first partition's FAT file system, through
+//! `exynos_4412_rs::fat::usb`: the root directory, with long names, and a timed read of its
+//! largest file with its CRC-32 (compare with `crc32 FILE` on a PC). Nothing is written unless asked: `w` writes 1 MiB at the end of the drive,
 //! reads it back, and puts back what was there.
 //!
 //! VBUS goes off as soon as the adapter is out, so the board never drives 5 V into a PC. `v`
@@ -18,6 +20,7 @@
 #![no_main]
 
 use core::cell::{RefCell, UnsafeCell};
+use core::ops::ControlFlow;
 
 use exynos_4412_rs::drivers::ehci::{self, Ehci};
 use exynos_4412_rs::drivers::gpio::{GPM0, GPX0, GPX1, Pin, Pull};
@@ -26,6 +29,9 @@ use exynos_4412_rs::drivers::l2c::L2c;
 use exynos_4412_rs::drivers::max77686::Max77686;
 use exynos_4412_rs::drivers::power::{self, BootMode, PowerKeys};
 use exynos_4412_rs::drivers::timer::Mct;
+use exynos_4412_rs::fat::embedded_sdmmc::{LfnBuffer, Mode, ShortFileName, VolumeIdx, VolumeManager};
+use exynos_4412_rs::fat::usb::{self as fat_usb, UsbDevice};
+use exynos_4412_rs::fat::FixedTime;
 use exynos_4412_rs::partition::{self, BlockRead, Partition};
 use exynos_4412_rs::usb::host::{self, Device};
 use exynos_4412_rs::usb::host::msc::{self, Disk};
@@ -36,6 +42,10 @@ exynos_4412_rs::entry!(main);
 /// `vdd_uotg_3v3` and `vdd_uotg_1v0`, as in `usb_msc_test`.
 const LDOS: [(u8, u16); 2] = [(12, 3300), (15, 1000)];
 const BUFFER_BYTES: usize = 1024 * 1024;
+/// The FAT device's read-ahead: four windows of 64 KiB.
+const WINDOW_BYTES: usize = 256 * 1024;
+/// Root directory entries listed at most.
+const LIST_MAX: usize = 64;
 const SPEED_TEST_BYTES: u32 = 32 * 1024 * 1024;
 /// Vendor `mach-mehmet.c`: the OTG adapter's ID pin (low with one), the VBUS boost, and
 /// `VDD_5V0_EN` (`GPIO_USB_BOOT_EN`), which the vendor kernel sets at start.
@@ -46,13 +56,14 @@ const VDD_5V0: Pin = GPM0.pin(0);
 const POWER_UP_US: u64 = 200_000;
 
 #[repr(C, align(32))]
-struct Buffer(UnsafeCell<[u8; BUFFER_BYTES]>);
+struct Buffer<const N: usize>(UnsafeCell<[u8; N]>);
 
 // SAFETY: `main` takes the one reference to each, once.
-unsafe impl Sync for Buffer {}
+unsafe impl<const N: usize> Sync for Buffer<N> {}
 
-static DATA: Buffer = Buffer(UnsafeCell::new([0; BUFFER_BYTES]));
-static SAVED: Buffer = Buffer(UnsafeCell::new([0; BUFFER_BYTES]));
+static DATA: Buffer<BUFFER_BYTES> = Buffer(UnsafeCell::new([0; BUFFER_BYTES]));
+static SAVED: Buffer<BUFFER_BYTES> = Buffer(UnsafeCell::new([0; BUFFER_BYTES]));
+static WINDOW: Buffer<WINDOW_BYTES> = Buffer(UnsafeCell::new([0; WINDOW_BYTES]));
 
 fn ms(mct: Mct, since: u64) -> u64 {
     (mct.count() - since) / u64::from(soc::MCT_CLOCK_HZ / 1000)
@@ -125,6 +136,115 @@ fn speed_test(disk: &mut Disk<'_>, data: &mut [u8], mct: Mct) {
     }
 }
 
+/// CRC-32 (IEEE 802.3, reflected, as `crc32` and zip use), a table made at compile time.
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut k = 0;
+        while k < 8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            k += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+};
+
+/// Continues a CRC-32: start with `!0`, end with `!crc`.
+fn crc32(mut crc: u32, data: &[u8]) -> u32 {
+    for byte in data {
+        crc = CRC_TABLE[((crc ^ u32::from(*byte)) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+type FatError = exynos_4412_rs::fat::embedded_sdmmc::Error<fat_usb::Error>;
+
+/// The first partition's FAT: the root directory, then the largest file in it read whole.
+fn fat_test(disk: &mut Disk<'_>, window: &mut [u8], data: &mut [u8], mct: Mct) -> Result<(), FatError> {
+    let device = UsbDevice::new(disk, window).map_err(FatError::DeviceError)?;
+    let volumes: VolumeManager<_, _, 4, 4, 1> = VolumeManager::new(device, FixedTime::default());
+    let begin = mct.count();
+    let volume = volumes.open_volume(VolumeIdx(0))?;
+    println!("FAT: volume open in {} ms", ms(mct, begin));
+    let root = volume.open_root_dir()?;
+    let mut name = [0u8; 256];
+    let mut lfn = LfnBuffer::new(&mut name);
+    let (mut count, mut bytes) = (0usize, 0u64);
+    let mut largest: Option<(ShortFileName, u32)> = None;
+    root.iterate_dir_lfn(&mut lfn, |entry, long| {
+        if entry.attributes.is_volume() {
+            return ControlFlow::Continue(());
+        }
+        count += 1;
+        if entry.attributes.is_directory() {
+            if count <= LIST_MAX {
+                match long {
+                    Some(long) => println!("  {:>10} {} {}/", "<DIR>", entry.mtime, long),
+                    None => println!("  {:>10} {} {}/", "<DIR>", entry.mtime, entry.name),
+                }
+            }
+            return ControlFlow::Continue(());
+        }
+        bytes += u64::from(entry.size);
+        if count <= LIST_MAX {
+            match long {
+                Some(long) => println!("  {:>10} {} {}", entry.size, entry.mtime, long),
+                None => println!("  {:>10} {} {}", entry.size, entry.mtime, entry.name),
+            }
+        }
+        if largest.as_ref().is_none_or(|(_, size)| entry.size > *size) {
+            largest = Some((entry.name, entry.size));
+        }
+        ControlFlow::Continue(())
+    })?;
+    let more = count.saturating_sub(LIST_MAX);
+    println!("Root: {} entries ({} not shown), {} KiB in files", count, more, bytes / 1024);
+    let listed = volumes.device(|device| device.stats());
+    println!("  {:?}", listed);
+
+    let Some((name, size)) = largest else {
+        println!("No file to read");
+        return Ok(());
+    };
+    let file = root.open_file_in_dir(name, Mode::ReadOnly)?;
+    let begin = mct.count();
+    let mut crc = !0u32;
+    let mut done = 0u64;
+    loop {
+        let read = file.read(&mut data[..])?;
+        if read == 0 {
+            break;
+        }
+        crc = crc32(crc, &data[..read]);
+        done += read as u64;
+    }
+    let took = ms(mct, begin).max(1);
+    let stats = volumes.device(|device| device.stats());
+    println!(
+        "{}: {} of {} bytes in {} ms, {} KiB/s, CRC-32 {:08x}",
+        name,
+        done,
+        size,
+        took,
+        done / 1024 * 1000 / took,
+        !crc
+    );
+    println!(
+        "  {} reads, {} blocks, {} from windows",
+        stats.disk_reads - listed.disk_reads,
+        stats.blocks_read - listed.blocks_read,
+        stats.window_reads - listed.window_reads
+    );
+    file.close()?;
+    root.close()?;
+    volume.close()?;
+    Ok(())
+}
+
 /// MBR type of a GPT's protective entry: the backup GPT is in the drive's last blocks.
 const TYPE_GPT: u8 = 0xEE;
 
@@ -180,7 +300,7 @@ fn write_test(disk: &mut Disk<'_>, table: &[Partition], data: &mut [u8], saved: 
 }
 
 /// Serves an opened disk until the device goes away or the adapter is out.
-fn use_disk(disk: &mut Disk<'_>, data: &mut [u8], mct: Mct) -> ([Partition; 16], usize) {
+fn use_disk(disk: &mut Disk<'_>, window: &mut [u8], data: &mut [u8], mct: Mct) -> ([Partition; 16], usize) {
     let (vendor, product, revision) = disk.identity();
     println!(
         "Disk: '{}' '{}' '{}', removable {}, {} LUNs, {} blocks of {} ({} MiB)",
@@ -217,6 +337,9 @@ fn use_disk(disk: &mut Disk<'_>, data: &mut [u8], mct: Mct) -> ([Partition; 16],
         }
     };
     speed_test(disk, data, mct);
+    if let Err(error) = fat_test(disk, window, data, mct) {
+        println!("FAT ERROR {:?}", error);
+    }
     println!("Ready. UART: w write test, r restart, f fastboot. Unplug to end.");
     (table, found)
 }
@@ -281,6 +404,8 @@ fn main(_args: BootArgs) -> ! {
     let data = unsafe { &mut *DATA.0.get() };
     // SAFETY: as above.
     let saved = unsafe { &mut *SAVED.0.get() };
+    // SAFETY: as above.
+    let window = unsafe { &mut *WINDOW.0.get() };
     let mut keys = PowerKeys::new();
     let uart = console::uart();
     let mut controller: Option<Ehci> = None;
@@ -346,7 +471,7 @@ fn main(_args: BootArgs) -> ! {
                             );
                             match Disk::open(ehci, storage, mct) {
                                 Ok(mut disk) => {
-                                    let (table, found) = use_disk(&mut disk, data, mct);
+                                    let (table, found) = use_disk(&mut disk, window, data, mct);
                                     loop {
                                         keys.service(mct);
                                         match uart.try_read_byte() {

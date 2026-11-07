@@ -47,7 +47,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `tmu_test/`: the chip's temperature from the TMU, every second, with the CPU clock changed from the UART
 - `battery_test/`: MAX17040 fuel gauge: the battery's voltage and charge every 5 s, beside the charger's state
 - `charger_test/`: MAX8903 charger: input power, charging and fault pins, charging enabled and disabled from the UART
-- `usb_host_test/`: USB host: a flash drive through an OTG adapter, enumerated, its partition table and read speed
+- `usb_host_test/`: USB host: a flash drive through an OTG adapter, enumerated, its partition table, read speed and FAT root directory
 - `usb_msc_test/`: USB mass storage gadget: the CACHE partition as a disk on the micro-USB port, through the OTG controller
 
 ## Build
@@ -2100,9 +2100,15 @@ high; `VDD_5V0_EN` (`gpm0-0`) is set at start.
 - `usb::host::msc::Disk`: Bulk-Only Transport with INQUIRY, TEST UNIT READY (until ready),
   READ CAPACITY, READ and WRITE (10), SYNCHRONIZE CACHE, sense data on failure and the reset
   recovery after transport errors. It is a `BlockDevice` too.
+- `fat::usb::UsbDevice` (feature `fat`): the drive whole as `embedded_sdmmc`'s block device, so
+  its own MBR is read and `VolumeIdx(0)` is its first partition (FAT16 or FAT32; GPT and
+  superfloppy drives are not opened). Each drive read fills one of four read-ahead windows, so
+  the crate's one-block reads become 64 KiB commands; writes go straight through.
 - `usb_host_test`: VBUS on while the adapter is in, enumeration, the drive's identity and partition
   table, a timed read of 32 MiB; `w` writes 1 MiB at the end of the drive and restores it, only
-  where no partition is, and never on a GPT drive (its backup table is at the end).
+  where no partition is, and never on a GPT drive (its backup table is at the end). Then the
+  first partition's root directory, long names included, and its largest file read whole, timed,
+  with its CRC-32.
 
 On the board, through a cable that does the adapter's job but leaves the ID pin high (VBUS turned
 on with `v`): two flash drives enumerated at high speed in about 167 ms.
@@ -2115,6 +2121,10 @@ on with `v`): two flash drives enumerated at high speed in about 167 ms.
 Neither takes SYNCHRONIZE CACHE: ILLEGAL REQUEST with INVALID COMMAND OPERATION CODE (`0x20`) or
 INVALID FIELD IN PARAMETER LIST (`0x26`). `Disk::flush` takes that as no cache to write. The ID
 pin is not verified: there was no real OTG adapter.
+
+FAT on `14cd:1212`: the volume opened in 7 ms, the root directory (a folder and a 1870-byte file)
+listed with three drive reads, and the file read. Not yet measured: the speed and CRC-32 of a
+large file.
 
 ## Sleeping instead of polling
 
