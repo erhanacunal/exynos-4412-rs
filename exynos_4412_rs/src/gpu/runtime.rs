@@ -3,6 +3,12 @@
 //!
 //! [`Gpu::start_offscreen`] starts the GPU alone, drawing into a buffer of the caller's
 //! ([`Target`]): for an application that drives the screen itself and copies the frames in.
+//! [`Gpu::map`] gives the GPU more of the caller's memory, for other targets
+//! ([`Gpu::set_target`]) and for textures read where they are ([`Frame::texture_at`]).
+//!
+//! Meshes made with [`Gpu::mesh`] last until restart; [`Frame::mesh`] makes one that lasts
+//! only for its frame, in the frame's memory, from shaders loaded once ([`Gpu::shaders`]): for
+//! geometry that changes every frame, such as a user interface's boxes.
 
 use core::cell::UnsafeCell;
 
@@ -11,7 +17,7 @@ use super::Stage;
 use super::math::Mat4;
 use super::memory::{self, Arena, Fixed, MAX_DRAWS, MAX_TILES, PLBU_DRAW_WORDS, VS_DRAW_WORDS};
 use crate::drivers::display::{self, Fimd, Framebuffer, LTN101AL03, LVDS_SETTLE_MS};
-use crate::drivers::mali::{self, Commands, Filter, GpFrame, Mali, PpFrame, TileEnd};
+use crate::drivers::mali::{self, Commands, Filter, GpFrame, Mali, PpFrame, TexelFormat, TileEnd};
 use crate::drivers::timer::Mct;
 use crate::{mmu, soc};
 
@@ -31,6 +37,14 @@ const DEPTH_FUNC_MASK: u32 = 0x7 << 1;
 const DEPTH_FUNC_LESS: u32 = 1 << 1;
 /// Descriptor addresses in a texture list: `lima_tex_list_size`, 64 bytes.
 const MAX_SAMPLERS: usize = 16;
+/// Ranges [`Gpu::map`] remembers, for checking targets and textures against.
+const MAX_MAPPED: usize = 8;
+/// Render state word 2, the blend: `lima_calculate_alpha_blend` (lima_draw.c) of RGB and alpha
+/// both `ADD` (2) of source `ONE` (0x0B) and destination `INV_SRC_ALPHA` (0x18; four bits for
+/// alpha), the `0x0C << 24` it always sets; the colour mask (bits 28-31) is kept. The shader
+/// compiler's state, with blending off, is the same with destination `ZERO`: 0x0C3B_1AD2.
+const BLEND_PREMULTIPLIED: u32 = 0x0C8B_C2D2;
+const COLOR_MASK: u32 = 0xF000_0000;
 
 #[repr(C, align(4096))]
 struct Pixels(UnsafeCell<[u32; WIDTH * HEIGHT]>);
@@ -69,6 +83,16 @@ impl Target {
     fn bytes(&self) -> usize {
         self.stride * self.height
     }
+}
+
+/// How a draw's colours meet what the frame holds there: see [`Draw::blend`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Blend {
+    /// They replace it: the program's own state.
+    Off,
+    /// Premultiplied "over": colour + (1 - alpha) x what is there, for colours already
+    /// multiplied by their alpha.
+    Premultiplied,
 }
 
 /// What went wrong. The `&'static str`s are the names asked for.
@@ -123,8 +147,16 @@ pub enum Error {
     TextureSize,
     /// The screen's vsync did not come.
     Vsync,
-    /// [`Gpu::start_offscreen`]'s target: not aligned, or its size not whole tiles.
+    /// [`Gpu::start_offscreen`]'s or [`Gpu::set_target`]'s target: not aligned, its size not
+    /// whole tiles, or outside what the GPU's MMUs map.
     BadTarget,
+    /// More ranges than [`Gpu::map`] remembers.
+    TooManyRanges,
+    /// A texture's texels: not 64-byte aligned, a stride over 65535 bytes, or outside what the
+    /// GPU's MMUs map.
+    BadTexels,
+    /// A mesh or texture of an earlier frame ([`Frame::mesh`], [`Frame::texture_at`]).
+    StaleFrame,
     /// The GP raised an error or did not finish.
     Gp(mali::Error),
     /// A PP raised an error or did not finish.
@@ -220,6 +252,10 @@ pub struct Texture {
     texels: u32,
     width: u32,
     height: u32,
+    stride: u32,
+    format: TexelFormat,
+    /// The frame it belongs to ([`Frame::texture_at`]), or 0: it lasts.
+    frame: u32,
 }
 
 /// Triangles for one [`Program`], their attributes in the GPU's memory: see [`Gpu::mesh`].
@@ -230,6 +266,17 @@ pub struct Mesh {
     vertex_shader: usize,
     fragment_shader: usize,
     attribute_info: usize,
+    /// The frame it belongs to ([`Frame::mesh`]), or 0: it lasts.
+    frame: u32,
+}
+
+/// A program's shaders in the GPU's memory, for the meshes of [`Frame::mesh`]: see
+/// [`Gpu::shaders`].
+#[derive(Clone, Copy, Debug)]
+pub struct Shaders {
+    program: &'static Program,
+    vertex_shader: usize,
+    fragment_shader: usize,
 }
 
 impl Mesh {
@@ -254,6 +301,13 @@ pub struct Gpu {
     /// The area the PPs' streams are for.
     streams_for: Option<(usize, usize)>,
     vsync: bool,
+    /// The MMUs' page tables, for [`map`](Self::map).
+    tables: &'static mut mali::IdentityMap<{ memory::MAP_TABLES }>,
+    /// What the MMUs map: start and end of each range given.
+    mapped: [(usize, usize); MAX_MAPPED],
+    mapped_count: usize,
+    /// The current frame's number, from 1: meshes and textures of a frame carry it.
+    serial: u32,
 }
 
 impl Gpu {
@@ -291,7 +345,9 @@ impl Gpu {
         let end = pool_end.max(pixels_end);
         pool.tables.map(soc::DRAM_BASE, end - soc::DRAM_BASE).map_err(|_| Error::PageTables)?;
         let target = Target { address: screen.address(), stride: screen.stride(), width: WIDTH, height: HEIGHT };
-        Self::bring_up(mali, mct, pool, Some(fimd), Some(screen), target)
+        let mut gpu = Self::bring_up(mali, mct, pool, Some(fimd), Some(screen), target)?;
+        gpu.remember(soc::DRAM_BASE, end - soc::DRAM_BASE)?;
+        Ok(gpu)
     }
 
     /// Powers the GPU at 160 MHz and maps the pool and `target` for its MMUs, without the
@@ -320,7 +376,72 @@ impl Gpu {
         let pool_start = pool as *const memory::Pool as usize;
         pool.tables.map(pool_start, size_of::<memory::Pool>()).map_err(|_| Error::PageTables)?;
         pool.tables.map(target.address, target.bytes()).map_err(|_| Error::PageTables)?;
-        Self::bring_up(mali, mct, pool, None, None, target)
+        let mut gpu = Self::bring_up(mali, mct, pool, None, None, target)?;
+        gpu.remember(target.address, target.bytes())?;
+        Ok(gpu)
+    }
+
+    /// Maps `start..start + len` (widened to whole 4 KiB pages) for the GPU's MMUs too: memory
+    /// for other targets ([`set_target`](Self::set_target)) and textures read in place
+    /// ([`Frame::texture_at`]). At most [`memory::MAP_TABLES`] times 4 MiB in all, in up to 8
+    /// ranges (with the pool's and the first target's).
+    ///
+    /// # Safety
+    ///
+    /// The GPU may read and write the range from now on, for as long as the `Gpu` lives: the
+    /// caller keeps it memory (not device registers), and decides what frames do with it.
+    pub unsafe fn map(&mut self, start: usize, len: usize) -> Result<(), Error> {
+        if self.mapped_count == MAX_MAPPED {
+            return Err(Error::TooManyRanges);
+        }
+        // The GPU reads the tables only while a frame runs, and none runs during `&mut self`.
+        self.tables.map(start, len).map_err(|_| Error::PageTables)?;
+        // The MMUs may have cached the directory's or a table's old entries.
+        self.mali.zap_mmu(None);
+        for index in 0..mali::PP_COUNT {
+            self.mali.zap_mmu(Some(index));
+        }
+        self.remember(start, len)
+    }
+
+    fn remember(&mut self, start: usize, len: usize) -> Result<(), Error> {
+        if self.mapped_count == MAX_MAPPED {
+            return Err(Error::TooManyRanges);
+        }
+        self.mapped[self.mapped_count] = (start, start + len);
+        self.mapped_count += 1;
+        Ok(())
+    }
+
+    /// Whether `start..start + len` lies in one range the MMUs map.
+    fn is_mapped(&self, start: usize, len: usize) -> bool {
+        self.mapped[..self.mapped_count].iter().any(|&(lo, hi)| start >= lo && start.saturating_add(len) <= hi)
+    }
+
+    /// Frames from now on are drawn into `target`, which the GPU must map: the first target, the
+    /// screen, or memory given to [`map`](Self::map). As for the first target, the GPU writes it
+    /// past the CPU's caches.
+    ///
+    /// # Safety
+    ///
+    /// As [`start_offscreen`](Self::start_offscreen)'s: nothing else writes `target` while frames
+    /// draw into it.
+    pub unsafe fn set_target(&mut self, target: Target) -> Result<(), Error> {
+        if !target.is_good() || !self.is_mapped(target.address, target.bytes()) {
+            return Err(Error::BadTarget);
+        }
+        self.target = target;
+        Ok(())
+    }
+
+    /// `program`'s shaders, copied into the GPU's memory (kept until restart), for meshes that
+    /// last a frame ([`Frame::mesh`]). Load each program once.
+    pub fn shaders(&mut self, program: &'static Program) -> Result<Shaders, Error> {
+        let vertex_shader = self.lasting.copy(program.vertex, 64)?;
+        let fragment_shader = self.lasting.copy(program.fragment, 64)?;
+        mmu::clean_dcache_range(vertex_shader, size_of_val(program.vertex));
+        mmu::clean_dcache_range(fragment_shader, size_of_val(program.fragment));
+        Ok(Shaders { program, vertex_shader, fragment_shader })
     }
 
     /// The MMUs on the tables `pool` holds, then the pool's fixed parts.
@@ -341,6 +462,7 @@ impl Gpu {
         }
 
         let fixed = &mut pool.fixed;
+        let tables = &mut pool.tables;
         let plb = fixed.plb.as_ptr() as u32;
         for (tile, slot) in fixed.block_addresses.0.iter_mut().enumerate() {
             *slot = plb + (tile * mali::PLB_BLOCK) as u32;
@@ -348,7 +470,22 @@ impl Gpu {
         mmu::clean_dcache_range(fixed as *const Fixed as usize, size_of::<Fixed>());
         let lasting = Arena::new(&mut pool.lasting.0);
         let frame = Arena::new(&mut pool.frame.0);
-        Ok(Self { mali, mct, fimd, screen, target, fixed, lasting, frame, streams_for: None, vsync: true })
+        Ok(Self {
+            mali,
+            mct,
+            fimd,
+            screen,
+            target,
+            fixed,
+            lasting,
+            frame,
+            streams_for: None,
+            vsync: true,
+            tables,
+            mapped: [(0, 0); MAX_MAPPED],
+            mapped_count: 0,
+            serial: 0,
+        })
     }
 
     /// The screen, for the CPU to draw on beside the frames; uncached, so what is drawn shows.
@@ -403,7 +540,15 @@ impl Gpu {
             *slot = u32::from_le_bytes([red, green, blue, alpha]);
         }
         let descriptor = self.lasting.alloc(mali::TEXTURE_DESCRIPTOR_BYTES, 64)?;
-        let texture = Texture { descriptor, texels: address as u32, width: width as u32, height: height as u32 };
+        let texture = Texture {
+            descriptor,
+            texels: address as u32,
+            width: width as u32,
+            height: height as u32,
+            stride: (width * 4) as u32,
+            format: TexelFormat::RGBA_BYTES,
+            frame: 0,
+        };
         self.set_filter(&texture, filter);
         mmu::clean_dcache_range(address, count * 4);
         Ok(texture)
@@ -411,8 +556,12 @@ impl Gpu {
 
     /// Rewrites `texture`'s texels: the one at column `x`, line `y` from the top becomes
     /// `texel(x, y)`, 0xAARRGGBB. The next frame samples them; frames run to their end in
-    /// [`Frame::show`], so none reads them meanwhile.
+    /// [`Frame::show`], so none reads them meanwhile. Only for textures of
+    /// [`texture`](Self::texture) or [`texture_with`](Self::texture_with).
     pub fn write_texture(&mut self, texture: &Texture, texel: impl Fn(usize, usize) -> u32) {
+        if texture.frame != 0 || texture.format != TexelFormat::RGBA_BYTES {
+            return;
+        }
         let (width, count) = (texture.width as usize, (texture.width * texture.height) as usize);
         let address = texture.texels as usize;
         // SAFETY: the texture's own texels, allocated by `texture_with`.
@@ -426,7 +575,7 @@ impl Gpu {
 
     /// Samples `texture` by `filter` from the next frame on.
     pub fn set_filter(&mut self, texture: &Texture, filter: Filter) {
-        let descriptor = mali::texture_rgba8888(texture.texels, texture.width, texture.height, filter);
+        let descriptor = mali::texture(texture.texels, texture.width, texture.height, texture.stride, texture.format, filter);
         // SAFETY: the descriptor's own words, allocated by `texture`.
         unsafe { memory::words(texture.descriptor, 16) }.copy_from_slice(&descriptor);
         mmu::clean_dcache_range(texture.descriptor, mali::TEXTURE_DESCRIPTOR_BYTES);
@@ -435,7 +584,7 @@ impl Gpu {
     /// Starts a mesh of triangles for `program`: give it every attribute the vertex shader
     /// declares, by name, then [`build`](MeshBuilder::build) it.
     pub fn mesh(&mut self, program: &'static Program) -> MeshBuilder<'_> {
-        MeshBuilder { gpu: self, program, attributes: [None; MAX_ATTRIBUTES], vertices: None, error: None }
+        MeshBuilder::new(&mut self.lasting, program, None, 0)
     }
 
     /// Starts a frame on `area` of the screen, cleared to `clear`, 0xAARRGGBB; first waits for
@@ -451,6 +600,7 @@ impl Gpu {
             }
         }
         self.frame.reset();
+        self.serial = self.serial.wrapping_add(1).max(1);
         let (across, down) = area.tiles();
         if error.is_none() && self.streams_for != Some((area.width, area.height)) {
             let plb = self.fixed.plb.as_ptr() as u32;
@@ -466,7 +616,8 @@ impl Gpu {
             plbu.plbu_head(across as u32, down as u32, self.fixed.block_addresses.0.as_ptr() as u32);
             plbu_words = plbu.bytes() as usize / 4;
         }
-        Frame { gpu: self, area, clear, vs_words: 0, plbu_words, draws: 0, error }
+        let serial = self.serial;
+        Frame { gpu: self, serial, area, clear, vs_words: 0, plbu_words, draws: 0, error }
     }
 }
 
@@ -476,15 +627,23 @@ const MAX_ATTRIBUTES: usize = 16;
 /// A mesh being made: see [`Gpu::mesh`]. A wrong name or count is kept, and
 /// [`build`](Self::build) returns it.
 pub struct MeshBuilder<'g> {
-    gpu: &'g mut Gpu,
+    arena: &'g mut Arena,
     program: &'static Program,
+    /// The shaders' addresses when loaded already ([`Gpu::shaders`]).
+    shaders: Option<(usize, usize)>,
+    /// The frame the mesh is for, or 0.
+    frame: u32,
     /// The attribute info of each: the data's address and `stride << 11 | components - 1`.
     attributes: [Option<[u32; 2]>; MAX_ATTRIBUTES],
     vertices: Option<usize>,
     error: Option<Error>,
 }
 
-impl MeshBuilder<'_> {
+impl<'g> MeshBuilder<'g> {
+    fn new(arena: &'g mut Arena, program: &'static Program, shaders: Option<(usize, usize)>, frame: u32) -> Self {
+        Self { arena, program, shaders, frame, attributes: [None; MAX_ATTRIBUTES], vertices: None, error: None }
+    }
+
     /// The attribute `name`'s values, a vertex each: `[f32; 3]` for a `vec3`, or for a `vec4`
     /// whose w is 1. Copied: `data` is free after.
     pub fn attribute<const N: usize>(mut self, name: &'static str, data: &[[f32; N]]) -> Self {
@@ -500,7 +659,7 @@ impl MeshBuilder<'_> {
             return self;
         }
         self.vertices = Some(data.len());
-        match self.gpu.lasting.copy(data, 64) {
+        match self.arena.copy(data, 64) {
             Ok(address) => {
                 // `stride << 11 | type << 2 | (components - 1)`, type 0 float: lima_draw.c:850-855.
                 let info = (((N * 4) as u32) << 11) | (N as u32).saturating_sub(1);
@@ -527,14 +686,20 @@ impl MeshBuilder<'_> {
         if vertices == 0 || !vertices.is_multiple_of(3) {
             return Err(Error::NotTriangles);
         }
-        let lasting = &mut self.gpu.lasting;
-        let attribute_info = lasting.copy(&info[..program.attributes.len() * 2], 64)?;
-        let vertex_shader = lasting.copy(program.vertex, 64)?;
-        let fragment_shader = lasting.copy(program.fragment, 64)?;
+        let arena = &mut *self.arena;
+        let attribute_info = arena.copy(&info[..program.attributes.len() * 2], 64)?;
         mmu::clean_dcache_range(attribute_info, program.attributes.len() * 8);
-        mmu::clean_dcache_range(vertex_shader, size_of_val(program.vertex));
-        mmu::clean_dcache_range(fragment_shader, size_of_val(program.fragment));
-        Ok(Mesh { program, vertices: vertices as u32, vertex_shader, fragment_shader, attribute_info })
+        let (vertex_shader, fragment_shader) = match self.shaders {
+            Some(loaded) => loaded,
+            None => {
+                let vertex_shader = arena.copy(program.vertex, 64)?;
+                let fragment_shader = arena.copy(program.fragment, 64)?;
+                mmu::clean_dcache_range(vertex_shader, size_of_val(program.vertex));
+                mmu::clean_dcache_range(fragment_shader, size_of_val(program.fragment));
+                (vertex_shader, fragment_shader)
+            }
+        };
+        Ok(Mesh { program, vertices: vertices as u32, vertex_shader, fragment_shader, attribute_info, frame: self.frame })
     }
 }
 
@@ -542,6 +707,7 @@ impl MeshBuilder<'_> {
 /// [`show`](Self::show) returns the first.
 pub struct Frame<'g> {
     gpu: &'g mut Gpu,
+    serial: u32,
     area: Area,
     clear: u32,
     vs_words: usize,
@@ -554,11 +720,61 @@ impl<'g> Frame<'g> {
     /// Draws `mesh`: set its uniforms and textures on what this returns; it joins the frame at
     /// the end of the statement. Uniforms the program has must all be set.
     pub fn draw<'f>(&'f mut self, mesh: &Mesh) -> Draw<'f, 'g> {
-        let place = self.place(mesh);
+        let place = if mesh.frame != 0 && mesh.frame != self.serial { Err(Error::StaleFrame) } else { self.place(mesh) };
         if let Err(error) = place {
             self.error.get_or_insert(error);
         }
-        Draw { frame: self, mesh: *mesh, place: place.ok(), set: 0, textures: 0, depth_test: false }
+        Draw { frame: self, mesh: *mesh, place: place.ok(), set: 0, textures: 0, depth_test: false, blend: Blend::Off }
+    }
+
+    /// Starts a mesh for `shaders`' program in this frame's memory: give it every attribute
+    /// the vertex shader declares, then [`build`](MeshBuilder::build) it. It can be drawn in this
+    /// frame only.
+    pub fn mesh(&mut self, shaders: &Shaders) -> MeshBuilder<'_> {
+        let loaded = Some((shaders.vertex_shader, shaders.fragment_shader));
+        MeshBuilder::new(&mut self.gpu.frame, shaders.program, loaded, self.serial)
+    }
+
+    /// A texture of `width` x `height` texels of `format` where they are, at `texels`, lines
+    /// `stride` bytes apart, sampled by `filter`: its descriptor lives in this frame's memory,
+    /// and it can be drawn in this frame only. Lines may be longer than the stride (they then
+    /// share texels): a picture whose first texel is not 64-byte aligned is read as a wider one
+    /// from the aligned address before it, sampled only where the picture is.
+    ///
+    /// # Safety
+    ///
+    /// The texels are memory the GPU maps ([`Gpu::map`]), written out of the CPU's caches, and
+    /// unchanged until [`show`](Self::show) returns.
+    pub unsafe fn texture_at(
+        &mut self,
+        texels: usize,
+        width: usize,
+        height: usize,
+        stride: usize,
+        format: TexelFormat,
+        filter: Filter,
+    ) -> Result<Texture, Error> {
+        if width == 0 || height == 0 || width > 4096 || height > 4096 {
+            return Err(Error::TextureSize);
+        }
+        let bytes = stride * (height - 1) + width * format.bytes as usize;
+        if !texels.is_multiple_of(64) || stride > 0xFFFF || !self.gpu.is_mapped(texels, bytes)
+        {
+            return Err(Error::BadTexels);
+        }
+        let descriptor = self.gpu.frame.alloc(mali::TEXTURE_DESCRIPTOR_BYTES, 64)?;
+        let words = mali::texture(texels as u32, width as u32, height as u32, stride as u32, format, filter);
+        // SAFETY: just allocated, the descriptor's 16 words; cleaned with the frame's memory.
+        unsafe { memory::words(descriptor, 16) }.copy_from_slice(&words);
+        Ok(Texture {
+            descriptor,
+            texels: texels as u32,
+            width: width as u32,
+            height: height as u32,
+            stride: stride as u32,
+            format,
+            frame: self.serial,
+        })
     }
 
     /// Room in the frame's memory for a draw of `mesh`, its uniforms filled but the program's.
@@ -694,6 +910,7 @@ pub struct Draw<'f, 'g> {
     /// Which samplers have a texture, a bit each.
     textures: u32,
     depth_test: bool,
+    blend: Blend,
 }
 
 impl Draw<'_, '_> {
@@ -748,6 +965,10 @@ impl Draw<'_, '_> {
             self.fail(Error::UnknownSampler(name));
             return self;
         };
+        if texture.frame != 0 && texture.frame != self.frame.serial {
+            self.fail(Error::StaleFrame);
+            return self;
+        }
         // SAFETY: the draw's own texture list, a word a sampler.
         let list = unsafe { memory::words(place.texture_list, MAX_SAMPLERS) };
         list[index] = texture.descriptor as u32;
@@ -759,6 +980,12 @@ impl Draw<'_, '_> {
     /// a depth test, `Less`. Off unless asked.
     pub fn depth_test(mut self, on: bool) -> Self {
         self.depth_test = on;
+        self
+    }
+
+    /// How the draw's colours meet what the frame holds: [`Blend::Off`] unless asked.
+    pub fn blend(mut self, blend: Blend) -> Self {
+        self.blend = blend;
         self
     }
 
@@ -780,6 +1007,9 @@ impl Draw<'_, '_> {
         state.copy_from_slice(&program.render_state);
         if self.depth_test {
             state[3] = (state[3] & !DEPTH_FUNC_MASK) | DEPTH_FUNC_LESS | DEPTH_TEST;
+        }
+        if self.blend == Blend::Premultiplied {
+            state[2] = (state[2] & COLOR_MASK) | BLEND_PREMULTIPLIED;
         }
         state[9] |= self.mesh.fragment_shader as u32;
         if place.pp_array != 0 {

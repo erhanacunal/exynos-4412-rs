@@ -118,6 +118,13 @@ pub fn init() -> Result<usize, InitError> {
     Ok(size)
 }
 
+/// Where the heap is: its first byte's address and its length, as `link.x` reserves it.
+pub fn region() -> (usize, usize) {
+    let start = &raw const __heap_start as usize;
+    let end = &raw const __heap_end as usize;
+    (start, end - start)
+}
+
 /// What the heap has done so far, from any core.
 pub fn stats() -> Stats {
     HEAP.lock().stats

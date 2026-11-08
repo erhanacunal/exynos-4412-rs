@@ -659,6 +659,14 @@ impl Mali {
         Ok(())
     }
 
+    /// Makes an MMU forget the page table entries it holds, after the tables changed: its zap
+    /// command (lima_mmu.c, `lima_mmu_flush_tlb`). Only while the GPU is idle. `pp` as for
+    /// [`reset_mmu`](Self::reset_mmu).
+    pub fn zap_mmu(&self, pp: Option<usize>) {
+        let (base, _) = Self::mmu_of(pp);
+        self.write(base + MMU_COMMAND, MMU_COMMAND_ZAP_CACHE);
+    }
+
     fn mmu_of(pp: Option<usize>) -> (usize, Block) {
         match pp {
             Some(index) => (PP_MMU[index], Block::PpMmu(index)),
@@ -857,6 +865,35 @@ pub enum Filter {
     Bilinear,
 }
 
+/// How texels are stored: the descriptor's texel format (`LIMA_TEXEL_FORMAT_*`,
+/// lima_texture.h), its bytes a texel, and whether red and blue trade places.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TexelFormat {
+    /// The texel format field.
+    pub code: u32,
+    /// Bytes a texel.
+    pub bytes: u32,
+    /// The descriptor's red/blue swap bit.
+    pub swap_rb: bool,
+}
+
+impl TexelFormat {
+    /// 32 bits a texel, the bytes red, green, blue, alpha in memory: what
+    /// [`texture_rgba8888`] describes and `Gpu::texture` writes.
+    pub const RGBA_BYTES: Self = Self { code: 0x16, bytes: 4, swap_rb: true };
+    /// 32 bits a texel, the bytes blue, green, red, alpha in memory: a little-endian
+    /// 0xAARRGGBB word, as the screen's pixels.
+    pub const BGRA_BYTES: Self = Self { code: 0x16, bytes: 4, swap_rb: false };
+    /// 16 bits a texel, little-endian, red in the top five bits.
+    pub const RGB_565: Self = Self { code: 0x0E, bytes: 2, swap_rb: false };
+
+    /// The same, red and blue the other way round: for a board on which the bit means the
+    /// opposite of what these assume.
+    pub const fn swapped(self) -> Self {
+        Self { swap_rb: !self.swap_rb, ..self }
+    }
+}
+
 /// The texture descriptor of a 2D texture of one level, `width` x `height` RGBA8888 texels in
 /// lines, red in the first byte, at `texels`, sampled by `filter`, clamped to its edges, as
 /// Mesa's driver packs one for `GL_RGBA`/`GL_UNSIGNED_BYTE`, `GL_NEAREST` or `GL_LINEAR`,
@@ -866,8 +903,18 @@ pub enum Filter {
 ///
 /// If `texels` is not 64-byte aligned: the descriptor holds the address shifted right by 6.
 pub fn texture_rgba8888(texels: u32, width: u32, height: u32, filter: Filter) -> [u32; 16] {
+    texture(texels, width, height, width * 4, TexelFormat::RGBA_BYTES, filter)
+}
+
+/// The texture descriptor of a 2D texture of one level, `width` x `height` texels of `format`
+/// in lines `stride` bytes apart, at `texels`, sampled by `filter`, clamped to its edges: as
+/// [`texture_rgba8888`], for other layouts. Linear, so no size needs to be a power of two.
+///
+/// # Panics
+///
+/// If `texels` is not 64-byte aligned: the descriptor holds the address shifted right by 6.
+pub fn texture(texels: u32, width: u32, height: u32, stride: u32, format: TexelFormat, filter: Filter) -> [u32; 16] {
     assert!(texels.is_multiple_of(64), "texels 64-byte aligned");
-    const FORMAT_RGBA_8888: u32 = 0x16;
     const SWAP_RB: u32 = 1 << 7;
     const DIM_2D: u32 = 1 << 10;
     // Lod Bias, signed, 4 fraction bits, from bit 28: 0.5, Mesa's for nearest filtering; 0 for
@@ -879,7 +926,9 @@ pub fn texture_rgba8888(texels: u32, width: u32, height: u32, filter: Filter) ->
     const CLAMP_TO_EDGE: u32 = 1;
     let mip0 = texels >> 6;
     let mut descriptor = [0; 16];
-    descriptor[0] = FORMAT_RGBA_8888 | SWAP_RB | ((width * 4) << 16);
+    let swap = if format.swap_rb { SWAP_RB } else { 0 };
+    // The stride, in bytes, from bit 16 (`HAS_STRIDE` below).
+    descriptor[0] = format.code | swap | (stride << 16);
     let (bias, nearest) = match filter {
         Filter::Nearest => (LOD_BIAS_HALF, MIN_NEAREST | MAG_NEAREST),
         Filter::Bilinear => (0, 0),

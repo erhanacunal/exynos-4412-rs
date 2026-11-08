@@ -14,7 +14,10 @@ use crate::drivers::mali;
 /// 512 pixels, or 352 x 352 square... any area of up to 512 tiles.
 pub const MAX_TILES: usize = mali::PLB_MAX_BLOCKS;
 /// The most draws in one frame.
-pub const MAX_DRAWS: usize = 64;
+pub const MAX_DRAWS: usize = 256;
+/// Page tables of the GPU's MMUs, 4 MiB of memory each: the pool, the targets and whatever
+/// [`Gpu::map`](super::Gpu::map) adds (a 512 MiB heap takes 128).
+pub const MAP_TABLES: usize = 160;
 /// Bytes for meshes, textures and shaders, kept until restart: about 260 000 vertices of the
 /// `lit` shader (32 bytes each).
 pub const LASTING_BYTES: usize = 8 << 20;
@@ -55,7 +58,7 @@ pub(crate) struct Pool {
     pub fixed: Fixed,
     pub lasting: Page<[u8; LASTING_BYTES]>,
     pub frame: Page<[u8; FRAME_BYTES]>,
-    pub tables: mali::IdentityMap<8>,
+    pub tables: mali::IdentityMap<MAP_TABLES>,
 }
 
 pub(crate) struct Store(UnsafeCell<Pool>);
