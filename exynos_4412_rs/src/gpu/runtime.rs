@@ -45,6 +45,9 @@ const MAX_MAPPED: usize = 8;
 /// compiler's state, with blending off, is the same with destination `ZERO`: 0x0C3B_1AD2.
 const BLEND_PREMULTIPLIED: u32 = 0x0C8B_C2D2;
 const COLOR_MASK: u32 = 0xF000_0000;
+/// Render state word 13 (`aux0`): forward pixel kill (lima_draw.c, `render->aux0 |= 0x1000`),
+/// which the shader compiler's state has on (no blending there).
+const AUX0_PIXEL_KILL: u32 = 0x1000;
 
 #[repr(C, align(4096))]
 struct Pixels(UnsafeCell<[u32; WIDTH * HEIGHT]>);
@@ -1010,6 +1013,11 @@ impl Draw<'_, '_> {
         }
         if self.blend == Blend::Premultiplied {
             state[2] = (state[2] & COLOR_MASK) | BLEND_PREMULTIPLIED;
+            // Forward pixel kill off: with it the PP drops fragments a later primitive covers,
+            // as if that one were opaque; Mesa clears it whenever blending is on
+            // (lima_draw.c, lima_pack_render_state: `if (rt->blend_enable) pixel_kill = false`).
+            // Left on, fragments under translucent draws went missing in scattered quads.
+            state[13] &= !AUX0_PIXEL_KILL;
         }
         state[9] |= self.mesh.fragment_shader as u32;
         if place.pp_array != 0 {
