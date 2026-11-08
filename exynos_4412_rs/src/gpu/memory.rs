@@ -15,13 +15,14 @@ use crate::drivers::mali;
 pub const MAX_TILES: usize = mali::PLB_MAX_BLOCKS;
 /// The most draws in one frame.
 pub const MAX_DRAWS: usize = 64;
-/// Bytes for meshes, textures and shaders, kept until restart.
-pub const LASTING_BYTES: usize = 2 << 20;
+/// Bytes for meshes, textures and shaders, kept until restart: about 260 000 vertices of the
+/// `lit` shader (32 bytes each).
+pub const LASTING_BYTES: usize = 8 << 20;
 /// Bytes for a frame's own: each draw's uniforms, render state and the GP's output.
-pub const FRAME_BYTES: usize = 512 << 10;
+pub const FRAME_BYTES: usize = 4 << 20;
 
 const BLOCK_WORDS: usize = mali::PLB_BLOCK / 4;
-const HEAP_WORDS: usize = 16 * 1024;
+const HEAP_WORDS: usize = 256 * 1024;
 pub(crate) const STREAM_WORDS: usize = MAX_TILES * 4 + 4;
 /// A draw's vertex commands: 12 of two words (`mali::Commands`, the `vs_` ones).
 pub(crate) const VS_DRAW_WORDS: usize = 24;
@@ -54,7 +55,7 @@ pub(crate) struct Pool {
     pub fixed: Fixed,
     pub lasting: Page<[u8; LASTING_BYTES]>,
     pub frame: Page<[u8; FRAME_BYTES]>,
-    pub tables: mali::IdentityMap<4>,
+    pub tables: mali::IdentityMap<8>,
 }
 
 pub(crate) struct Store(UnsafeCell<Pool>);
