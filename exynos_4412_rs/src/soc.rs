@@ -172,6 +172,19 @@ pub const AUDSS_BASE: usize = 0x0381_0000;
 /// `i2s0: i2s@3830000`, and `exynos4412-mehmet.dts` has the codec on it.
 pub const I2S0_BASE: usize = 0x0383_0000;
 
+/// The USB OTG controller (Synopsys DWC2), the micro-USB port's device side. Verified:
+/// `exynos4.dtsi:365-374`, node `hsotg: hsotg@12480000`, `reg`, 128 KiB.
+pub const OTG_BASE: usize = 0x1248_0000;
+/// Its interrupt: `exynos4.dtsi:368`, `GIC_SPI 71`.
+pub const OTG_IRQ: u16 = 32 + 71;
+/// The USB 2.0 PHY's control block: power, clock and reset of PHY0 (the micro-USB port) and the
+/// two HSIC PHYs. Verified: `exynos4.dtsi:355-363`, node `exynos_usbphy: exynos-usbphy@125b0000`.
+pub const USB_PHY_BASE: usize = 0x125B_0000;
+/// The EHCI host controller. Verified: `exynos4.dtsi:376-385`, node `ehci: ehci@12580000`.
+pub const EHCI_BASE: usize = 0x1258_0000;
+/// Its interrupt, shared with the OHCI: `exynos4.dtsi:379`, `GIC_SPI 70`.
+pub const EHCI_IRQ: u16 = 32 + 70;
+
 /// Number of cores. Verified: `exynos4412.dtsi`, nodes `cpu@a00`..`cpu@a03`. `link.x`
 /// reserves this many stack blocks.
 pub const CPU_COUNT: usize = 4;

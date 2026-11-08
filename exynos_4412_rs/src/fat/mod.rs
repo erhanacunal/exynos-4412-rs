@@ -1,5 +1,7 @@
 //! FAT32 on one eMMC partition, through [`embedded_sdmmc`].
 //!
+//! [`usb`] gives that crate a USB flash drive instead, through its own partition table.
+//!
 //! [`PartitionDevice`] is the [`BlockDevice`] that crate needs. It shows one partition as a
 //! whole disk, with a partition table of its own: block 0 is a master boot record made up in
 //! memory, which lists one FAT32 partition from block 1 on, and block `n` from 1 on is block
@@ -27,6 +29,8 @@ use core::cell::RefCell;
 use core::fmt;
 
 pub use embedded_sdmmc;
+
+pub mod usb;
 use embedded_sdmmc::{Block, BlockCount, BlockDevice, BlockIdx, TimeSource, Timestamp};
 
 use crate::drivers::mmc::{self, BLOCK_SIZE, Mmc, MmcWriter, WriteError};

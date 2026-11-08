@@ -213,6 +213,10 @@ const GATE_FSYS_SDMMC4: u32 = 1 << 9;
 const GATE_FSYS_PDMA0: u32 = 1 << 0;
 /// clk-exynos4.c:845: `CLK_SDMMC3`, the register clock of `sdhci_3`.
 const GATE_FSYS_SDMMC3: u32 = 1 << 8;
+/// clk-exynos4.c:752: `usb_host`, the EHCI's and OHCI's gate.
+const GATE_FSYS_USB_HOST: u32 = 1 << 12;
+/// clk-exynos4.c:730: `usb_device`, the OTG controller's and the USB PHY block's gate.
+const GATE_FSYS_USB_DEVICE: u32 = 1 << 13;
 /// clk-exynos4.c:561: `mout_mmc3` is this field of `SRC_FSYS`.
 const SRC_FSYS_MMC3_SHIFT: u32 = 12;
 const SRC_FSYS_MMC3_MASK: u32 = 0xF << SRC_FSYS_MMC3_SHIFT;
@@ -825,7 +829,7 @@ impl Cmu {
         let was_masked = cpu::mask_irq();
         // SAFETY: as in `read`. Every caller changes only fields of the block it configures: the
         // FIMD, `sdhci_3`, `pdma0`, the audio subsystem, the GPU, the MFC, a FIMC, the G2D, the
-        // PWM timers or the TMU.
+        // PWM timers, the TMU or the USB controllers.
         unsafe {
             ptr::write_volatile(address, (ptr::read_volatile(address) & !clear) | set);
         }
@@ -996,6 +1000,22 @@ impl Cmu {
     /// `E4X12_GATE_IP_MAUDIO`, for reports.
     pub fn audio_gates(&self) -> u32 {
         self.read(GATE_IP_MAUDIO)
+    }
+
+    /// Opens the gate of the OTG controller and of the USB PHY's registers, `usb_device`.
+    pub fn open_usb_device_gate(&self) {
+        self.modify(GATE_IP_FSYS, 0, GATE_FSYS_USB_DEVICE);
+    }
+
+    /// Opens the gate of the EHCI and OHCI host controllers, `usb_host`.
+    pub fn open_usb_host_gate(&self) {
+        self.modify(GATE_IP_FSYS, 0, GATE_FSYS_USB_HOST);
+    }
+
+    /// Whether the gates `usb_device` and `usb_host` are open, in that order.
+    pub fn usb_gates_open(&self) -> (bool, bool) {
+        let gates = self.read(GATE_IP_FSYS);
+        (gates & GATE_FSYS_USB_DEVICE != 0, gates & GATE_FSYS_USB_HOST != 0)
     }
 
     /// Opens the PWM timers' clock gate.

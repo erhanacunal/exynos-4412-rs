@@ -1,0 +1,9 @@
+[package]
+name = "usb_host_test"
+version = "0.1.0"
+edition = "2024"
+description = "USB host test for exynos_4412_rs: a flash drive on the micro-USB port through an OTG adapter"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["fat"] }
