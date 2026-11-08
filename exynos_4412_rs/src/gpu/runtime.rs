@@ -1,5 +1,8 @@
 //! Drawing: [`Gpu`] starts the GPU and the screen, holds meshes and textures, and runs
 //! [`Frame`]s of [`Draw`]s. See the module's documentation, `gpu`.
+//!
+//! [`Gpu::start_offscreen`] starts the GPU alone, drawing into a buffer of the caller's
+//! ([`Target`]): for an application that drives the screen itself and copies the frames in.
 
 use core::cell::UnsafeCell;
 
@@ -37,6 +40,37 @@ unsafe impl Sync for Pixels {}
 
 static PIXELS: Pixels = Pixels(UnsafeCell::new([0; WIDTH * HEIGHT]));
 
+/// A buffer frames are drawn into, 32 bits a pixel (0xAARRGGBB as the screen shows them), line
+/// after line `stride` bytes apart: the screen's pixels, or the caller's own
+/// ([`Gpu::start_offscreen`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Target {
+    /// The first pixel's address: a multiple of 64.
+    pub address: usize,
+    /// Bytes from a line to the next: a multiple of 64, at least `width * 4`.
+    pub stride: usize,
+    /// Pixels in a line: a multiple of 16.
+    pub width: usize,
+    /// Lines: a multiple of 16.
+    pub height: usize,
+}
+
+impl Target {
+    fn is_good(&self) -> bool {
+        self.address % 64 == 0
+            && self.stride % 64 == 0
+            && self.stride >= self.width * 4
+            && self.width % mali::TILE == 0
+            && self.height % mali::TILE == 0
+            && self.width > 0
+            && self.height > 0
+    }
+
+    fn bytes(&self) -> usize {
+        self.stride * self.height
+    }
+}
+
 /// What went wrong. The `&'static str`s are the names asked for.
 #[derive(Clone, Copy, Debug)]
 pub enum Error {
@@ -57,7 +91,7 @@ pub enum Error {
     OutOfMemory,
     /// More than [`memory::MAX_DRAWS`] draws in a frame.
     TooManyDraws,
-    /// The frame's area: its corner and size not multiples of 16, beyond the screen, or more
+    /// The frame's area: its corner and size not multiples of 16, beyond the target, or more
     /// than [`memory::MAX_TILES`] tiles of 16 x 16.
     BadArea,
     /// The program has no attribute of this name.
@@ -89,6 +123,8 @@ pub enum Error {
     TextureSize,
     /// The screen's vsync did not come.
     Vsync,
+    /// [`Gpu::start_offscreen`]'s target: not aligned, or its size not whole tiles.
+    BadTarget,
     /// The GP raised an error or did not finish.
     Gp(mali::Error),
     /// A PP raised an error or did not finish.
@@ -124,10 +160,15 @@ impl Area {
         (self.width / mali::TILE, self.height / mali::TILE)
     }
 
-    fn is_good(&self) -> bool {
+    fn is_good(&self, target: &Target) -> bool {
         let (across, down) = self.tiles();
         let whole = [self.x, self.y, self.width, self.height].iter().all(|value| value % mali::TILE == 0);
-        whole && across > 0 && down > 0 && across * down <= MAX_TILES && self.x + self.width <= WIDTH && self.y + self.height <= HEIGHT
+        whole
+            && across > 0
+            && down > 0
+            && across * down <= MAX_TILES
+            && self.x + self.width <= target.width
+            && self.y + self.height <= target.height
     }
 }
 
@@ -198,12 +239,15 @@ impl Mesh {
     }
 }
 
-/// The GPU and the screen. One, from [`Gpu::start`].
+/// The GPU and the screen. One, from [`Gpu::start`] or [`Gpu::start_offscreen`].
 pub struct Gpu {
     mali: Mali,
     mct: Mct,
-    fimd: Fimd,
-    screen: Framebuffer,
+    /// The screen, with [`Gpu::start`]; none offscreen.
+    fimd: Option<Fimd>,
+    screen: Option<Framebuffer>,
+    /// Where frames are drawn: the screen's pixels, or the caller's buffer.
+    target: Target,
     fixed: &'static mut Fixed,
     lasting: Arena,
     frame: Arena,
@@ -246,6 +290,48 @@ impl Gpu {
         let pool_end = pool as *const memory::Pool as usize + size_of::<memory::Pool>();
         let end = pool_end.max(pixels_end);
         pool.tables.map(soc::DRAM_BASE, end - soc::DRAM_BASE).map_err(|_| Error::PageTables)?;
+        let target = Target { address: screen.address(), stride: screen.stride(), width: WIDTH, height: HEIGHT };
+        Self::bring_up(mali, mct, pool, Some(fimd), Some(screen), target)
+    }
+
+    /// Powers the GPU at 160 MHz and maps the pool and `target` for its MMUs, without the
+    /// screen: frames are drawn into `target`, [`frame`](Self::frame)s don't wait for vsync, and
+    /// [`screen`](Self::screen) has nothing to give. The GPU writes `target` past the CPU's
+    /// caches: have no dirty lines of it in them (`mmu::discard_dcache_range` first), read it
+    /// after a frame through an uncached view or by a device, and keep the CPU's writes out of
+    /// it.
+    /// Needs the MMU on (`mmu::enable()`).
+    ///
+    /// # Safety
+    ///
+    /// `target` is memory the caller owns for as long as the `Gpu` lives, which nothing else
+    /// uses meanwhile but to read what the frames drew.
+    pub unsafe fn start_offscreen(mct: Mct, target: Target) -> Result<Self, Error> {
+        if !mmu::is_enabled() {
+            return Err(Error::MmuOff);
+        }
+        if !target.is_good() {
+            return Err(Error::BadTarget);
+        }
+        let pool = memory::take()?;
+        let mali = Mali::new();
+        mali.power_on(mali::SAFE_HZ, mct).map_err(Error::Mali)?;
+        mali.pmu_power_up(mali::PMU_ALL, mct).map_err(Error::Mali)?;
+        let pool_start = pool as *const memory::Pool as usize;
+        pool.tables.map(pool_start, size_of::<memory::Pool>()).map_err(|_| Error::PageTables)?;
+        pool.tables.map(target.address, target.bytes()).map_err(|_| Error::PageTables)?;
+        Self::bring_up(mali, mct, pool, None, None, target)
+    }
+
+    /// The MMUs on the tables `pool` holds, then the pool's fixed parts.
+    fn bring_up(
+        mali: Mali,
+        mct: Mct,
+        pool: &'static mut memory::Pool,
+        fimd: Option<Fimd>,
+        screen: Option<Framebuffer>,
+        target: Target,
+    ) -> Result<Self, Error> {
         let directory = pool.tables.directory();
         mali.reset_gp(mct, false).map_err(Error::Mali)?;
         mali.enable_mmu(None, directory, mct).map_err(Error::Mali)?;
@@ -262,12 +348,21 @@ impl Gpu {
         mmu::clean_dcache_range(fixed as *const Fixed as usize, size_of::<Fixed>());
         let lasting = Arena::new(&mut pool.lasting.0);
         let frame = Arena::new(&mut pool.frame.0);
-        Ok(Self { mali, mct, fimd, screen, fixed, lasting, frame, streams_for: None, vsync: true })
+        Ok(Self { mali, mct, fimd, screen, target, fixed, lasting, frame, streams_for: None, vsync: true })
     }
 
     /// The screen, for the CPU to draw on beside the frames; uncached, so what is drawn shows.
+    ///
+    /// # Panics
+    ///
+    /// Without a screen: [`start_offscreen`](Self::start_offscreen).
     pub fn screen(&mut self) -> &mut Framebuffer {
-        &mut self.screen
+        self.screen.as_mut().expect("Gpu::start_offscreen has no screen")
+    }
+
+    /// Where frames are drawn.
+    pub fn target(&self) -> Target {
+        self.target
     }
 
     /// Whether [`frame`](Self::frame) waits for vsync first: on from the start. Off, frames come
@@ -314,6 +409,21 @@ impl Gpu {
         Ok(texture)
     }
 
+    /// Rewrites `texture`'s texels: the one at column `x`, line `y` from the top becomes
+    /// `texel(x, y)`, 0xAARRGGBB. The next frame samples them; frames run to their end in
+    /// [`Frame::show`], so none reads them meanwhile.
+    pub fn write_texture(&mut self, texture: &Texture, texel: impl Fn(usize, usize) -> u32) {
+        let (width, count) = (texture.width as usize, (texture.width * texture.height) as usize);
+        let address = texture.texels as usize;
+        // SAFETY: the texture's own texels, allocated by `texture_with`.
+        let memory = unsafe { memory::words(address, count) };
+        for (index, slot) in memory.iter_mut().enumerate() {
+            let [alpha, red, green, blue] = texel(index % width, index / width).to_be_bytes();
+            *slot = u32::from_le_bytes([red, green, blue, alpha]);
+        }
+        mmu::clean_dcache_range(address, count * 4);
+    }
+
     /// Samples `texture` by `filter` from the next frame on.
     pub fn set_filter(&mut self, texture: &Texture, filter: Filter) {
         let descriptor = mali::texture_rgba8888(texture.texels, texture.width, texture.height, filter);
@@ -333,10 +443,12 @@ impl Gpu {
     /// [`show`](Frame::show) it. What it holds lasts until the next frame starts.
     pub fn frame(&mut self, area: Area, clear: u32) -> Frame<'_> {
         let mut error = None;
-        if !area.is_good() {
+        if !area.is_good(&self.target) {
             error = Some(Error::BadArea);
-        } else if self.vsync && self.fimd.wait_vsync().is_err() {
-            error = Some(Error::Vsync);
+        } else if let Some(fimd) = self.fimd.as_ref().filter(|_| self.vsync) {
+            if fimd.wait_vsync().is_err() {
+                error = Some(Error::Vsync);
+            }
         }
         self.frame.reset();
         let (across, down) = area.tiles();
@@ -536,9 +648,10 @@ impl<'g> Frame<'g> {
         })?;
 
         let area = self.area;
-        let corner = gpu.screen.address() + (area.y * WIDTH + area.x) * 4;
+        let target = gpu.target;
+        let corner = target.address + area.y * target.stride + area.x * 4;
         let frame_state = fixed.frame_state.0.as_ptr() as usize;
-        let pp_frame = PpFrame::clear(area.width, area.height, self.clear, corner, gpu.screen.stride(), frame_state);
+        let pp_frame = PpFrame::clear(area.width, area.height, self.clear, corner, target.stride, frame_state);
         let pps = mct.count();
         for index in 0..mali::PP_COUNT {
             mali.start_pp(index, &pp_frame, fixed.streams[index].0.as_ptr() as u32).map_err(Error::Pp)?;
