@@ -1,10 +1,11 @@
 //! FIMD display controller, the board's panel and a framebuffer to draw in.
 //!
-//! This drives one full-screen window in 32-bit XRGB format, with the output going straight
-//! to the RGB pins. Waits for a vsync sleep until the frame interrupt, through the interrupt
-//! combiner ([`sleep::until`]), or poll if the MCT is not running. Not here: the other windows
-//! and the System MMU (off, so the FIMD reads physical addresses). The backlight's brightness
-//! is a PWM: [`set_brightness`].
+//! This drives a full-screen window 0 in 32-bit XRGB format, with the output going straight
+//! to the RGB pins, and windows 1-4 as overlays above it ([`Fimd::set_overlay`]): premultiplied
+//! ARGB8888 buffers placed anywhere, partly off-screen too, faded by a plane alpha. Waits for a
+//! vsync sleep until the frame interrupt, through the interrupt combiner ([`sleep::until`]), or
+//! poll if the MCT is not running. Not here: the System MMU (off, so the FIMD reads physical
+//! addresses). The backlight's brightness is a PWM: [`set_brightness`].
 //!
 //! Register offsets and fields are verified against Linux 5.15.198
 //! `include/video/samsung_fimd.h`, cited as `samsung_fimd.h:<line>`. `exynos_drm_fimd.c` is
@@ -53,33 +54,46 @@ register_structs! {
         /// samsung_fimd.h:234.
         (0x34 => shadowcon: ReadWrite<u32>),
         (0x38 => _reserved2),
-        /// samsung_fimd.h:243 `VIDOSD_BASE`, exynos_drm_fimd.c:43 `VIDOSD_A(0)`.
-        (0x40 => vidosd0a: ReadWrite<u32>),
-        /// exynos_drm_fimd.c:44 `VIDOSD_B(0)`.
-        (0x44 => vidosd0b: ReadWrite<u32>),
-        /// exynos_drm_fimd.c:46-49 `VIDOSD_C(0)`: the size in pixels, on window 0.
-        (0x48 => vidosd0c: ReadWrite<u32>),
-        (0x4C => _reserved3),
-        /// samsung_fimd.h:297 `VIDW_BUF_START(0)`.
-        (0xA0 => buf_start: ReadWrite<u32>),
-        (0xA4 => _reserved4),
-        /// samsung_fimd.h:300 `VIDW_BUF_END(0)`.
-        (0xD0 => buf_end: ReadWrite<u32>),
-        (0xD4 => _reserved5),
-        /// samsung_fimd.h:302 `VIDW_BUF_SIZE(0)`.
-        (0x100 => buf_size: ReadWrite<u32>),
-        (0x104 => _reserved6),
+        /// samsung_fimd.h:243 `VIDOSD_BASE`, exynos_drm_fimd.c:43-51 `VIDOSD_A..D(win)`: four
+        /// per window, index `win * 4 + OSD_*`. C is the size on window 0 and the plane alpha
+        /// on windows 1-4, D the size on windows 1-2.
+        (0x40 => vidosd: [ReadWrite<u32>; WINDOWS * 4]),
+        (0x90 => _reserved3),
+        /// samsung_fimd.h:297,299 `VIDW_BUF_START(win)`, `VIDW_BUF_START1(win)`: two per
+        /// window, index `win * 2` (the second buffer is not used).
+        (0xA0 => buf_start: [ReadWrite<u32>; WINDOWS * 2]),
+        (0xC8 => _reserved4),
+        /// samsung_fimd.h:300-301 `VIDW_BUF_END(win)`, as `buf_start`.
+        (0xD0 => buf_end: [ReadWrite<u32>; WINDOWS * 2]),
+        (0xF8 => _reserved5),
+        /// samsung_fimd.h:302 `VIDW_BUF_SIZE(win)`.
+        (0x100 => buf_size: [ReadWrite<u32>; WINDOWS]),
+        (0x114 => _reserved6),
         /// samsung_fimd.h:318.
         (0x130 => vidintcon0: ReadWrite<u32>),
         /// samsung_fimd.h:363: pending interrupts, cleared by writing 1.
         (0x134 => vidintcon1: ReadWrite<u32>),
         (0x138 => _reserved6b),
+        /// exynos_drm_fimd.c:65-68 `WKEYCON0_BASE(win)`, `WKEYCON1_BASE(win)`: the colour key
+        /// of windows 1-4, index `(win - 1) * 2` (control) and `+ 1` (value).
+        (0x140 => wkeycon: [ReadWrite<u32>; (WINDOWS - 1) * 2]),
+        (0x160 => _reserved6c),
         /// samsung_fimd.h:406 `WINxMAP(0)`.
         (0x180 => win0map: ReadWrite<u32>),
         (0x184 => _reserved7),
-        /// samsung_fimd.h:298 `VIDW_BUF_START_S(0)`: the address in use, from the shadow register.
-        (0x40A0 => buf_start_shadow: ReadOnly<u32>),
-        (0x40A4 => @END),
+        /// samsung_fimd.h:291, exynos_drm_fimd.c:53-54 `VIDWnALPHA0/1(win)`: the low nibble of
+        /// the 8-bit plane alpha, index `win * 2` (ALPHA0) and `+ 1` (ALPHA1).
+        (0x21C => vidw_alpha: [ReadWrite<u32>; WINDOWS * 2]),
+        /// samsung_fimd.h:439 `BLENDEQx(win)` of windows 1-4, index `win - 1`.
+        (0x244 => blendeq: [ReadWrite<u32>; WINDOWS - 1]),
+        (0x254 => _reserved8),
+        /// samsung_fimd.h:447.
+        (0x260 => blendcon: ReadWrite<u32>),
+        (0x264 => _reserved9),
+        /// samsung_fimd.h:298 `VIDW_BUF_START_S(win)`: the address in use, from the shadow
+        /// register, index `win * 2`.
+        (0x40A0 => buf_start_shadow: [ReadOnly<u32>; WINDOWS * 2]),
+        (0x40C8 => @END),
     }
 }
 
@@ -166,6 +180,37 @@ const SHADOWCON_CH0: u32 = 1 << 0;
 /// samsung_fimd.h:235 `SHADOWCON_WINx_PROTECT(0)`.
 const SHADOWCON_PROTECT0: u32 = 1 << 10;
 
+/// Index of each `VIDOSDx` register in a window's four of `Registers::vidosd`.
+const OSD_A: usize = 0;
+const OSD_B: usize = 1;
+const OSD_C: usize = 2;
+const OSD_D: usize = 3;
+/// samsung_fimd.h:243-266: the extension bits of `VIDOSDxA/B`, bit 11 of each coordinate.
+const OSD_X_E: u32 = 1 << 23;
+const OSD_Y_E: u32 = 1 << 22;
+/// samsung_fimd.h:269-277 `VIDISD14C_ALPHA0_R/G/B` (the high nibble of the plane alpha), and
+/// samsung_fimd.h:292-294 `VIDW_ALPHA_R/G/B` (the low nibble).
+const OSDC_ALPHA0_SHIFTS: [u32; 3] = [20, 16, 12];
+const VIDW_ALPHA_SHIFTS: [u32; 3] = [16, 8, 0];
+/// samsung_fimd.h:229 `WINCON1_BPPMODE_25BPP_A1888`: ARGB8888 on windows 1-4.
+const WINCON_BPP_A888: u32 = 0xD << 2;
+/// samsung_fimd.h:231,213,212: alpha from the pixels' `DATA[31:24]`, multiplied by the plane
+/// alpha. exynos_drm_fimd.c:621-626 for premultiplied buffers.
+const WINCON_ALPHA_SEL: u32 = 1 << 1;
+const WINCON_BLD_PIX: u32 = 1 << 6;
+const WINCON_ALPHA_MUL: u32 = 1 << 7;
+/// samsung_fimd.h:192 `WINCONx_BURSTLEN_4WORD`: exynos_drm_fimd.c:40,694-697 use it for windows
+/// narrower than 128 pixels, as 16-word bursts tear on them.
+const WINCON_BURST_4: u32 = 2 << 9;
+const MIN_WIDTH_FOR_BURST_16: usize = 128;
+/// samsung_fimd.h:440-446: `BLENDEQ` factors, A for the window's colour, B for what is below.
+const BLENDEQ_ONE: u32 = 0x1;
+const BLENDEQ_ONE_MINUS_ALPHA_A: u32 = 0x3;
+const BLENDEQ_ALPHA0: u32 = 0x6;
+const BLENDEQ_B_SHIFT: u32 = 6;
+/// samsung_fimd.h:449 `BLENDCON_NEW_8BIT_ALPHA_VALUE`.
+const BLENDCON_8BIT: u32 = 1 << 0;
+
 /// samsung_fimd.h:308 `VIDW_BUF_SIZE_OFFSET`: bytes between lines.
 const BUF_SIZE_OFFSET_SHIFT: u32 = 13;
 
@@ -213,8 +258,11 @@ pub enum Error {
     UnknownClock,
     /// The pixel clock is out of reach from this rate of `sclk_fimd0`.
     BadClock(u32),
-    /// The framebuffer is not the size of the panel, or the panel is too large.
+    /// The framebuffer is not the size of the panel, or the panel is too large; or an overlay's
+    /// buffer is misaligned, its stride too small for its width, or it is too large.
     BadSize,
+    /// Not an overlay window: windows 1-4 are.
+    BadWindow,
     /// The FIMD never reached vsync.
     NoVsync,
 }
@@ -509,6 +557,28 @@ fn wait_writes() {
     unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
 }
 
+/// An overlay window's picture and place: see [`Fimd::set_overlay`].
+///
+/// The buffer holds premultiplied ARGB8888 pixels (`0xAARRGGBB` words, each colour channel
+/// already multiplied by the alpha), `width` x `height` of them, lines `stride` bytes apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Overlay {
+    /// Physical address of the top-left pixel, a multiple of 4.
+    pub address: usize,
+    /// Bytes from one line to the next, a multiple of 4, at least `width * 4`.
+    pub stride: usize,
+    /// Width of the picture in pixels.
+    pub width: usize,
+    /// Height of the picture in pixels.
+    pub height: usize,
+    /// Screen column of its left edge; the part left of or past the screen is cut off.
+    pub x: i32,
+    /// Screen line of its top edge, as `x`.
+    pub y: i32,
+    /// Plane alpha, multiplied into every pixel's: 255 = as the pixels say, 0 = invisible.
+    pub alpha: u8,
+}
+
 /// Registers as found, for reports. See [`Fimd::registers`].
 #[derive(Clone, Copy, Debug)]
 pub struct RegisterDump {
@@ -580,8 +650,8 @@ impl Fimd {
             vidtcon2: regs.vidtcon2.get(),
             wincon0: regs.wincon[0].get(),
             shadowcon: regs.shadowcon.get(),
-            buf_start: regs.buf_start.get(),
-            buf_start_shadow: regs.buf_start_shadow.get(),
+            buf_start: regs.buf_start[0].get(),
+            buf_start_shadow: regs.buf_start_shadow[0].get(),
         })
     }
 
@@ -677,15 +747,15 @@ impl Fimd {
             wincon.set(wincon.get() & !WINCON_ENWIN);
         }
         regs.wincon[0].set(WINCON_ENWIN | WINCON_BPP_888 | WINCON_WSWP | WINCON_BURST_16);
-        regs.vidosd0a.set(0);
-        regs.vidosd0b.set(last_x << SIZE_HIGH_SHIFT | last_y);
-        regs.vidosd0c.set((timing.width * timing.height) as u32);
+        regs.vidosd[OSD_A].set(0);
+        regs.vidosd[OSD_B].set(last_x << SIZE_HIGH_SHIFT | last_y);
+        regs.vidosd[OSD_C].set((timing.width * timing.height) as u32);
 
         let start = framebuffer.address() as u32;
         let line = framebuffer.stride() as u32;
-        regs.buf_start.set(start);
-        regs.buf_end.set(start + line * timing.height as u32);
-        regs.buf_size.set(0 << BUF_SIZE_OFFSET_SHIFT | line);
+        regs.buf_start[0].set(start);
+        regs.buf_end[0].set(start + line * timing.height as u32);
+        regs.buf_size[0].set(0 << BUF_SIZE_OFFSET_SHIFT | line);
         regs.win0map.set(0);
 
         regs.shadowcon.set(SHADOWCON_CH0);
@@ -714,12 +784,12 @@ impl Fimd {
         let regs = self.regs();
         let start = framebuffer.address() as u32;
         let len = (framebuffer.stride() * framebuffer.height()) as u32;
-        if regs.buf_end.get().wrapping_sub(regs.buf_start.get()) != len {
+        if regs.buf_end[0].get().wrapping_sub(regs.buf_start[0].get()) != len {
             return Err(Error::BadSize);
         }
         regs.shadowcon.set(regs.shadowcon.get() | SHADOWCON_PROTECT0);
-        regs.buf_start.set(start);
-        regs.buf_end.set(start + len);
+        regs.buf_start[0].set(start);
+        regs.buf_end[0].set(start + len);
         regs.shadowcon.set(regs.shadowcon.get() & !SHADOWCON_PROTECT0);
         Ok(())
     }
@@ -774,7 +844,116 @@ impl Fimd {
     /// The buffer address the FIMD is using, as opposed to the one programmed: a difference
     /// means the settings have not applied.
     pub fn scan_address(&self) -> u32 {
-        self.regs().buf_start_shadow.get()
+        self.regs().buf_start_shadow[0].get()
+    }
+
+    /// The same for an overlay window: the start address in use, which differs from the one
+    /// programmed until a [`set_overlay`](Self::set_overlay) has applied. 0 for a bad window.
+    pub fn overlay_scan_address(&self, window: usize) -> u32 {
+        if window == 0 || window >= WINDOWS {
+            return 0;
+        }
+        self.regs().buf_start_shadow[window * 2].get()
+    }
+
+    /// Shows `overlay` in `window` (1-4) above window 0 and the lower windows, from the next
+    /// vsync; `None` hides the window. All its registers apply together: the window's shadow
+    /// update is held off while they are written (exynos_drm_fimd.c:745-768,
+    /// `fimd_shadow_protect_win`; the writes follow `fimd_update_plane`, :785-873). Returns at
+    /// once; [`overlay_scan_address`](Self::overlay_scan_address) tells when it applied.
+    ///
+    /// The part of the overlay outside the screen is cut off; an overlay entirely outside is
+    /// hidden. [`start`](Self::start) must have run. The buffer's cached lines are not cleaned
+    /// here.
+    pub fn set_overlay(&self, window: usize, overlay: Option<&Overlay>) -> Result<(), Error> {
+        if window == 0 || window >= WINDOWS {
+            return Err(Error::BadWindow);
+        }
+        if let Some(o) = overlay {
+            if o.address % 4 != 0
+                || o.stride % 4 != 0
+                || o.width > MAX_SIZE
+                || o.height > MAX_SIZE
+                || o.stride < o.width * 4
+                || o.stride - o.width * 4 > 0x3FFF
+            {
+                return Err(Error::BadSize);
+            }
+        }
+        let regs = self.regs();
+        let screen = regs.vidtcon2.get();
+        let screen_w = ((screen & 0x7FF) + 1) as i32;
+        let screen_h = (((screen >> SIZE_HIGH_SHIFT) & 0x7FF) + 1) as i32;
+        // The visible part, on the screen.
+        let shown = overlay.and_then(|o| {
+            let x0 = o.x.max(0);
+            let y0 = o.y.max(0);
+            let x1 = (o.x + o.width as i32).min(screen_w);
+            let y1 = (o.y + o.height as i32).min(screen_h);
+            (x1 > x0 && y1 > y0).then(|| (o, x0, y0, (x1 - x0) as usize, (y1 - y0) as usize))
+        });
+        let protect = SHADOWCON_PROTECT0 << window;
+        let channel = SHADOWCON_CH0 << window;
+        regs.shadowcon.set(regs.shadowcon.get() | protect);
+        let Some((o, x, y, w, h)) = shown else {
+            regs.wincon[window].set(regs.wincon[window].get() & !WINCON_ENWIN);
+            regs.shadowcon.set(regs.shadowcon.get() & !(channel | protect));
+            return Ok(());
+        };
+        let skip_x = (x - o.x) as usize;
+        let skip_y = (y - o.y) as usize;
+        let start = (o.address + skip_y * o.stride + skip_x * 4) as u32;
+        let line = (w * 4) as u32;
+        let gap = o.stride as u32 - line;
+        regs.buf_start[window * 2].set(start);
+        regs.buf_end[window * 2].set(start + o.stride as u32 * h as u32);
+        // samsung_fimd.h:304-314: 13 bits each, bit 13 in an extension bit.
+        regs.buf_size[window].set(
+            (gap & 0x1FFF) << BUF_SIZE_OFFSET_SHIFT
+                | (gap >> 13 & 1) << 27
+                | (line & 0x1FFF)
+                | (line >> 13 & 1) << 26,
+        );
+        let corner = |x: u32, y: u32| {
+            let mut v = (x & 0x7FF) << SIZE_HIGH_SHIFT | (y & 0x7FF);
+            if x & 0x800 != 0 {
+                v |= OSD_X_E;
+            }
+            if y & 0x800 != 0 {
+                v |= OSD_Y_E;
+            }
+            v
+        };
+        let osd = window * 4;
+        regs.vidosd[osd + OSD_A].set(corner(x as u32, y as u32));
+        regs.vidosd[osd + OSD_B].set(corner((x as usize + w - 1) as u32, (y as usize + h - 1) as u32));
+        let (high, low) = (u32::from(o.alpha >> 4), u32::from(o.alpha & 0xF));
+        regs.vidosd[osd + OSD_C].set(OSDC_ALPHA0_SHIFTS.iter().fold(0, |a, s| a | high << s));
+        regs.vidw_alpha[window * 2].set(VIDW_ALPHA_SHIFTS.iter().fold(0, |a, s| a | low << s));
+        regs.vidw_alpha[window * 2 + 1].set(0);
+        if window <= 2 {
+            regs.vidosd[osd + OSD_D].set((w * h) as u32);
+        }
+        // Premultiplied: colour x (1, or the plane alpha) + below x (1 - pixel alpha x plane
+        // alpha), exynos_drm_fimd.c:592-602; the vendor kernel writes 0xc1 for premultiplied
+        // windows (`willow` `drivers/video/samsung/s3cfb_fimd6x.c:772`).
+        let a = if o.alpha == 255 { BLENDEQ_ONE } else { BLENDEQ_ALPHA0 };
+        regs.blendeq[window - 1].set(a | BLENDEQ_ONE_MINUS_ALPHA_A << BLENDEQ_B_SHIFT);
+        regs.blendcon.set(regs.blendcon.get() | BLENDCON_8BIT);
+        // No colour key (exynos_drm_fimd.c:713-724 turns it off the same way).
+        regs.wkeycon[(window - 1) * 2].set(0);
+        let burst = if w < MIN_WIDTH_FOR_BURST_16 { WINCON_BURST_4 } else { WINCON_BURST_16 };
+        regs.wincon[window].set(
+            WINCON_ENWIN
+                | WINCON_BPP_A888
+                | WINCON_WSWP
+                | burst
+                | WINCON_ALPHA_SEL
+                | WINCON_BLD_PIX
+                | WINCON_ALPHA_MUL,
+        );
+        regs.shadowcon.set((regs.shadowcon.get() | channel) & !protect);
+        Ok(())
     }
 
     /// Waits for the next start of vsync.
