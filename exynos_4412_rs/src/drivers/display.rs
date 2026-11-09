@@ -787,11 +787,34 @@ impl Fimd {
         if regs.buf_end[0].get().wrapping_sub(regs.buf_start[0].get()) != len {
             return Err(Error::BadSize);
         }
+        // Held by `hold_updates`: applies at its `release_updates`.
+        let held = regs.shadowcon.get() & SHADOWCON_PROTECT0 != 0;
         regs.shadowcon.set(regs.shadowcon.get() | SHADOWCON_PROTECT0);
         regs.buf_start[0].set(start);
         regs.buf_end[0].set(start + len);
-        regs.shadowcon.set(regs.shadowcon.get() & !SHADOWCON_PROTECT0);
+        if !held {
+            regs.shadowcon.set(regs.shadowcon.get() & !SHADOWCON_PROTECT0);
+        }
         Ok(())
+    }
+
+    /// Holds off the shadow update of the windows in `windows` (bit n = window n): what
+    /// [`show`](Self::show) and [`set_overlay`](Self::set_overlay) write for them meanwhile is
+    /// kept back, and [`release_updates`](Self::release_updates) lets it all apply together, at
+    /// the first vsync after it. For a page flip of window 0 that must appear in the same frame
+    /// as an overlay change. Callers keep other writers of `SHADOWCON` (an interrupt that flips)
+    /// out in between.
+    pub fn hold_updates(&self, windows: u32) {
+        let regs = self.regs();
+        let mask = windows & ((1 << WINDOWS) - 1);
+        regs.shadowcon.set(regs.shadowcon.get() | mask * SHADOWCON_PROTECT0);
+    }
+
+    /// Ends a [`hold_updates`](Self::hold_updates) of `windows`.
+    pub fn release_updates(&self, windows: u32) {
+        let regs = self.regs();
+        let mask = windows & ((1 << WINDOWS) - 1);
+        regs.shadowcon.set(regs.shadowcon.get() & !(mask * SHADOWCON_PROTECT0));
     }
 
     /// Waits until the FIMD scans `framebuffer`: see [`show`](Self::show). Asleep until each
@@ -894,10 +917,12 @@ impl Fimd {
         });
         let protect = SHADOWCON_PROTECT0 << window;
         let channel = SHADOWCON_CH0 << window;
+        // Held by `hold_updates`: applies at its `release_updates`.
+        let release = if regs.shadowcon.get() & protect != 0 { 0 } else { protect };
         regs.shadowcon.set(regs.shadowcon.get() | protect);
         let Some((o, x, y, w, h)) = shown else {
             regs.wincon[window].set(regs.wincon[window].get() & !WINCON_ENWIN);
-            regs.shadowcon.set(regs.shadowcon.get() & !(channel | protect));
+            regs.shadowcon.set(regs.shadowcon.get() & !(channel | release));
             return Ok(());
         };
         let skip_x = (x - o.x) as usize;
@@ -952,7 +977,7 @@ impl Fimd {
                 | WINCON_BLD_PIX
                 | WINCON_ALPHA_MUL,
         );
-        regs.shadowcon.set((regs.shadowcon.get() | channel) & !protect);
+        regs.shadowcon.set((regs.shadowcon.get() | channel) & !release);
         Ok(())
     }
 
