@@ -11,7 +11,7 @@
 //! | `0x0000_0000..0x0010_0000` | fault | catches null pointers |
 //! | `0x0010_0000..DRAM` | Device, execute-never | SYSRAM and peripherals; never speculated |
 //! | DRAM | Normal, write-back write-allocate, Shareable | [`soc::DRAM_BASE`] |
-//! | `0xC000_0000`, 16 MiB | Normal, non-cacheable, execute-never | [`DRAM_UNCACHED`]: the start of DRAM again, to see what DRAM holds |
+//! | `0xC000_0000`, 1 GiB | Normal, non-cacheable, execute-never | [`DRAM_UNCACHED`]: the start of DRAM again, to see what DRAM holds |
 //! | rest above DRAM | fault | not ours: speculative accesses must not reach it |
 //!
 //! # After [`enable`]
@@ -50,11 +50,12 @@ const TABLE_ENTRIES: usize = 4096;
 /// view also uses: the two views of one line disagree by design, and a dirty line would later be
 /// written back over the write. Clean and drop the cached lines first, and leave them unwritten.
 pub const DRAM_UNCACHED: usize = 0xC000_0000;
-/// How much of DRAM it covers, from [`soc::DRAM_BASE`]: the applications' images, `.bss` and
-/// stacks are all there.
-pub const DRAM_UNCACHED_SIZE: usize = 16 << 20;
+/// How much of DRAM it covers, from [`soc::DRAM_BASE`]: the applications' images, `.bss`,
+/// stacks and heaps are all there. Up to the top of the address space.
+pub const DRAM_UNCACHED_SIZE: usize = 1 << 30;
 
 const _: () = assert!(DRAM_UNCACHED >= soc::DRAM_BASE + soc::DRAM_SIZE && DRAM_UNCACHED_SIZE <= soc::DRAM_SIZE);
+const _: () = assert!(DRAM_UNCACHED as u64 + DRAM_UNCACHED_SIZE as u64 <= 1 << 32);
 
 /// Whether [`enable`] has turned the MMU on, and with it [`DRAM_UNCACHED`].
 pub fn is_enabled() -> bool {
