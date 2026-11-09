@@ -156,6 +156,14 @@ pub const FIMC_BASE: [usize; 4] = [0x1180_0000, 0x1181_0000, 0x1182_0000, 0x1183
 pub const FIMC_IRQ: [u16; 4] = [32 + 84, 32 + 85, 32 + 86, 32 + 87];
 /// `exynos4.dtsi:143-147`, `pd_cam`: the FIMCs' power domain.
 pub const PD_CAM_BASE: usize = 0x1002_3C00;
+/// `exynos4.dtsi:135-141`, `pd_tv`: the HDMI's and the mixer's power domain.
+pub const PD_TV_BASE: usize = 0x1002_3C20;
+/// `exynos4412.dtsi:226-231`, `pd_isp`: FIMC-IS's power domain.
+pub const PD_ISP_BASE: usize = 0x1002_3CA0;
+/// `exynos4.dtsi:150-155`, `pd_gps`.
+pub const PD_GPS_BASE: usize = 0x1002_3CE0;
+/// `exynos4.dtsi:157-162`, `pd_gps_alive`.
+pub const PD_GPS_ALIVE_BASE: usize = 0x1002_3D00;
 
 /// eMMC controller, `mshc_0`. Verified: `exynos4412.dtsi:307-309`, node `mshc_0: mmc@12550000`,
 /// and `exynos4412-mehmet.dts:1399-1414` has the eMMC on it.

@@ -31,6 +31,7 @@
 use core::ptr;
 
 use crate::drivers::cmu::Cmu;
+use crate::drivers::pd::Domain;
 use crate::mmu;
 use crate::drivers::timer::Mct;
 use crate::soc;
@@ -150,10 +151,6 @@ const ENTRIES: usize = 1024;
 const MMU_DTE_PROBE: u32 = 0xCAFE_BABE;
 const MMU_DTE_PROBE_READ: u32 = 0xCAFE_B000;
 
-/// `LOCAL_PWR_CFG`, both in the configuration and in the status of a domain, as for the FIMD's.
-const DOMAIN_ON: u32 = 7;
-const DOMAIN_STATUS: usize = 0x04;
-
 /// Longest wait for anything here.
 const TIMEOUT_US: u64 = 10_000;
 const COUNTS_PER_US: u64 = soc::MCT_CLOCK_HZ as u64 / 1_000_000;
@@ -218,8 +215,7 @@ pub enum Block {
 
 /// Raw status of the GPU's power domain.
 pub fn power_domain_status() -> u32 {
-    // SAFETY: this register of the PMU is device memory that stays mapped for the whole program.
-    unsafe { ptr::read_volatile((soc::PD_G3D_BASE + DOMAIN_STATUS) as *const u32) }
+    Domain::G3d.status()
 }
 
 /// What the GPU's blocks say they are.
@@ -282,24 +278,14 @@ impl Mali {
 
     /// Whether the GPU's registers can be touched: domain on and gate open.
     pub fn is_accessible(&self) -> bool {
-        power_domain_status() & DOMAIN_ON == DOMAIN_ON && Cmu::new().g3d_clocks().gate_open()
+        Domain::G3d.is_on() && Cmu::new().g3d_clocks().gate_open()
     }
 
     /// Turns on the power domain and the clock gate, and runs the core clock at the highest rate
     /// not above `hz` from the MPLL. Returns the rate. The supply must be up to that rate's
     /// voltage: see the [module documentation](self).
     pub fn power_on(&self, hz: u32, mct: Mct) -> Result<u32, Error> {
-        if power_domain_status() & DOMAIN_ON != DOMAIN_ON {
-            // SAFETY: as in `power_domain_status`, the configuration register before it. Nothing
-            // uses this domain while it is off.
-            unsafe { ptr::write_volatile(soc::PD_G3D_BASE as *mut u32, DOMAIN_ON) };
-            let begin = mct.count();
-            while power_domain_status() & DOMAIN_ON != DOMAIN_ON {
-                if mct.count() - begin > TIMEOUT_US * COUNTS_PER_US {
-                    return Err(Error::PowerDomain(power_domain_status()));
-                }
-            }
-        }
+        Domain::G3d.power_on(mct).map_err(|_| Error::PowerDomain(power_domain_status()))?;
         let cmu = Cmu::new();
         cmu.open_g3d_gate();
         Ok(cmu.set_g3d_clock(hz))

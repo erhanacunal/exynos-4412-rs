@@ -18,6 +18,7 @@ pub mod max8903;
 pub mod mfc;
 pub mod mxt;
 pub mod otg;
+pub mod pd;
 pub mod pl330;
 pub mod mmc;
 pub mod power;

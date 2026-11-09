@@ -31,6 +31,7 @@ use tock_registers::registers::{ReadOnly, ReadWrite};
 
 use super::cmu::Cmu;
 use super::gpio::{self, Drive, Function, Pin, Pull};
+use super::pd::Domain;
 use super::pwm;
 use super::timer::Mct;
 use crate::{cpu, mmu, sleep, soc};
@@ -222,12 +223,6 @@ const WINMAP_ENABLE: u32 = 1 << 24;
 const LCDBLK_CFG: usize = 0x210;
 /// exynos_drm_fimd.c:138 `lcdblk_bypass_shift`: the FIMD output skips the image enhancer.
 const LCDBLK_FIMD_BYPASS: u32 = 1 << 1;
-
-/// What to write to the domain to turn it on, and what its status reads then: pm_domains.c:46-52,
-/// with `exynos4210_cfg` (pm_domains.c:76-78) for `samsung,exynos4210-pd` (pm_domains.c:86-87).
-const DOMAIN_ON: u32 = 0x7;
-/// pm_domains.c:52, status at `base + 4`.
-const DOMAIN_STATUS: usize = 4;
 
 /// Turns a stuck power domain or a stopped scan into an error instead of a hang.
 const POLL_LIMIT: u32 = 10_000_000;
@@ -604,13 +599,13 @@ pub struct RegisterDump {
 
 /// Raw status of the FIMD's power domain.
 pub fn power_domain_status() -> u32 {
-    // SAFETY: this register of the PMU is device memory that stays mapped for the whole program.
-    unsafe { ptr::read_volatile((soc::PD_LCD0_BASE + DOMAIN_STATUS) as *const u32) }
+    Domain::Lcd0.status()
 }
 
 /// Raw `LCDBLK_CFG` system register.
 pub fn lcdblk_cfg() -> u32 {
-    // SAFETY: as in `power_domain_status`, for the system registers.
+    // SAFETY: a system register, device memory that stays mapped for the whole program. Reading
+    // it has no side effects.
     unsafe { ptr::read_volatile((soc::SYSREG_BASE + LCDBLK_CFG) as *const u32) }
 }
 
@@ -633,7 +628,7 @@ impl Fimd {
 
     /// Whether the FIMD's registers can be touched: domain on and register clock running.
     pub fn is_accessible(&self) -> bool {
-        power_domain_status() & DOMAIN_ON == DOMAIN_ON && Cmu::new().fimd_clocks().bus_clock_on()
+        Domain::Lcd0.is_on() && Cmu::new().fimd_clocks().bus_clock_on()
     }
 
     /// The registers as they are now. `None` if they cannot be read at this point.
@@ -658,19 +653,7 @@ impl Fimd {
     /// Turns on the power domain and the clocks, and leaves the FIMD stopped, whatever the
     /// bootloader had it doing.
     pub fn power_on(&self) -> Result<(), Error> {
-        if power_domain_status() & DOMAIN_ON != DOMAIN_ON {
-            // SAFETY: as in `power_domain_status`. Nothing uses this domain at this point.
-            unsafe {
-                ptr::write_volatile(soc::PD_LCD0_BASE as *mut u32, DOMAIN_ON);
-            }
-            let mut polls = 0;
-            while power_domain_status() & DOMAIN_ON != DOMAIN_ON {
-                polls += 1;
-                if polls == POLL_LIMIT {
-                    return Err(Error::PowerDomain(power_domain_status()));
-                }
-            }
-        }
+        Domain::Lcd0.power_on(Mct::new()).map_err(|_| Error::PowerDomain(power_domain_status()))?;
         let cmu = Cmu::new();
         cmu.open_fimd_gates();
         self.stop();

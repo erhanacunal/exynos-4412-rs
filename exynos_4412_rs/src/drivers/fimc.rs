@@ -13,6 +13,7 @@
 use core::ptr;
 
 use crate::drivers::cmu::Cmu;
+use crate::drivers::pd::Domain;
 use crate::drivers::timer::Mct;
 use crate::{sleep, soc};
 
@@ -111,11 +112,7 @@ const CIDMAPARAM_TILE_MASK: u32 = 3 << 29 | 3 << 13;
 // fimc-reg.h:278.
 const CIFCNTSEQ: usize = 0x1FC;
 
-/// The power domain's status register reads 7 when on, as the others of the PMU.
-const DOMAIN_ON: u32 = 7;
-const DOMAIN_STATUS: usize = 0x04;
 const COUNTS_PER_US: u64 = soc::MCT_CLOCK_HZ as u64 / 1_000_000;
-const DOMAIN_TIMEOUT_US: u64 = 10_000;
 /// `fimc_hw_reset` (`fimc-reg.c:31`): the reset is held this long.
 const RESET_US: u64 = 10;
 
@@ -211,8 +208,7 @@ pub struct Fimc {
 
 /// Raw status of the camera power domain.
 pub fn power_domain_status() -> u32 {
-    // SAFETY: this register of the PMU is device memory that stays mapped for the whole program.
-    unsafe { ptr::read_volatile((soc::PD_CAM_BASE + DOMAIN_STATUS) as *const u32) }
+    Domain::Cam.status()
 }
 
 /// The ratio and its shift for the pre-scaler, `fimc_get_scaler_factor` (`fimc-core.c:207`): the
@@ -254,17 +250,7 @@ impl Fimc {
     /// Turns the camera power domain on if it is off, opens the gates, runs `sclk_fimc` at the
     /// highest rate not above `hz` ([`DEFAULT_HZ`]) and resets the FIMC. Returns the rate.
     pub fn power_on(&self, hz: u32, mct: Mct) -> Result<u32, Error> {
-        if power_domain_status() & DOMAIN_ON != DOMAIN_ON {
-            // SAFETY: as in `power_domain_status`, the configuration register before it. Nothing
-            // uses this domain while it is off.
-            unsafe { ptr::write_volatile(soc::PD_CAM_BASE as *mut u32, DOMAIN_ON) };
-            let begin = mct.count();
-            while power_domain_status() & DOMAIN_ON != DOMAIN_ON {
-                if mct.count() - begin > DOMAIN_TIMEOUT_US * COUNTS_PER_US {
-                    return Err(Error::PowerDomain(power_domain_status()));
-                }
-            }
-        }
+        Domain::Cam.power_on(mct).map_err(|_| Error::PowerDomain(power_domain_status()))?;
         let cmu = Cmu::new();
         cmu.open_fimc_gates(self.index);
         let rate = cmu.set_fimc_clock(self.index, hz);

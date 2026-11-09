@@ -45,6 +45,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `standby_test/`: light standby on the power key: screen off, CPU at 200 MHz and 0.9 V, asleep until the next press
 - `power_test/`: restart, restart into fastboot, power off, and the same from the keys
 - `tmu_test/`: the chip's temperature from the TMU, every second, with the CPU clock changed from the UART
+- `pd_test/`: the PMU's power domains: each one turned on and off and timed, the GPU checked across a cut of its domain
 - `battery_test/`: MAX17040 fuel gauge: the battery's voltage and charge every 5 s, beside the charger's state
 - `charger_test/`: MAX8903 charger: input power, charging and fault pins, charging enabled and disabled from the UART
 - `usb_host_test/`: USB host: a flash drive through an OTG adapter, enumerated, its partition table, read speed and FAT root directory
@@ -1021,6 +1022,37 @@ prints the registers. First run on the board:
 | CPU0 polling at 1000 MHz | 47 °C at first, then 48 °C (code 74) |
 
 Not yet checked: the temperature following the CPU clock.
+
+## Power domains
+
+`drivers::pd` turns the PMU's power domains on and off: CAM, TV, MFC, G3D, LCD0, ISP, GPS and GPS
+alive, with the registers of `exynos4.dtsi` and `exynos4412.dtsi` and the sequence of Linux's
+`pm_domains.c`: write 7 or 0, wait for the status to match. TV is powered through LCD0, so
+`Domain::Tv.power_on` turns LCD0 on first and `Domain::Lcd0.power_off` is refused while TV is on.
+There is no reference count: the application decides what is on. The GPU, MFC, FIMC and FIMD
+drivers turn their domains on through it.
+
+A domain that is turned off loses its blocks' registers. Touching them then may stop the bus, so
+each driver's `is_accessible` checks the domain, and its `power_on` has to run again.
+
+`pd_test` on the board: `make img APP=pd_test`. It prints every domain as U-Boot left it, reads the
+GPU's identity, cuts G3D, checks that the GPU is not accessible, turns it on and reads the identity
+again, then turns every other domain but LCD0 on and off, timing each step, and checks that LCD0
+cannot be cut under TV. It leaves only LCD0 on; `l` turns LCD0 off or on, `r` prints the domains.
+First run on the board, `PASS`:
+
+| Check | Result |
+|---|---|
+| From U-Boot | All eight domains on: configuration 7, status `0x60007` |
+| GPU across a cut of G3D | Same identity before and after (`0x0b070101` Mali-400 r1p1); not accessible while off |
+| Off | 173-174 µs for every domain; status `0x110000`, G3D `0x100000` |
+| On | 347-349 µs; G3D 176 µs; status `0x60007` |
+| LCD0 under TV | Refused with TV on, `ChildOn(Tv)` |
+| `l` | LCD0 off in 174 µs, nothing else touched it |
+
+The bits above the low three of the status are not described in Linux; only the low three are
+checked. The steps take whole multiples of about 174 µs, so the PMU seems to step the sequence on a
+slow clock.
 
 ## eMMC
 
