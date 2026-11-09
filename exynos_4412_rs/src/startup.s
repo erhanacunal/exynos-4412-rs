@@ -249,6 +249,63 @@ __exynos_secondary_entry:
     b       __exynos_halt
 .size __exynos_secondary_entry, . - __exynos_secondary_entry
 
+@ The end of `smp::stop_this_cpu`, with IRQ and FIQ masked: r0 is this core's
+@ ARM_CORE_CONFIGURATION in the PMU. Leaves coherency as Linux 5.15.198 does,
+@ arch/arm/include/asm/cacheflush.h:453-469 v7_exit_coherency_flush(louis): D-cache off,
+@ then L1 cleaned and invalidated, then ACTLR.SMP clear. No stack from here on: the
+@ cache is off, and whatever this core has in it must reach memory before power goes.
+@ Then arch/arm/mach-exynos/platsmp.c:49-77: power off at the next WFI. The PMU cuts
+@ power while the core waits; until then, it only wakes. If CPU0 asks for power again,
+@ the configuration reads LOCAL_PWR_EN and this core starts again as a woken one does,
+@ with no reset.
+.global __exynos_cpu_die
+.type __exynos_cpu_die, %function
+__exynos_cpu_die:
+    mov     r11, r0
+
+    mrc     p15, 0, r0, c1, c0, 0           @ SCTLR
+    bic     r0, r0, #SCTLR_C
+    mcr     p15, 0, r0, c1, c0, 0
+    isb
+
+    @ Clean and invalidate the whole L1 data cache by set and way, DCCISW, with the loop
+    @ of __exynos_mmu_on.
+    mov     r0, #0
+    mcr     p15, 2, r0, c0, c0, 0           @ CSSELR: L1 data
+    isb
+    mrc     p15, 1, r0, c0, c0, 0           @ CCSIDR
+    and     r1, r0, #7
+    add     r1, r1, #4                      @ r1 = set shift
+    ubfx    r2, r0, #3, #10                 @ r2 = way, counting down
+    ubfx    r3, r0, #13, #15                @ r3 = highest set
+    clz     r4, r2                          @ r4 = way shift
+1:  mov     r5, r3
+2:  lsl     r12, r2, r4
+    orr     r12, r12, r5, lsl r1
+    mcr     p15, 0, r12, c7, c14, 2         @ DCCISW
+    subs    r5, r5, #1
+    bpl     2b
+    subs    r2, r2, #1
+    bpl     1b
+    dsb
+
+    mrc     p15, 0, r0, c1, c0, 1           @ ACTLR
+    bic     r0, r0, #ACTLR_SMP
+    mcr     p15, 0, r0, c1, c0, 1
+    isb
+    dsb
+
+    mov     r0, #0
+    str     r0, [r11]                       @ LOCAL_PWR_EN off: power down at WFI
+    dsb
+3:  wfi
+    ldr     r0, [r11]
+    and     r0, r0, #3
+    cmp     r0, #3
+    bne     3b
+    b       __exynos_secondary_entry
+.size __exynos_cpu_die, . - __exynos_cpu_die
+
 __exynos_secondary_no_vfp:
     BOOT_MARKER 'V'
     b       __exynos_halt

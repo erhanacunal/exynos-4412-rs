@@ -11,6 +11,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `mmu_test/`: MMU and cache test
 - `l2_test/`: L2 cache test and MCT rate measurement
 - `smp_test/`: CPU1-3 bring-up, inter-core memory and SGI tests, L2 latency measurement
+- `hotplug_test/`: CPU1-3 stopped and started again 100 times, with data left dirty in their caches checked after each power cut
 - `timer_test/`: per-core MCT local timer test
 - `display_test/`: panel bring-up with FIMD: state report, scan checks, test patterns
 - `touch_test/`: mXT1664S touch controller: object table, touches drawn on the panel, five-point calibration
@@ -479,6 +480,34 @@ that other cores also write. On the board, in three attempts out of three, the o
 that line stopped without reporting an error. The same loop on a line nobody else touches caused no
 problem for 40 s and kept taking interrupts. A loop that pauses once every 1 million writes on the shared
 line also caused no problem. The cause is unknown and has not been matched to a published erratum.
+
+### Stopping a core (hotplug)
+
+A started core stops itself with `smp::stop_this_cpu()`, as Linux's `exynos_cpu_die` does: IRQ
+and FIQ masked, its PPIs disabled, its MCT local timer stopped, whatever was still pending at the
+GIC dropped (a pending interrupt ends every `wfi` at once, so the PMU would never cut the power),
+`USE_DELAYED_RESET_ASSERTION` set in its `ARM_CORE_OPTION` as Linux does for every Exynos4 core.
+Then `__exynos_cpu_die` in `startup.s`, with no stack: D-cache off, L1 cleaned and invalidated by
+set and way, `ACTLR.SMP` clear (`v7_exit_coherency_flush`), 0 in `ARM_CORE_CONFIGURATION`, and
+`wfi` until the PMU cuts the power. CPU0 waits for that with `smp::wait_offline`, and
+`smp::start_cpu` starts the core again, at any function: it comes back through the firmware's pen
+with fresh stacks. If the power never went, the core sees `LOCAL_PWR_EN` in its configuration
+again and restarts without a reset, as Linux's `pen_release` check does.
+
+`hotplug_test` on the board, 100 rounds of CPU1-3 each filling 16 KiB with a pattern and stopping,
+`PASS`:
+
+| Check | Result |
+|---|---|
+| Starts | 300 of 300; first start of each core 206-1493 µs, every start after a power cut about 2034 µs (max 3507 µs) |
+| Power cut | Every time; CPU1 and CPU2 already off when CPU3's start returned, CPU3 off 5-7 µs after |
+| Data dirty in L1 at the cut | No word lost in any round |
+| Interrupts | One wake SGI per start, dropped or taken; nothing else |
+| After the test | `ARM_CORE_CONFIGURATION` 0, status `0x70000` (low bits clear) for CPU1-3 |
+
+The firmware takes a core back after a power cut, so the reset path is the one that ran; the
+restart without a reset has not been seen. Where the 2 ms of a restart after a cut go is not
+measured.
 
 ## MCT local timer
 

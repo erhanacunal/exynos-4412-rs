@@ -22,6 +22,18 @@
 //! vendor kernel `arch/arm/mach-exynos/platsmp.c` `boot_secondary`): it needs the core
 //! powered, the entry address in SYSRAM, an SMC and an SGI.
 //!
+//! # Stopping a core
+//!
+//! A started core stops itself with [`stop_this_cpu`], as a Linux core does in
+//! `arch/arm/mach-exynos/platsmp.c` `exynos_cpu_die`: it leaves coherency, asks the PMU to cut
+//! its power at the next `wfi` and waits there. CPU0 sees it go with [`wait_offline`], and can
+//! start it again with [`start_cpu`], at any function: the core comes back through the
+//! firmware's pen as at the first start, with fresh stacks.
+//!
+//! Before it stops, a core should have handed off its work and released its locks: what it
+//! holds stays held. Its SPIs should be routed elsewhere; [`stop_this_cpu`] disables its PPIs
+//! and stops its MCT local timer itself.
+//!
 //! # Store loops
 //!
 //! Do not leave a core in an endless store-only loop on a cache line other cores use. On the
@@ -45,7 +57,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 
 use crate::drivers::gic::Gic;
 use crate::drivers::scu::Scu;
-use crate::drivers::timer::Mct;
+use crate::drivers::timer::{LocalTimer, Mct};
 use crate::{console, cpu, firmware, soc};
 
 /// `exynos-regs-pmu.h:134-138`: `EXYNOS_ARM_CORE_CONFIGURATION(n)`, with its status
@@ -55,6 +67,17 @@ const fn pmu_core_config(cpu: usize) -> usize {
 }
 /// `exynos-regs-pmu.h:181` `S5P_CORE_LOCAL_PWR_EN`.
 const CORE_LOCAL_PWR_EN: u32 = 3;
+/// `exynos-regs-pmu.h:139-140` `EXYNOS_ARM_CORE_OPTION(n)`, from the configuration register.
+const CORE_OPTION: usize = 0x8;
+/// `exynos-regs-pmu.h:38` `S5P_USE_DELAYED_RESET_ASSERTION`, which Linux sets for every core of
+/// an Exynos4 before any of them is started or stopped: `exynos.c:124-138`, from
+/// `platsmp.c:410`.
+const USE_DELAYED_RESET_ASSERTION: u32 = 1 << 12;
+/// The first PPI and the first SPI: the IDs [`stop_this_cpu`] disables lie between.
+const FIRST_PPI: u16 = 16;
+const FIRST_SPI: u16 = 32;
+/// More than the interrupts a core can have pending at once that [`stop_this_cpu`] drops.
+const DRAIN_LIMIT: usize = 64;
 
 /// `firmware.c:81-89`: the boot address register of a core in the Non-secure SYSRAM page.
 const fn sysram_boot_addr(cpu: usize) -> usize {
@@ -73,6 +96,9 @@ const ACTLR_SMP: u32 = 1 << 6;
 const COUNTS_PER_MS: u64 = soc::MCT_CLOCK_HZ as u64 / 1000;
 /// `platsmp.c:342-344`: "wait max 10 ms until cpu1 is on".
 const POWER_TIMEOUT_MS: u64 = 10;
+/// How long [`start_cpu`] waits for a stopping core to lose power before it asks for power
+/// again, which brings the core back without a reset.
+const STOP_TIMEOUT_MS: u64 = 10;
 /// `platsmp.c:368`: one second.
 const BOOT_TIMEOUT_MS: u64 = 1000;
 /// `platsmp.c:390` retries every 10 µs.
@@ -102,9 +128,12 @@ pub enum StartError {
 static ENTRIES: [AtomicPtr<()>; soc::CPU_COUNT] =
     [const { AtomicPtr::new(ptr::null_mut()) }; soc::CPU_COUNT];
 static ONLINE: [AtomicBool; soc::CPU_COUNT] = [const { AtomicBool::new(false) }; soc::CPU_COUNT];
+/// Set by [`stop_this_cpu`], cleared by [`start_cpu`].
+static STOPPED: [AtomicBool; soc::CPU_COUNT] = [const { AtomicBool::new(false) }; soc::CPU_COUNT];
 
 unsafe extern "C" {
     fn __exynos_secondary_entry();
+    fn __exynos_cpu_die(core_config: usize) -> !;
 }
 
 // Called by `__exynos_secondary_entry`. A `sym` operand keeps the function alive through LTO.
@@ -156,12 +185,27 @@ pub fn boot_address(cpu: usize) -> u32 {
     unsafe { ptr::read_volatile(sysram_boot_addr(cpu) as *const u32) }
 }
 
+/// The raw PMU configuration register of a core: [`CORE_LOCAL_PWR_EN`] while it is meant to
+/// have power, 0 once [`stop_this_cpu`] asked for it to go.
+///
+/// # Panics
+///
+/// If there is no such core.
+pub fn power_config(cpu: usize) -> u32 {
+    assert!(cpu < soc::CPU_COUNT);
+    // SAFETY: as in `power_status`, the register below it.
+    unsafe { ptr::read_volatile(pmu_core_config(cpu) as *const u32) }
+}
+
 fn power_up(cpu: usize, mct: Mct) -> Result<(), StartError> {
-    if power_status(cpu) & CORE_LOCAL_PWR_EN == CORE_LOCAL_PWR_EN {
+    if power_config(cpu) & CORE_LOCAL_PWR_EN == CORE_LOCAL_PWR_EN
+        && power_status(cpu) & CORE_LOCAL_PWR_EN == CORE_LOCAL_PWR_EN
+    {
         return Ok(());
     }
-    // SAFETY: requests local power for a core that is off, as `platsmp.c:116-122` does.
-    // Nothing runs on that core yet.
+    // SAFETY: requests local power for a core that is off, as `platsmp.c:116-122` does, or
+    // one that waits in `__exynos_cpu_die` for power to go, which it then leaves. Nothing
+    // runs on that core yet.
     unsafe {
         ptr::write_volatile(pmu_core_config(cpu) as *mut u32, CORE_LOCAL_PWR_EN);
     }
@@ -205,6 +249,12 @@ pub fn start_cpu(cpu: usize, entry: fn(usize) -> !) -> Result<(), StartError> {
     // The failure trace bypasses the console and does not check the FIFO: empty it first.
     console::flush();
 
+    if STOPPED[cpu].load(Ordering::Acquire) {
+        // Asking for power while the core still cleans its cache would race with its own
+        // request to lose it. A core that never loses power is taken back without a reset.
+        let _ = wait_offline(cpu, STOP_TIMEOUT_MS);
+        STOPPED[cpu].store(false, Ordering::Relaxed);
+    }
     power_up(cpu, mct)?;
 
     ENTRIES[cpu].store(entry as *mut (), Ordering::Release);
@@ -235,6 +285,69 @@ pub fn start_cpu(cpu: usize, entry: fn(usize) -> !) -> Result<(), StartError> {
         }
     }
     Ok(())
+}
+
+/// Stops the calling core and cuts its power. See "Stopping a core" in the
+/// [module documentation](self).
+///
+/// # Panics
+///
+/// On CPU0, which has to stay.
+pub fn stop_this_cpu() -> ! {
+    let cpu = cpu::id();
+    assert!(cpu != 0, "CPU0 cannot stop");
+    // SAFETY: masks IRQ and FIQ for good on this core; nothing here returns.
+    unsafe { asm!("cpsid if", options(nomem, nostack, preserves_flags)) };
+
+    let gic = Gic::new();
+    for id in FIRST_PPI..FIRST_SPI {
+        gic.disable(id);
+    }
+    LocalTimer::this_cpu().stop();
+    LocalTimer::this_cpu().clear_interrupt();
+    // A pending interrupt ends each `wfi` at once, so the PMU would never see this core wait.
+    // Whatever was still pending for it, the stray wake SGI among them, is dropped.
+    for _ in 0..DRAIN_LIMIT {
+        match gic.acknowledge() {
+            Some(irq) => gic.end_of_interrupt(irq),
+            None => break,
+        }
+    }
+
+    let option = pmu_core_config(cpu) + CORE_OPTION;
+    // SAFETY: this core's option register in the PMU, set as `exynos.c:130-135` does.
+    unsafe {
+        let value = ptr::read_volatile(option as *const u32);
+        ptr::write_volatile(option as *mut u32, value | USE_DELAYED_RESET_ASSERTION);
+    }
+
+    STOPPED[cpu].store(true, Ordering::Release);
+    ONLINE[cpu].store(false, Ordering::Release);
+    // SAFETY: `__exynos_cpu_die` takes this core's configuration register and never returns.
+    // Whatever this core still has in its cache is cleaned to memory there.
+    unsafe { __exynos_cpu_die(pmu_core_config(cpu)) }
+}
+
+/// Waits up to `timeout_ms` for a core that called [`stop_this_cpu`] to lose power. Returns the
+/// microseconds it took, or the core's [`power_status`] at the timeout.
+///
+/// # Panics
+///
+/// If there is no such core, or it is CPU0.
+pub fn wait_offline(cpu: usize, timeout_ms: u64) -> Result<u64, u32> {
+    assert!(cpu != 0 && cpu < soc::CPU_COUNT);
+    let mct = Mct::new();
+    mct.start();
+    let start = mct.count();
+    loop {
+        let off = !is_online(cpu) && power_status(cpu) & CORE_LOCAL_PWR_EN == 0;
+        if off {
+            return Ok((mct.count() - start) / (COUNTS_PER_MS / 1000));
+        }
+        if mct.count() - start > timeout_ms * COUNTS_PER_MS {
+            return Err(power_status(cpu));
+        }
+    }
 }
 
 /// A spinning lock around `T`. IRQ stays masked on the holding core, so an interrupt
