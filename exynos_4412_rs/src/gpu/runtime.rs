@@ -301,6 +301,9 @@ pub struct Gpu {
     fixed: &'static mut Fixed,
     lasting: Arena,
     frame: Arena,
+    /// The frame arena holds CPU writes no `show` cleaned (a frame dropped unshown): cleaned
+    /// before the next frame reuses the memory, where the GP may then write.
+    frame_unclean: bool,
     /// The area the PPs' streams are for.
     streams_for: Option<(usize, usize)>,
     vsync: bool,
@@ -482,6 +485,7 @@ impl Gpu {
             fixed,
             lasting,
             frame,
+            frame_unclean: false,
             streams_for: None,
             vsync: true,
             tables,
@@ -602,7 +606,12 @@ impl Gpu {
                 error = Some(Error::Vsync);
             }
         }
+        if self.frame_unclean {
+            let (start, length) = self.frame.used();
+            mmu::clean_dcache_range(start, length);
+        }
         self.frame.reset();
+        self.frame_unclean = true;
         self.serial = self.serial.wrapping_add(1).max(1);
         let (across, down) = area.tiles();
         if error.is_none() && self.streams_for != Some((area.width, area.height)) {
@@ -666,7 +675,10 @@ impl<'g> MeshBuilder<'g> {
             Ok(address) => {
                 // `stride << 11 | type << 2 | (components - 1)`, type 0 float: lima_draw.c:850-855.
                 let info = (((N * 4) as u32) << 11) | (N as u32).saturating_sub(1);
-                mmu::clean_dcache_range(address, size_of_val(data));
+                if self.frame == 0 {
+                    // A frame's own meshes are cleaned with the frame's memory, in `show`.
+                    mmu::clean_dcache_range(address, size_of_val(data));
+                }
                 self.attributes[index] = Some([address as u32, info]);
             }
             Err(error) => self.error = Some(error),
@@ -691,7 +703,9 @@ impl<'g> MeshBuilder<'g> {
         }
         let arena = &mut *self.arena;
         let attribute_info = arena.copy(&info[..program.attributes.len() * 2], 64)?;
-        mmu::clean_dcache_range(attribute_info, program.attributes.len() * 8);
+        if self.frame == 0 {
+            mmu::clean_dcache_range(attribute_info, program.attributes.len() * 8);
+        }
         let (vertex_shader, fragment_shader) = match self.shaders {
             Some(loaded) => loaded,
             None => {
@@ -812,7 +826,8 @@ impl<'g> Frame<'g> {
         let vertices = mesh.vertices as usize;
         let positions = (vertices * 16).next_multiple_of(64);
         let varyings = (program.varying_stride as usize * vertices).next_multiple_of(64);
-        let gp_output = arena.alloc(positions + varyings, 4096)?;
+        // Only the GP writes it and only the PPs read it: no zeroing, no cleaning.
+        let gp_output = arena.alloc_gpu(positions + varyings, 4096)?;
         let varying_info = arena.alloc((1 + program.varyings.len()) * 8, 64)?;
         let texture_list = arena.alloc(MAX_SAMPLERS * 4, 64)?;
         let render_state = arena.alloc(64, 64)?;
@@ -847,6 +862,7 @@ impl<'g> Frame<'g> {
         };
         let (start, length) = gpu.frame.used();
         mmu::clean_dcache_range(start, length);
+        gpu.frame_unclean = false;
         mmu::clean_dcache_range(vs_start as usize, self.vs_words * 4);
         mmu::clean_dcache_range(plbu_start as usize, plbu_bytes as usize);
 

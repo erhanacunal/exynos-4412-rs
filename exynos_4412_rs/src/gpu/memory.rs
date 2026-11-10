@@ -92,34 +92,58 @@ pub(crate) fn take() -> Result<&'static mut Pool, Error> {
     Ok(unsafe { &mut *STORE.0.get() })
 }
 
-/// A bump allocator over a byte array: addresses out, never freed but all at once.
+/// A bump allocator over a byte array: addresses out, never freed but all at once. What the
+/// CPU writes grows from the start; what only the GPU writes ([`alloc_gpu`](Self::alloc_gpu))
+/// from the end, outside [`used`](Self::used), so it is neither zeroed nor cleaned.
 pub(crate) struct Arena {
     base: usize,
     size: usize,
     used: usize,
+    /// Where the GPU-only allocations start, from `base`; `size` when there are none.
+    gpu_from: usize,
 }
 
 impl Arena {
     pub fn new(bytes: &mut [u8]) -> Self {
-        Self { base: bytes.as_mut_ptr() as usize, size: bytes.len(), used: 0 }
+        let size = bytes.len();
+        Self { base: bytes.as_mut_ptr() as usize, size, used: 0, gpu_from: size }
+    }
+
+    /// `bytes` at a multiple of `align`, a power of two, left as they are.
+    fn alloc_raw(&mut self, bytes: usize, align: usize) -> Result<usize, Error> {
+        let start = (self.base + self.used).next_multiple_of(align) - self.base;
+        if start + bytes > self.gpu_from {
+            return Err(Error::OutOfMemory);
+        }
+        self.used = start + bytes;
+        Ok(self.base + start)
     }
 
     /// `bytes`, zeroed, at a multiple of `align`, a power of two.
     pub fn alloc(&mut self, bytes: usize, align: usize) -> Result<usize, Error> {
-        let start = (self.base + self.used).next_multiple_of(align) - self.base;
-        if start + bytes > self.size {
-            return Err(Error::OutOfMemory);
-        }
-        self.used = start + bytes;
-        let address = self.base + start;
+        let address = self.alloc_raw(bytes, align)?;
         // SAFETY: inside the arena's array, which only this arena hands out.
         unsafe { core::ptr::write_bytes(address as *mut u8, 0, bytes) };
         Ok(address)
     }
 
+    /// `bytes` at a multiple of `align` that only the GPU writes and reads: not zeroed, and
+    /// outside [`used`](Self::used). The CPU must not touch them: they then hold no dirty
+    /// line that could be written back over the GPU's data. (Lines the CPU wrote there for
+    /// an earlier frame were cleaned when that frame ran.)
+    pub fn alloc_gpu(&mut self, bytes: usize, align: usize) -> Result<usize, Error> {
+        let end = self.base + self.gpu_from.checked_sub(bytes).ok_or(Error::OutOfMemory)?;
+        let start = (end & !(align - 1)) - self.base;
+        if start < self.used {
+            return Err(Error::OutOfMemory);
+        }
+        self.gpu_from = start;
+        Ok(self.base + start)
+    }
+
     /// `values` copied in, at a multiple of `align`.
     pub fn copy<T: Copy>(&mut self, values: &[T], align: usize) -> Result<usize, Error> {
-        let address = self.alloc(size_of_val(values), align.max(align_of::<T>()))?;
+        let address = self.alloc_raw(size_of_val(values), align.max(align_of::<T>()))?;
         // SAFETY: just allocated, of this size and alignment.
         unsafe { core::ptr::copy_nonoverlapping(values.as_ptr(), address as *mut T, values.len()) };
         Ok(address)
@@ -128,6 +152,7 @@ impl Arena {
     /// Forgets everything allocated.
     pub fn reset(&mut self) {
         self.used = 0;
+        self.gpu_from = self.size;
     }
 
     /// The start and length of what is allocated, to clean from the caches.
