@@ -672,6 +672,11 @@ impl Cmu {
         self.modify(GATE_IP_G3D, 0, GATE_G3D);
     }
 
+    /// Closes the GPU's clock gate (before its power domain goes off).
+    pub fn close_g3d_gate(&self) {
+        self.modify(GATE_IP_G3D, GATE_G3D, 0);
+    }
+
     /// Runs `sclk_g3d` from `mout_mpll_user_t`, divided down to the highest rate not above `hz`,
     /// and returns the rate. The GPU must be idle.
     ///

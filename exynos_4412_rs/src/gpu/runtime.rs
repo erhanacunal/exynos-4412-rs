@@ -387,6 +387,33 @@ impl Gpu {
         Ok(gpu)
     }
 
+    /// Turns the GPU off: clock gate closed, `G3D` power domain off. Everything in its memory
+    /// pool stays (meshes, textures, MMU tables, mapped ranges); its registers are lost until
+    /// [`power_up`](Self::power_up). Call it between frames, with none in flight.
+    pub fn power_down(&mut self) -> Result<(), Error> {
+        crate::drivers::cmu::Cmu::new().close_g3d_gate();
+        crate::drivers::pd::Domain::G3d
+            .power_off(self.mct)
+            .map_err(|_| Error::Mali(mali::Error::PowerDomain(crate::drivers::pd::Domain::G3d.status())))
+    }
+
+    /// Turns the GPU on again after [`power_down`](Self::power_down): domain, gate, the core
+    /// clock at `mali::SAFE_HZ` (returned), then the blocks reset and their MMUs pointed at the
+    /// kept tables, as at the start. Raise the clock again after, as after the start.
+    pub fn power_up(&mut self) -> Result<u32, Error> {
+        let mct = self.mct;
+        let hz = self.mali.power_on(mali::SAFE_HZ, mct).map_err(Error::Mali)?;
+        self.mali.pmu_power_up(mali::PMU_ALL, mct).map_err(Error::Mali)?;
+        let directory = self.tables.directory();
+        self.mali.reset_gp(mct, false).map_err(Error::Mali)?;
+        self.mali.enable_mmu(None, directory, mct).map_err(Error::Mali)?;
+        for index in 0..mali::PP_COUNT {
+            self.mali.reset_pp(index, mct, false).map_err(Error::Mali)?;
+            self.mali.enable_mmu(Some(index), directory, mct).map_err(Error::Mali)?;
+        }
+        Ok(hz)
+    }
+
     /// Maps `start..start + len` (widened to whole 4 KiB pages) for the GPU's MMUs too: memory
     /// for other targets ([`set_target`](Self::set_target)) and textures read in place
     /// ([`Frame::texture_at`]). At most [`memory::MAP_TABLES`] times 4 MiB in all, in up to 8

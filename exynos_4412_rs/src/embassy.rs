@@ -202,7 +202,7 @@ fn pender(_context: *mut ()) {
 
 struct Executors([UnsafeCell<MaybeUninit<Executor>>; CPU_COUNT]);
 
-// SAFETY: `run` lets each core reach only its own slot, and only once.
+// SAFETY: `run_until` lets each core reach only its own slot, one executor at a time.
 unsafe impl Sync for Executors {}
 
 static EXECUTORS: Executors = Executors([const { UnsafeCell::new(MaybeUninit::uninit()) }; CPU_COUNT]);
@@ -215,17 +215,53 @@ static STARTED: [AtomicBool; CPU_COUNT] = [const { AtomicBool::new(false) }; CPU
 ///
 /// If an executor already runs on this core, or the MMU is off.
 pub fn run(init: impl FnOnce(Spawner)) -> ! {
+    run_until(init, || false, || {});
+    unreachable!("the executor never ends")
+}
+
+/// Runs an executor on the calling core like [`run`], but returns once `done` is true after a
+/// poll, so that the core can stop ([`crate::smp::stop_this_cpu`]) and run an executor again
+/// after [`crate::smp::start_cpu`] brings it back.
+///
+/// Every task spawned on it should have ended when `done` says so: a task that has not keeps
+/// its slot in its pool, and spawning it again fails. The new executor takes the old one's
+/// place.
+///
+/// An ended task can still be woken by a waker left behind: a timer in the queue, or an
+/// interrupt's. The wake marks it queued to run, and only a poll of its executor clears that:
+/// left set, spawning the task again fails as well. So once `done` holds, `quiesce` runs, where
+/// the caller turns off the interrupts whose wakers this core's tasks registered; then every
+/// timer in the queue fires (other cores' timers too: a woken `Timer` that is not due waits
+/// again), and the executor is polled a last time.
+///
+/// # Panics
+///
+/// If an executor already runs on this core, or the MMU is off.
+pub fn run_until(init: impl FnOnce(Spawner), done: impl Fn() -> bool, quiesce: impl FnOnce()) {
     assert!(cpu::read_sctlr() & SCTLR_M != 0, "the executor needs the MMU on");
     let core = cpu::id();
     assert!(!STARTED[core].swap(true, Ordering::AcqRel), "an executor already runs on CPU{}", core);
-    // SAFETY: `STARTED` lets only this core, once, reach its slot, which lives for the whole
-    // program.
+    // SAFETY: `STARTED` lets only this core reach its slot while an executor runs there, and the
+    // slot lives for the whole program. An earlier executor of this core has returned: nothing
+    // polls it any more, and its tasks have ended.
     let executor: &'static Executor =
         unsafe { (*EXECUTORS.0[core].get()).write(Executor::new(core as *mut ())) };
     init(executor.spawner());
     loop {
         // SAFETY: only this loop polls this executor, never from inside a poll.
         unsafe { executor.poll() };
+        if done() {
+            quiesce();
+            critical_section::with(|cs| {
+                let mut queue = DRIVER.queue.borrow_ref_mut(cs);
+                queue.next_expiration(u64::MAX);
+                service_queue(&mut queue);
+            });
+            // SAFETY: as above.
+            unsafe { executor.poll() };
+            STARTED[core].store(false, Ordering::Release);
+            return;
+        }
         // An event since the last one, a wake-up during the poll, ends this at once.
         // SAFETY: waits for an event or an interrupt, nothing else.
         unsafe { core::arch::asm!("wfe", options(nostack, preserves_flags)) };
