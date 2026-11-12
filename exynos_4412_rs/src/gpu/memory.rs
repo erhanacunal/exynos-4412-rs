@@ -26,7 +26,11 @@ pub const FRAME_BYTES: usize = 4 << 20;
 
 const BLOCK_WORDS: usize = mali::PLB_BLOCK / 4;
 const HEAP_WORDS: usize = 256 * 1024;
-pub(crate) const STREAM_WORDS: usize = MAX_TILES * 4 + 4;
+/// The most tiles a frame takes when they share blocks (`mali::Blocking`): 64 x 64, the
+/// whole 1280 x 800 screen (80 x 50).
+pub const MAX_FRAME_TILES: usize = 4096;
+/// A PP's stream: 4 words a tile for its share of the tiles, and the end.
+pub(crate) const STREAM_WORDS: usize = MAX_FRAME_TILES.div_ceil(mali::PP_COUNT) * 4 + 8;
 /// A draw's vertex commands: 12 of two words (`mali::Commands`, the `vs_` ones).
 pub(crate) const VS_DRAW_WORDS: usize = 24;
 /// The PLBU's head and end, and a draw's commands: 5 and 1, and 13, of two words.

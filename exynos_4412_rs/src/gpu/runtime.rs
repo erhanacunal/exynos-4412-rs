@@ -15,7 +15,7 @@ use core::cell::UnsafeCell;
 use super::Program;
 use super::Stage;
 use super::math::Mat4;
-use super::memory::{self, Arena, Fixed, MAX_DRAWS, MAX_TILES, PLBU_DRAW_WORDS, VS_DRAW_WORDS};
+use super::memory::{self, Arena, Fixed, MAX_DRAWS, MAX_FRAME_TILES, PLBU_DRAW_WORDS, VS_DRAW_WORDS};
 use crate::drivers::display::{self, Fimd, Framebuffer, LTN101AL03, LVDS_SETTLE_MS};
 use crate::drivers::mali::{self, Commands, Filter, GpFrame, Mali, PpFrame, TexelFormat, TileEnd};
 use crate::drivers::timer::Mct;
@@ -119,7 +119,8 @@ pub enum Error {
     /// More than [`memory::MAX_DRAWS`] draws in a frame.
     TooManyDraws,
     /// The frame's area: its corner and size not multiples of 16, beyond the target, or more
-    /// than [`memory::MAX_TILES`] tiles of 16 x 16.
+    /// than [`memory::MAX_FRAME_TILES`] tiles of 16 x 16 (past [`memory::MAX_TILES`] they share
+    /// polygon list blocks), or more than 256 a side.
     BadArea,
     /// The program has no attribute of this name.
     UnknownAttribute(&'static str),
@@ -201,7 +202,9 @@ impl Area {
         whole
             && across > 0
             && down > 0
-            && across * down <= MAX_TILES
+            && across * down <= MAX_FRAME_TILES
+            && across <= 256
+            && down <= 256
             && self.x + self.width <= target.width
             && self.y + self.height <= target.height
     }
@@ -643,8 +646,9 @@ impl Gpu {
         let (across, down) = area.tiles();
         if error.is_none() && self.streams_for != Some((area.width, area.height)) {
             let plb = self.fixed.plb.as_ptr() as u32;
+            let blocking = mali::Blocking::of(across as u32, down as u32);
             for (pp, stream) in self.fixed.streams.iter_mut().enumerate() {
-                mali::clear_stream(&mut stream.0, area.width, area.height, pp, mali::PP_COUNT, TileEnd::Blocks(plb));
+                mali::clear_stream(&mut stream.0, area.width, area.height, pp, mali::PP_COUNT, TileEnd::Shared(plb, blocking));
             }
             mmu::clean_dcache_range(self.fixed.streams.as_ptr() as usize, size_of_val(&self.fixed.streams));
             self.streams_for = Some((area.width, area.height));
@@ -652,7 +656,8 @@ impl Gpu {
         let mut plbu_words = 0;
         if error.is_none() {
             let mut plbu = Commands::new(&mut self.fixed.plbu_list.0);
-            plbu.plbu_head(across as u32, down as u32, self.fixed.block_addresses.0.as_ptr() as u32);
+            let blocking = mali::Blocking::of(across as u32, down as u32);
+            plbu.plbu_head_shared(across as u32, down as u32, blocking, self.fixed.block_addresses.0.as_ptr() as u32);
             plbu_words = plbu.bytes() as usize / 4;
         }
         let serial = self.serial;
@@ -913,7 +918,9 @@ impl<'g> Frame<'g> {
         let target = gpu.target;
         let corner = target.address + area.y * target.stride + area.x * 4;
         let frame_state = fixed.frame_state.0.as_ptr() as usize;
-        let pp_frame = PpFrame::clear(area.width, area.height, self.clear, corner, target.stride, frame_state);
+        let (across, down) = area.tiles();
+        let pp_frame = PpFrame::clear(area.width, area.height, self.clear, corner, target.stride, frame_state)
+            .blocking(mali::Blocking::of(across as u32, down as u32));
         let pps = mct.count();
         for index in 0..mali::PP_COUNT {
             mali.start_pp(index, &pp_frame, fixed.streams[index].0.as_ptr() as u32).map_err(Error::Pp)?;

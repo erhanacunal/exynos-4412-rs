@@ -539,6 +539,61 @@ impl PpFrame {
         wb[0][5] = (stride / 8) as u32;
         Self { regs, wb }
     }
+
+    /// The frame's tiles share polygon list blocks as `blocking` says (the PLBU's
+    /// `BLOCK_STEP` of the same frame): `frame->blocking`, lima_job.c.
+    pub fn blocking(mut self, blocking: Blocking) -> Self {
+        regs_blocking(&mut self.regs, blocking);
+        self
+    }
+}
+
+fn regs_blocking(regs: &mut [u32; PP_FRAME_REGISTERS], b: Blocking) {
+    regs[20] = b.step();
+}
+
+/// How a frame's tiles share polygon list blocks: a block holds the list of `1 << shift_w` by
+/// `1 << shift_h` tiles. A frame of up to [`PLB_MAX_BLOCKS`] tiles has a block a tile (no
+/// shifts); a larger one shifts its longer side until the blocks fit, as Mesa's lima does
+/// (`lima_set_framebuffer_state`: only one side is ever shifted there, so only that is used
+/// here).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Blocking {
+    pub shift_w: u32,
+    pub shift_h: u32,
+    /// Blocks across and down.
+    pub block_w: u32,
+    pub block_h: u32,
+}
+
+impl Blocking {
+    /// For a frame of `tiles_x` by `tiles_y` tiles.
+    pub fn of(tiles_x: u32, tiles_y: u32) -> Self {
+        let (mut shift_w, mut shift_h) = (0, 0);
+        let blocks = |sw: u32, sh: u32| (tiles_x.div_ceil(1 << sw), tiles_y.div_ceil(1 << sh));
+        loop {
+            let (block_w, block_h) = blocks(shift_w, shift_h);
+            if block_w * block_h <= PLB_MAX_BLOCKS as u32 || (block_w == 1 && block_h == 1) {
+                return Self { shift_w, shift_h, block_w, block_h };
+            }
+            if tiles_y > tiles_x {
+                shift_h += 1;
+            } else {
+                shift_w += 1;
+            }
+        }
+    }
+
+    /// The block of tile (`x`, `y`), counted row after row.
+    pub fn block(&self, x: u32, y: u32) -> u32 {
+        (y >> self.shift_h) * self.block_w + (x >> self.shift_w)
+    }
+
+    /// `PLBU_CMD_BLOCK_STEP`'s word and the PP frame's `blocking`: the smallest shift (at
+    /// most 2), the shift down, the shift across.
+    fn step(&self) -> u32 {
+        (self.shift_w.min(self.shift_h).min(2) << 28) | (self.shift_h << 16) | self.shift_w
+    }
 }
 
 /// A rectangle of pixels.
@@ -598,6 +653,9 @@ pub enum TileEnd {
     /// [`PLB_BLOCK`] bytes a tile from this address, row after row of the frame's tiles, as
     /// [`Commands::plbu_head`] lays them out (lima_job.c:549-554).
     Blocks(u32),
+    /// As `Blocks`, the tiles sharing blocks: the block of the tile's place
+    /// ([`Blocking::block`]), as [`Commands::plbu_head_shared`] lays them out.
+    Shared(u32, Blocking),
 }
 
 /// Writes into `stream` the tiles of a `width` by `height` frame that PP `pp` of `pp_count`
@@ -617,6 +675,7 @@ pub fn clear_stream(stream: &mut [u32], width: usize, height: usize, pp: usize, 
             TileEnd::Bare => None,
             TileEnd::EmptyList(list) => Some(list),
             TileEnd::Blocks(blocks) => Some(blocks + tile as u32 * PLB_BLOCK as u32),
+            TileEnd::Shared(blocks, b) => Some(blocks + b.block(x, y) * PLB_BLOCK as u32),
         };
         if let Some(list) = list {
             stream[at] = 0xE000_0002 | ((list >> 3) & !0xE000_0003);
@@ -1002,13 +1061,29 @@ impl<'a> Commands<'a> {
         self.push(0x0000_0000, 0x5000_0000);
     }
 
-    /// The head of a PLBU list for a frame of `tiles_x` by `tiles_y` tiles, a polygon list block
-    /// each: `PLBU_CMD_UNKNOWN2`, `BLOCK_STEP` of no shifts, `TILED_DIMENSIONS`, `BLOCK_STRIDE`
-    /// and `ARRAY_ADDRESS`, the address of the blocks' addresses, one word each.
+    /// The head of a PLBU list for a frame of `tiles_x` by `tiles_y` tiles whose polygon list
+    /// blocks are shared as `blocking` says: `PLBU_CMD_UNKNOWN2`, `BLOCK_STEP`,
+    /// `TILED_DIMENSIONS`, `BLOCK_STRIDE` (blocks across) and `ARRAY_ADDRESS`, the address of
+    /// the blocks' addresses, one word each. The shifts' places in `BLOCK_STEP` and in the PP
+    /// frame's `blocking` are as Mesa's lima packs them, written from memory of that driver
+    /// (not checked against its source here); on the board frames of 1024, 2048 and 4000
+    /// tiles (shifts across of 1, 2 and 3) draw the same picture as frames of 512.
     ///
     /// # Panics
     ///
-    /// If the frame has more than [`PLB_MAX_BLOCKS`] tiles: Mesa then shares a block among tiles.
+    /// If there are more than [`PLB_MAX_BLOCKS`] blocks, or more than 256 tiles a side.
+    pub fn plbu_head_shared(&mut self, tiles_x: u32, tiles_y: u32, blocking: Blocking, block_addresses: u32) {
+        let blocks = blocking.block_w * blocking.block_h;
+        assert!(blocks as usize <= PLB_MAX_BLOCKS && tiles_x <= 256 && tiles_y <= 256, "too many polygon list blocks");
+        self.push(0x0000_0200, 0x1000_010B);
+        self.push(blocking.step(), 0x1000_010C);
+        self.push(((tiles_x - 1) << 24) | ((tiles_y - 1) << 8), 0x1000_0109);
+        self.push(blocking.block_w & 0xFF, 0x3000_0000);
+        self.push(block_addresses, 0x2800_0000 | (blocks - 1) | 1);
+    }
+
+    /// The head of a PLBU list for a frame of `tiles_x` by `tiles_y` tiles, a polygon list block
+    /// each: [`plbu_head_shared`](Self::plbu_head_shared) of no shifts.
     pub fn plbu_head(&mut self, tiles_x: u32, tiles_y: u32, block_addresses: u32) {
         let blocks = tiles_x * tiles_y;
         assert!(blocks as usize <= PLB_MAX_BLOCKS, "one polygon list block a tile");

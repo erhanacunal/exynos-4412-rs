@@ -14,7 +14,7 @@ mod memory;
 mod runtime;
 
 pub use math::*;
-pub use memory::{FRAME_BYTES, LASTING_BYTES, MAP_TABLES, MAX_DRAWS, MAX_TILES};
+pub use memory::{FRAME_BYTES, LASTING_BYTES, MAP_TABLES, MAX_DRAWS, MAX_FRAME_TILES, MAX_TILES};
 pub use runtime::*;
 
 /// Which shader a uniform belongs to.
