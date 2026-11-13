@@ -37,8 +37,9 @@
 //! Holding volume up at power-on skips the saved application altogether, and so does test mode:
 //! with `FERRITE/STAY` on CACHE, every image sent is run and nothing boots by itself. Test mode
 //! is turned on with the key `s` or `POST /stay`, off with `a` or `POST /autoboot`; either
-//! lasts across restarts. An HTTP connection, or `s`, also cancels the autoboot of this power-on
-//! only. Without WiFi in the build, or when joining fails, step 2 is left out and the UART waits
+//! lasts across restarts. A request for this loader over HTTP (a `POST` to `/boot`, `/save`,
+//! `/flash`, `/stay` or `/autoboot`), or `s`, also cancels the autoboot of this power-on only;
+//! other HTTP requests don't. Without WiFi in the build, or when joining fails, step 2 is left out and the UART waits
 //! on its own, polled.
 //!
 //! # Starting an image

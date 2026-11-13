@@ -169,7 +169,10 @@ power-on:
    `uart_boot: http://<address>/ (exynos): POST /boot or /save`. HTTP and the UART are served
    together from then on; whichever starts receiving first owns the image.
 3. 5 s after the address, the saved application boots if nothing has started arriving and no
-   HTTP connection has come. Holding **volume up** at power-on, test mode (above), or having no
+   request for `uart_boot` has come (a `POST` to `/boot`, `/save`, `/flash`, `/stay` or
+   `/autoboot`; a connection that has not sent its request line yet is waited for). Other
+   requests, such as an application's status page polled while the board restarts, don't stop
+   it. Holding **volume up** at power-on, test mode (above), or having no
    saved application keeps it waiting for good.
 
 Without the network, or if joining fails, step 2 is left out and the UART waits alone.

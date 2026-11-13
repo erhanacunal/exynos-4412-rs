@@ -17,8 +17,10 @@ skipped. The image goes with its CRC-32 in `X-CRC32`, which the board checks.
     httpboot.py --flash FLASH.BIN [IMAGE]           save FILE as it is as FERRITE/FLASH.BIN,
                                                     the application's data; then IMAGE if given
 
-Any connection during the 5 s also holds the saved application for that power-on, so with
---wait the image is never beaten by it. Keys on the console do the same as --stay and
+A request for uart_boot during the 5 s (a POST to /boot, /save, /flash, /stay or /autoboot)
+also holds the saved application for that power-on, and the autoboot waits for a connection
+that has not sent its request yet, so with --wait the image is never beaten by it. Other
+requests (an application's status page polled meanwhile) leave the autoboot alone. Keys on the console do the same as --stay and
 --autoboot: `s` and `a`.
 
 The host defaults to $EXYNOS_HOST, else `exynos`, the name uart_boot gives DHCP (many routers

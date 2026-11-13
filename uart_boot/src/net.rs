@@ -29,8 +29,11 @@
 //!
 //! [`STAGE`](crate::STAGE) has one image. Whoever starts receiving first, HTTP or the UART, claims
 //! it ([`Claim`]); the other is turned away until that one fails. The saved application boots,
-//! [`HTTP_WINDOW`] after the address came, only if no one holds the claim, no connection came,
-//! and test mode is off (see [`crate`]).
+//! [`HTTP_WINDOW`] after the address came, only if no one holds the claim, no request for this
+//! loader came (a `POST`/`PUT` to `/boot`, `/save`, `/flash`, `/stay` or `/autoboot`), and test
+//! mode is off (see [`crate`]). Other requests (`GET`s, such as an application's status page
+//! polled while the board restarts) are answered and leave the autoboot alone; while a
+//! connection has not sent its request line yet, the autoboot waits for it ([`PENDING`]).
 //!
 //! # State
 //!
@@ -38,7 +41,7 @@
 //! and buffers the console: [`crate::start`] undoes what an application would mind.
 
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_futures::select::{Either, select};
 use embassy_net::tcp::TcpSocket;
@@ -92,6 +95,33 @@ const SERVER_TX: usize = 4 * 1024;
 const REQUEST_MAX: usize = 1024;
 /// How long a connection may stay silent.
 const TCP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connections accepted whose request line has not come yet: the autoboot waits for them, so
+/// that an image sent at the end of the window is not beaten by it.
+static PENDING: AtomicU32 = AtomicU32::new(0);
+/// How often the autoboot looks again while [`PENDING`] connections are undecided.
+const PENDING_RECHECK: Duration = Duration::from_millis(50);
+
+/// One undecided connection ([`PENDING`]), until dropped or [`decided`](Self::decided).
+struct Pending(bool);
+
+impl Pending {
+    fn new() -> Self {
+        PENDING.fetch_add(1, Ordering::AcqRel);
+        Self(true)
+    }
+
+    fn decided(&mut self) {
+        if core::mem::take(&mut self.0) {
+            PENDING.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.decided();
+    }
+}
 /// How long the answer gets to reach the client before the image starts.
 const ANSWER_LINGER: Duration = Duration::from_secs(1);
 const ANDROID_MAGIC: &[u8; 8] = b"ANDROID!";
@@ -317,6 +347,11 @@ async fn boot_task(stack: Stack<'static>) {
         match select(READY.wait(), Timer::at(at)).await {
             Either::First(len) => break len,
             Either::Second(()) => {
+                // A connection that has not said what it wants yet may be an image coming.
+                if PENDING.load(Ordering::Acquire) != 0 && !crate::stay() {
+                    autoboot = Some(Instant::now() + PENDING_RECHECK);
+                    continue;
+                }
                 autoboot = None;
                 if crate::stay() {
                     println!("uart_boot: not booting {}: held", crate::cache::FILE);
@@ -425,9 +460,9 @@ async fn http_task(stack: Stack<'static>) {
         if socket.accept(HTTP_PORT).await.is_err() {
             continue;
         }
-        // Someone is about to send: the saved application waits.
-        crate::hold();
-        let ready = match serve(&mut socket).await {
+        // Maybe someone about to send: the saved application waits until the request says.
+        let mut pending = Pending::new();
+        let ready = match serve(&mut socket, &mut pending).await {
             Ok(ready) => ready,
             Err(error) => {
                 println!("uart_boot: HTTP {:?}", error);
@@ -551,7 +586,7 @@ curl --data-binary @app.bin http://<this address>/boot\n";
 
 /// Answers one request. `Some(length)` when an image is checked at the stage, claimed, and is
 /// to start once the connection is closed.
-async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<Option<usize>> {
+async fn serve(socket: &mut TcpSocket<'_>, pending: &mut Pending) -> TcpResult<Option<usize>> {
     let mut request = [0; REQUEST_MAX];
     let mut filled = 0;
     let head_end = loop {
@@ -579,6 +614,14 @@ async fn serve(socket: &mut TcpSocket<'_>) -> TcpResult<Option<usize>> {
         b"/flash" => Some(Request::Flash),
         _ => None,
     };
+    // A request for this loader holds the saved application this power-on; anything else (a
+    // status page polled while the board restarts) leaves the autoboot alone.
+    let for_loader = matches!(method, b"POST" | b"PUT")
+        && (request_kind.is_some() || path == b"/stay" || path == b"/autoboot");
+    if for_loader {
+        crate::hold();
+    }
+    pending.decided();
     if method == b"POST" && (path == b"/stay" || path == b"/autoboot") {
         let on = path == b"/stay";
         let body: &[u8] = match (crate::set_test_mode(on), on) {
