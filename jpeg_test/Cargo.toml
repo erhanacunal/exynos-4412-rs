@@ -1,0 +1,10 @@
+[package]
+name = "jpeg_test"
+version = "0.1.0"
+edition = "2024"
+description = "JPEG codec test: decoding into every raw format and encoding from them, against libjpeg's pictures"
+license = "GPL-2.0-only"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs" }
+exynos_4412_jpeg = { path = "../exynos_4412_jpeg" }

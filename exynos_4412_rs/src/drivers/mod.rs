@@ -10,6 +10,7 @@ pub mod gic;
 pub mod gpio;
 pub mod i2s;
 pub mod i2c;
+pub mod jpeg;
 pub mod l2c;
 pub mod mali;
 pub mod max17040;

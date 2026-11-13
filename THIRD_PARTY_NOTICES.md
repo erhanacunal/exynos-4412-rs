@@ -36,6 +36,15 @@ Electronics Co., Ltd.). The license text is in `exynos_4412_mfc/COPYING`. Nothin
 `exynos_4412_rs` comes from that driver; its `drivers::mfc` takes register addresses only. The
 MFC's firmware is not in this repository.
 
+## Samsung's `s5p-jpeg` driver (GPL)
+
+`exynos_4412_jpeg/` and `jpeg_test/` are not under this repository's MIT license: they are
+GPL-2.0-only, as the Linux driver whose register settings, order of operations and encoder
+tables they follow, `drivers/media/platform/s5p-jpeg/` in Linux 5.15.198 (Copyright (c)
+2011-2014 Samsung Electronics Co., Ltd.). The license text is in `exynos_4412_jpeg/COPYING`.
+Nothing in `exynos_4412_rs` comes from that driver; its `drivers::jpeg` takes addresses and clock
+fields only.
+
 ## Mesa's lima driver
 
 The Mali-400 support, `exynos_4412_rs/src/drivers/mali.rs`, follows the frame, stream, write-back

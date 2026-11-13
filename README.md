@@ -6,6 +6,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 
 - `exynos_4412_rs/`: startup, exceptions, drivers, console, panic, `link.x`
 - `exynos_4412_mfc/`: the MFC v5.1 video codec through its firmware; **GPL-2.0-or-later**, unlike the rest (see below)
+- `exynos_4412_jpeg/`: the JPEG codec; **GPL-2.0-only**, unlike the rest (see below)
 - `hello_world/`: console test
 - `irq_timer/`: GIC and MCT test
 - `mmu_test/`: MMU and cache test
@@ -32,6 +33,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `gpu_clear_test/`: first Mali-400 frames: the pixel processors clear a buffer, then the screen, through their MMUs
 - `mfc_test/`: MFC test: firmware start, then H.264 decoding checked picture by picture, then played on the panel (GPL, links `exynos_4412_mfc`)
 - `mfc_play/`: plays an H.264 stream on the panel, over and over (GPL, links `exynos_4412_mfc`)
+- `jpeg_test/`: JPEG codec test: decoding into every raw format, encoding from them, against libjpeg (GPL, links `exynos_4412_jpeg`)
 - `uart_boot/`: a loader for the boot partition: takes each new build over UART2 from minicom, or over WiFi by HTTP, and starts it, instead of fastboot
 - `gpu_triangle_test/`: flat, shaded and textured triangles through the GP and the PPs, with shaders compiled offline by Mesa's lima compiler
 - `gpu_cube_test/`: two textured (bilinear), lit cubes turning in perspective, drawn with the `gpu` runtime: two draws a frame, depth tested by the PPs
@@ -2083,6 +2085,48 @@ size. `Fimc::power_on` (camera power domain `0x1002_3C00`, gates, `sclk_fimc` at
 the MPLL, reset), `configure` once per size, then `start` and `wait` per picture, polled on
 `CISTATUS`. FIMC 3 has no rotator. The registers come from Linux's `exynos4-is/fimc-reg.h`;
 nothing here uses its System MMU.
+
+## JPEG codec
+
+The JPEG codec at `0x1184_0000` (`exynos4.dtsi:727-735`, interrupt `GIC_SPI 88`) decodes and
+encodes baseline JPEG between DRAM buffers. It sits in the camera power domain and runs on
+`aclk160`; it has no clock of its own. `exynos_4412_rs::drivers::jpeg` (MIT) turns the domain on
+and opens its gates (`GATE_IP_CAM` bits 6 and 11, the second its System MMU, left off but on its
+path to memory). How the codec is programmed is known only from Linux's
+`drivers/media/platform/s5p-jpeg`, which is GPL-2.0-only, so that part lives in its own crate,
+`exynos_4412_jpeg`, also GPL-2.0-only (text in `exynos_4412_jpeg/COPYING`). An application that
+links it is GPL-2.0 too.
+
+`Jpeg::decode` takes a stream and a raw format, reads the size and subsampling from the header
+(`exynos_4412_jpeg::header`, after `s5p_jpeg_parse_hdr`) and lets the codec read the tables
+itself; `Jpeg::encode` loads Linux's quantisation tables (four levels, `Quality`) and the
+standard Huffman tables and gets a whole JPEG file back. Raw formats are those the Exynos 4x12
+entries of the driver list: RGB32, RGB565, YUYV, YVYU, NV16, NV61, NV12, NV21, YUV420, NV24,
+NV42 and grey, planes packed with no stride. Combinations the driver refuses are refused here
+too: a raw format with coarser chroma than the stream, 4:2:0 of odd width into a 4:2:0 format,
+grey from a colour format. The CPU sleeps until the interrupt. Buffers must start on a cache
+line; the crate cleans and invalidates them around the codec.
+
+```
+python3 tools/jpeg_testdata.py jpeg_test/data   # once; needs ImageMagick's convert
+make img APP=jpeg_test
+```
+
+`jpeg_test` decodes one 320x240 picture, stored as 4:2:0, 4:2:2, 4:4:4 and grey, into every
+format and compares each result, converted back to RGB, with libjpeg's decoding of the same file
+(PSNR of at least 30 dB, as the IDCT and chroma upsampling differ). It finds which way round R
+and B are in RGB32 and RGB565. Then it encodes the picture from each format, checks the file's
+markers and header, decodes it back and compares again. The panel shows the decoded picture and
+its round trip side by side.
+
+On the board (2026-11-13) all 31 decodings and 16 encodings pass. RGB32 comes out as the panel's
+`0x00RRGGBB`. The codec repeats chroma rather than interpolating it: against libjpeg with its
+"fancy" upsampling off, the 4:2:0 file decodes at 38.0 dB, 4:4:4 at 37.8 dB, grey at 45.6 dB.
+At 320x240 a decoding takes 0.85 to 2.8 ms, an encoding 1.2 to 2.4 ms; RGB32 to 4:2:0 gives
+5.9 KB at quality 0 (31.7 dB) to 9.1 KB at quality 3 (35.9 dB). Reading `INT_STATUS` clears
+it, so it is read once. The encoder writes a whole file, starting with its tables (no JFIF
+`APP0`), and pads one of odd length with a zero byte after the EOI, which `encode` leaves out
+of the length.
 
 ## 2D accelerator (G2D)
 

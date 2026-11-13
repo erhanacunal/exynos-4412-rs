@@ -164,6 +164,9 @@ const SRC_CAM_FIMC_MPLL_USER: u32 = 6;
 /// clk-exynos4.c:795-801,807-813: `CLK_FIMCn` at bit n of `GATE_IP_CAM`, `CLK_SMMU_FIMCn` at
 /// 7 + n. The System MMUs stay off, but sit on the FIMCs' path to memory.
 const GATE_CAM_SMMU_FIMC0_BIT: u32 = 7;
+/// clk-exynos4.c:718,815: `CLK_JPEG` and `CLK_SMMU_JPEG` of `GATE_IP_CAM`.
+const GATE_CAM_JPEG: u32 = 1 << 6;
+const GATE_CAM_SMMU_JPEG: u32 = 1 << 11;
 /// clk-exynos4.c:104 `E4X12_MPLL_CON0`.
 const MPLL_CON0: usize = 0x1_0108;
 /// clk-exynos4.c:105.
@@ -191,6 +194,10 @@ const GATE_DMC_G2D: u32 = 1 << 23;
 const GATE_DMC_SMMU_G2D: u32 = 1 << 24;
 /// clk-exynos4.c:630: `aclk100` divides by this field, plus 1.
 const DIV_TOP_ACLK100_SHIFT: u32 = 4;
+/// clk-exynos4.c:532,352: `mout_aclk160` selects `sclk_apll` when set.
+const SRC_TOP0_ACLK160_APLL: u32 = 1 << 20;
+/// clk-exynos4.c:631: `aclk160` divides by this 3-bit field, plus 1.
+const DIV_TOP_ACLK160_SHIFT: u32 = 8;
 /// clk-exynos4.c:858: `CLK_I2C0` is bit 6, and the next seven follow up to clk-exynos4.c:872.
 const GATE_I2C0_BIT: u32 = 6;
 /// clk-exynos4.c:555: `mout_fimd0` is this field of `SRC_LCD0`.
@@ -565,6 +572,15 @@ impl Cmu {
         Some(self.mout_mpll_user_t_hz() / (((self.read(DIV_TOP) >> DIV_TOP_ACLK100_SHIFT) & 0xF) + 1))
     }
 
+    /// Rate of `aclk160`, the bus clock of the camera and LCD blocks, and the JPEG codec's only
+    /// clock (`clk-exynos4.c:631,718`). `None` if it comes from the APLL.
+    pub fn aclk160_hz(&self) -> Option<u32> {
+        if self.read(SRC_TOP0) & SRC_TOP0_ACLK160_APLL != 0 {
+            return None;
+        }
+        Some(self.mout_mpll_user_t_hz() / (((self.read(DIV_TOP) >> DIV_TOP_ACLK160_SHIFT) & 7) + 1))
+    }
+
     /// `sclk_mpll`, the MPLL as the DMC block sees it (clk-exynos4.c:540).
     fn sclk_mpll_hz(&self) -> u32 {
         if self.read(SRC_DMC) & SRC_DMC_MPLL != 0 { self.fout_mpll_hz() } else { soc::FIN_PLL_HZ }
@@ -752,6 +768,22 @@ impl Cmu {
     /// on its path to memory.
     pub fn open_fimc_gates(&self, index: usize) {
         self.modify(GATE_IP_CAM, 0, 1 << index | 1 << (GATE_CAM_SMMU_FIMC0_BIT + index as u32));
+    }
+
+    /// `GATE_IP_CAM`, for reports.
+    pub fn cam_gates(&self) -> u32 {
+        self.read(GATE_IP_CAM)
+    }
+
+    /// Opens the gates of the JPEG codec's registers and of its System MMU, which stays off but
+    /// is on its path to memory.
+    pub fn open_jpeg_gates(&self) {
+        self.modify(GATE_IP_CAM, 0, GATE_CAM_JPEG | GATE_CAM_SMMU_JPEG);
+    }
+
+    /// Whether the JPEG codec's gate is open.
+    pub fn jpeg_gate_open(&self) -> bool {
+        self.read(GATE_IP_CAM) & GATE_CAM_JPEG != 0
     }
 
     /// Runs `sclk_fimc<index>` from `mout_mpll_user_t`, divided down to the highest rate not

@@ -436,6 +436,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "exynos_4412_jpeg"
+version = "0.1.0"
+dependencies = [
+ "exynos_4412_rs",
+]
+
+[[package]]
 name = "exynos_4412_mfc"
 version = "0.1.0"
 dependencies = [
@@ -625,6 +632,14 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 name = "irq_timer"
 version = "0.1.0"
 dependencies = [
+ "exynos_4412_rs",
+]
+
+[[package]]
+name = "jpeg_test"
+version = "0.1.0"
+dependencies = [
+ "exynos_4412_jpeg",
  "exynos_4412_rs",
 ]
 

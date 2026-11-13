@@ -154,6 +154,11 @@ pub const PWM_BASE: usize = 0x139D_0000;
 pub const FIMC_BASE: [usize; 4] = [0x1180_0000, 0x1181_0000, 0x1182_0000, 0x1183_0000];
 /// Their interrupts, `GIC_SPI 84` to `87` (`exynos4.dtsi:217`, and so on).
 pub const FIMC_IRQ: [u16; 4] = [32 + 84, 32 + 85, 32 + 86, 32 + 87];
+/// `exynos4.dtsi:727-735`, `jpeg_codec: jpeg-codec@11840000`: the JPEG codec, 4 KiB, in the
+/// camera power domain.
+pub const JPEG_BASE: usize = 0x1184_0000;
+/// Its interrupt: `exynos4.dtsi:730`, `GIC_SPI 88`.
+pub const JPEG_IRQ: u16 = 32 + 88;
 /// `exynos4.dtsi:143-147`, `pd_cam`: the FIMCs' power domain.
 pub const PD_CAM_BASE: usize = 0x1002_3C00;
 /// `exynos4.dtsi:135-141`, `pd_tv`: the HDMI's and the mixer's power domain.
