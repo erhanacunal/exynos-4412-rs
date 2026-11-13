@@ -64,8 +64,9 @@ pub const CHIPID_BASE: usize = 0x1000_0000;
 pub const L2C_BASE: usize = 0x1050_2000;
 /// First byte of DRAM. Verified: `exynos4412-mehmet.dts`, node `memory@40000000`, `reg`.
 pub const DRAM_BASE: usize = 0x4000_0000;
-/// DRAM usable by this system. Verified: `exynos4412-mehmet.dts`, node `memory@40000000`, `reg`.
-pub const DRAM_SIZE: usize = 0x7EA0_0000;
+/// DRAM on the board: 1 GiB, `0x4000_0000..0x8000_0000` (General Mobile eTab4). Was 0x7EA0_0000
+/// from `exynos4412-mehmet.dts`, `memory@40000000`, which describes a 2 GiB variant.
+pub const DRAM_SIZE: usize = 0x4000_0000;
 /// Clock management unit. Verified: `exynos4412.dtsi`, node `clock: clock-controller@10030000`.
 pub const CMU_BASE: usize = 0x1003_0000;
 

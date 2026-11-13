@@ -16,8 +16,9 @@ pub const MAX_TILES: usize = mali::PLB_MAX_BLOCKS;
 /// The most draws in one frame.
 pub const MAX_DRAWS: usize = 256;
 /// Page tables of the GPU's MMUs, 4 MiB of memory each: the pool, the targets and whatever
-/// [`Gpu::map`](super::Gpu::map) adds (a 512 MiB heap takes 128).
-pub const MAP_TABLES: usize = 160;
+/// [`Gpu::map`](super::Gpu::map) adds (a 512 MiB heap takes 128). 256 cover all of DRAM
+/// (1 GiB), whatever the application's heap.
+pub const MAP_TABLES: usize = 256;
 /// Bytes for meshes, textures and shaders, kept until restart: about 260 000 vertices of the
 /// `lit` shader (32 bytes each).
 pub const LASTING_BYTES: usize = 8 << 20;
