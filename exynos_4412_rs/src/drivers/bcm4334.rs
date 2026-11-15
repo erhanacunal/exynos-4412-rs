@@ -333,6 +333,10 @@ const CONTROL_TIMEOUT_MS: u64 = 2000;
 const IOCTL_SET_SSID: u32 = 26;
 /// `brcmfmac/fwil.h:13`.
 const IOCTL_UP: u32 = 2;
+/// `brcmfmac/fwil.h:37`: leaves the network, the reason in a `struct brcmf_scb_val_le`.
+const IOCTL_DISASSOC: u32 = 52;
+/// IEEE 802.11 reason 3: the station leaves.
+const REASON_LEAVING: u32 = 3;
 /// `brcmfmac/fwil.h:18`.
 const IOCTL_SET_INFRA: u32 = 20;
 /// `brcmfmac/fwil.h:50`.
@@ -732,8 +736,9 @@ pub enum Activity {
     Ignored(wpa::Error),
 }
 
-/// Reads an entry of a scan's results, and finds the network's security element, with its header.
-fn parse_bss(bss: &[u8]) -> Option<(Bss, &[u8])> {
+/// Reads an entry of a scan's results, and finds the network's security element, with its header;
+/// also all its elements (diagnostics: [`Bcm4334::scan_elements`]).
+fn parse_bss(bss: &[u8]) -> Option<(Bss, &[u8], &[u8])> {
     let le16 = |at: usize| u16::from_le_bytes([bss[at], bss[at + 1]]);
     let le32 = |at: usize| u32::from_le_bytes([bss[at], bss[at + 1], bss[at + 2], bss[at + 3]]);
     if bss.len() < BSS_FIXED_SIZE {
@@ -778,7 +783,7 @@ fn parse_bss(bss: &[u8]) -> Option<(Bss, &[u8])> {
         channel,
         security,
     };
-    Some((found, rsn))
+    Some((found, rsn, elements))
 }
 
 /// Reads the chip's power state, without changing it.
@@ -1813,14 +1818,32 @@ impl Bcm4334 {
         self.associated = false;
         self.join(ssid, supplicant.access_point())?;
         let begin = self.mct.count();
-        while self.mct.count() - begin < timeout_ms * 1000 * COUNTS_PER_US {
-            // Nothing but the handshake is worth keeping until the keys are in.
-            self.serve(supplicant, &mut [], &mut report)?;
-            if self.associated && supplicant.is_complete() {
-                return Ok(());
+        let result = loop {
+            if self.mct.count() - begin >= timeout_ms * 1000 * COUNTS_PER_US {
+                break Err(Error::JoinTimeout);
             }
+            // Nothing but the handshake is worth keeping until the keys are in.
+            match self.serve(supplicant, &mut [], &mut report) {
+                Ok(_) if self.associated && supplicant.is_complete() => break Ok(()),
+                Ok(_) => {}
+                Err(error) => break Err(error),
+            }
+        };
+        if result.is_err() {
+            // Left half joined, the firmware and the access point keep the old association: the
+            // next try's handshake then times out (reason 15) with some access points.
+            let _ = self.disassociate();
         }
-        Err(Error::JoinTimeout)
+        result
+    }
+
+    /// Leaves the network joined or being joined, as `brcmfmac/cfg80211.c` `brcmf_link_down`.
+    pub fn disassociate(&mut self) -> Result<(), Error> {
+        self.associated = false;
+        let mut value = [0; SCB_VAL_BYTES];
+        value[..4].copy_from_slice(&REASON_LEAVING.to_le_bytes());
+        self.ioctl(IOCTL_DISASSOC, true, &mut value)?;
+        Ok(())
     }
 
     /// Serves a connection once: takes one thing that is waiting, answers what the network asks of
@@ -1942,6 +1965,16 @@ impl Bcm4334 {
     /// firmware ended on, 0 if the scan finished normally. Call [`prepare_radio`](Self::prepare_radio)
     /// first.
     pub fn scan(&mut self, timeout_ms: u64, mut found: impl FnMut(&Bss, &[u8])) -> Result<u32, Error> {
+        self.scan_elements(timeout_ms, |bss, rsn, _| found(bss, rsn))
+    }
+
+    /// [`scan`](Self::scan), also handing over each result's information elements as the frame
+    /// carried them (beacon or probe response: an access point may send other elements in each).
+    pub fn scan_elements(
+        &mut self,
+        timeout_ms: u64,
+        mut found: impl FnMut(&Bss, &[u8], &[u8]),
+    ) -> Result<u32, Error> {
         let mut params = [0; SCAN_PARAMS_BYTES];
         params[0..4].copy_from_slice(&SCAN_REQUEST_VERSION.to_le_bytes());
         params[4..6].copy_from_slice(&SCAN_ACTION_START.to_le_bytes());
@@ -1974,8 +2007,10 @@ impl Bcm4334 {
                 let declared = entries
                     .get(BSS_LENGTH..BSS_LENGTH + 4)
                     .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
-                if let Some((bss, rsn)) = declared.and_then(|length| entries.get(..length)).and_then(parse_bss) {
-                    found(&bss, rsn);
+                if let Some((bss, rsn, elements)) =
+                    declared.and_then(|length| entries.get(..length)).and_then(parse_bss)
+                {
+                    found(&bss, rsn, elements);
                 }
             }
         }

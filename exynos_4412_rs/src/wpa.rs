@@ -101,6 +101,54 @@ pub fn rsn_supported(element: &[u8]) -> bool {
     has(pairwise, CIPHER_CCMP) && has(akms, AKM_PSK) && capabilities & RSN_CAPABILITY_MFP_REQUIRED == 0
 }
 
+/// What an RSN element (with its header) asks for, without its PMKID list: the version, group,
+/// pairwise and AKM suites, capabilities and group management cipher, each as its bytes (`None`
+/// when the element ends before it). `None` for an element that does not parse.
+fn rsn_security(element: &[u8]) -> Option<[Option<&[u8]>; 6]> {
+    let [ELEMENT_RSN, length, body @ ..] = element else {
+        return None;
+    };
+    if body.len() != usize::from(*length) {
+        return None;
+    }
+    let mut fields = [None; 6];
+    let mut at = 0;
+    // (fixed length, or 0 for a counted list of `item` bytes each)
+    for (field, (fixed, item)) in [(2, 0), (4, 0), (0, 4), (0, 4), (2, 0), (4, 0)].into_iter().enumerate() {
+        if at == body.len() {
+            break;
+        }
+        if field == 5 {
+            // The PMKID list before the group management cipher: skipped.
+            let count = usize::from(u16::from_le_bytes([*body.get(at)?, *body.get(at + 1)?]));
+            at += 2 + count * 16;
+            if at == body.len() {
+                break;
+            }
+        }
+        let end = if fixed > 0 {
+            at + fixed
+        } else {
+            let count = usize::from(u16::from_le_bytes([*body.get(at)?, *body.get(at + 1)?]));
+            at + 2 + count * item
+        };
+        fields[field] = Some(body.get(at..end)?);
+        at = end;
+    }
+    Some(fields)
+}
+
+/// Whether message 3's RSN element describes the security the network advertised. As in
+/// wpa_supplicant (`wpa_compare_rsn_ie`), the PMKID list is not compared: some access points
+/// (a Zyxel EX3501, MediaTek) put one in their beacons, none in their probe responses, change it
+/// over time, and send the beacon's element in message 3.
+fn same_security(advertised: &[u8], message3: &[u8]) -> bool {
+    match (rsn_security(advertised), rsn_security(message3)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Why a frame was not taken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -184,6 +232,9 @@ pub struct Supplicant {
     access_point: [u8; 6],
     network_rsn: [u8; RSN_MAX],
     network_rsn_length: usize,
+    /// The element a message 3 carried that was not `network_rsn` (diagnostics).
+    mismatch: [u8; RSN_MAX],
+    mismatch_length: usize,
     snonce: [u8; 32],
     anonce: [u8; 32],
     last_replay: Option<[u8; 8]>,
@@ -215,6 +266,8 @@ impl Supplicant {
             access_point,
             network_rsn: copy,
             network_rsn_length: network_rsn.len(),
+            mismatch: [0; RSN_MAX],
+            mismatch_length: 0,
             snonce,
             anonce: [0; 32],
             last_replay: None,
@@ -238,6 +291,17 @@ impl Supplicant {
     /// Whether traffic and broadcast keys are both in place.
     pub const fn is_complete(&self) -> bool {
         self.installed_tk.is_some() && self.installed_group.is_some()
+    }
+
+    /// The network's security element this handshake expects (from the scan), with its header.
+    pub fn network_rsn(&self) -> &[u8] {
+        &self.network_rsn[..self.network_rsn_length]
+    }
+
+    /// After [`Error::RsnMismatch`]: the element message 3 carried instead (empty: none; cut to
+    /// [`RSN_MAX`]).
+    pub fn mismatched_rsn(&self) -> &[u8] {
+        &self.mismatch[..self.mismatch_length]
     }
 
     /// Takes an EAPOL frame from the access point. `reply` needs [`REPLY_MAX`] bytes.
@@ -294,7 +358,11 @@ impl Supplicant {
         let mut plain = [0; KEY_DATA_MAX];
         let data = decrypt_key_data(frame, &ptk.kek, &mut plain)?;
         let (rsn, group) = parse_key_data(data)?;
-        if rsn != Some(&self.network_rsn[..self.network_rsn_length]) {
+        if !rsn.is_some_and(|rsn| same_security(&self.network_rsn[..self.network_rsn_length], rsn)) {
+            let got = rsn.unwrap_or(&[]);
+            let n = got.len().min(RSN_MAX);
+            self.mismatch[..n].copy_from_slice(&got[..n]);
+            self.mismatch_length = n;
             return Err(Error::RsnMismatch);
         }
         let group = group_key(group, frame)?;
@@ -611,6 +679,46 @@ mod tests {
         let error = client.handle(&frame[..length], &mut reply).unwrap_err();
         assert_eq!(error, Error::RsnMismatch);
         assert!(error.is_fatal());
+    }
+
+    /// A Zyxel EX3501's elements: its probe response's (no PMKID), its beacon's (one PMKID).
+    const PROBE_RSN: [u8; 32] = [
+        0x30, 0x1e, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x02, 0x00,
+        0x00, 0x0f, 0xac, 0x02, 0x00, 0x0f, 0xac, 0x04, 0x80, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xac, 0x06,
+    ];
+    const BEACON_RSN: [u8; 48] = [
+        0x30, 0x2e, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x01, 0x00, 0x00, 0x0f, 0xac, 0x04, 0x02, 0x00,
+        0x00, 0x0f, 0xac, 0x02, 0x00, 0x0f, 0xac, 0x04, 0x80, 0x00, 0x01, 0x00, 0xdc, 0x6c, 0x03, 0x1b,
+        0x73, 0xe0, 0x70, 0x55, 0x94, 0x0b, 0x62, 0x5e, 0xfd, 0x55, 0x84, 0xa9, 0x00, 0x0f, 0xac, 0x06,
+    ];
+
+    #[test]
+    fn pmkid_list_is_not_compared() {
+        assert!(rsn_supported(&PROBE_RSN) && rsn_supported(&BEACON_RSN));
+        assert!(same_security(&PROBE_RSN, &BEACON_RSN));
+        assert!(same_security(&BEACON_RSN, &PROBE_RSN));
+        assert!(same_security(&OWN_RSN, &OWN_RSN));
+        // Anything else differing still is a mismatch: an AKM, capabilities, the BIP cipher, a cut.
+        let mut other = BEACON_RSN;
+        other[23] = 6;
+        assert!(!same_security(&PROBE_RSN, &other));
+        let mut other = BEACON_RSN;
+        other[24] = 0xc0;
+        assert!(!same_security(&PROBE_RSN, &other));
+        let mut other = BEACON_RSN;
+        other[47] = 5;
+        assert!(!same_security(&PROBE_RSN, &other));
+        assert!(!same_security(&PROBE_RSN, &BEACON_RSN[..44]));
+    }
+
+    #[test]
+    fn message_3_with_the_beacon_element_is_taken() {
+        let mut client = Supplicant::new(pmk(), OWN, AP, &PROBE_RSN, SNONCE).unwrap();
+        let mut reply = [0; REPLY_MAX];
+        let ptk = after_first(&mut client, &mut reply);
+        let (data, data_length) = wrapped_data(&ptk.kek, &BEACON_RSN, 1);
+        let (frame, length) = ap_frame(INFO_M3, 2, &ANONCE, &data[..data_length], Some(&ptk.kck));
+        assert_eq!(client.handle(&frame[..length], &mut reply).unwrap().message, Message::Third);
     }
 
     #[test]
