@@ -142,12 +142,19 @@ pub fn new<'d, const RX: usize, const TX: usize>(
 impl Runner<'_> {
     /// Serves the chip until the connection fails, then sets the link down and returns why.
     pub async fn run(self) -> Error {
+        self.run_keeping_chip().await.0
+    }
+
+    /// As [`run`](Self::run), and gives the chip back: after a lost connection
+    /// ([`Error::Disconnected`]) it is still up, with its radio prepared, and can scan and join
+    /// again without loading its firmware anew.
+    pub async fn run_keeping_chip(self) -> (Error, Bcm4334) {
         let Runner { mut chip, mut supplicant, report, wake, channel } = self;
         let (state, mut rx, mut tx) = channel.split();
         let mut link = Link { chip: &mut chip, supplicant: &mut supplicant, report, stats: Stats::ZERO };
         let error = link.serve(&wake, &mut rx, &mut tx).await;
         state.set_link_state(LinkState::Down);
-        error
+        (error, chip)
     }
 }
 

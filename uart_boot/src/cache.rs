@@ -1,5 +1,7 @@
-//! The saved application on CACHE (p8, FAT32): `FERRITE/FERRITE.BIN`; and the application's
-//! data file next to it, `FERRITE/FLASH.BIN`, written as sent ([`save_flash`]).
+//! The saved application on CACHE (p8, FAT32): `FERRITE/FERRITE.BIN`; the application's
+//! data file next to it, `FERRITE/FLASH.BIN`, written as sent ([`save_flash`]); and the board's
+//! own settings in `SYSTEM/` ([`SYSTEM_DIR`]): `WIFI.TXT`, the WiFi chip's firmware and NVRAM
+//! (`net`), read by this loader and by the application alike, written by [`save_system`].
 //!
 //! The file is the UART's wire header followed by the image, so the CRC it was checked against is
 //! kept with it:
@@ -32,6 +34,8 @@ pub const FLASH_FILE: &str = "FLASH.BIN";
 /// Present: test mode, the saved application is not booted (see [`crate::stay`]). Empty.
 pub const STAY_FILE: &str = "STAY";
 pub const HEADER_MAGIC: &[u8; 8] = b"EXYNBOOT";
+/// The board's settings, shared with the application: see `net`.
+pub const SYSTEM_DIR: &str = "SYSTEM";
 const HEADER_BYTES: usize = 16;
 /// Read-ahead and single blocks, plus a 32 KiB run for writes: this loader writes one file.
 const DEVICE_BYTES: usize = fat::MIN_BUFFER - 512 + 32 * 1024;
@@ -182,16 +186,41 @@ pub fn set_stay(on: bool) -> Result<(), Error> {
     })
 }
 
-/// Writes `parts`, one after the other, as `FERRITE/<name>`, making `FERRITE` if needed.
-fn write_file(name: &str, parts: &[&[u8]]) -> Result<(), Error> {
+/// Reads `<dir>/<name>` whole into the start of `buf`; its length. [`Error::BadFile`] when it is
+/// longer than `buf`.
+pub fn read_file(dir: &str, name: &str, buf: &mut [u8]) -> Result<usize, Error> {
     with_volumes(|volumes| {
         let volume = volumes.open_volume(VolumeIdx(0))?;
         let root = volume.open_root_dir()?;
-        match root.make_dir_in_dir(DIR) {
+        let dir = root.open_dir(dir)?;
+        let file = dir.open_file_in_dir(name, Mode::ReadOnly)?;
+        let len = file.length() as usize;
+        if len > buf.len() {
+            return Err(Error::BadFile);
+        }
+        let mut done = 0;
+        while done < len {
+            let n = file.read(&mut buf[done..len])?;
+            if n == 0 {
+                return Err(Error::BadFile);
+            }
+            done += n;
+        }
+        file.close()?;
+        Ok(len)
+    })
+}
+
+/// Writes `parts`, one after the other, as `<dir>/<name>`, making `dir` if needed.
+fn write_file(dir: &str, name: &str, parts: &[&[u8]]) -> Result<(), Error> {
+    with_volumes(|volumes| {
+        let volume = volumes.open_volume(VolumeIdx(0))?;
+        let root = volume.open_root_dir()?;
+        match root.make_dir_in_dir(dir) {
             Ok(()) | Err(FsError::DirAlreadyExists) => {}
             Err(error) => return Err(error.into()),
         }
-        let dir = root.open_dir(DIR)?;
+        let dir = root.open_dir(dir)?;
         let file = dir.open_file_in_dir(name, Mode::ReadWriteCreateOrTruncate)?;
         for part in parts {
             file.write(part)?;
@@ -207,10 +236,15 @@ pub fn save(image: &[u8], crc: u32) -> Result<(), Error> {
     header[..8].copy_from_slice(HEADER_MAGIC);
     header[8..12].copy_from_slice(&(image.len() as u32).to_le_bytes());
     header[12..16].copy_from_slice(&crc.to_le_bytes());
-    write_file(FILE, &[&header, image])
+    write_file(DIR, FILE, &[&header, image])
 }
 
 /// Saves `data` as [`FLASH_FILE`], as it is: the caller has checked its CRC.
 pub fn save_flash(data: &[u8]) -> Result<(), Error> {
-    write_file(FLASH_FILE, &[data])
+    write_file(DIR, FLASH_FILE, &[data])
+}
+
+/// Saves `data` as `SYSTEM/<name>` (an 8.3 name, checked by the caller), making `SYSTEM` if needed.
+pub fn save_system(name: &str, data: &[u8]) -> Result<(), Error> {
+    write_file(SYSTEM_DIR, name, &[data])
 }

@@ -3,7 +3,7 @@
 
 `uart_boot` built with WiFi (see uart_boot/build.rs) joins the network after its 3 s on the UART,
 gets an address by DHCP, prints it, and takes images for 5 s before it boots the application
-saved on CACHE; with volume up held at power-on, or without a saved application, it waits for
+saved on CACHE; with volume down held at power-on, or without a saved application, it waits for
 good. The file is a `make bin` output, `<app>.bin`; a `boot.img` is taken too, its Android header
 skipped. The image goes with its CRC-32 in `X-CRC32`, which the board checks.
 
@@ -16,6 +16,11 @@ skipped. The image goes with its CRC-32 in `X-CRC32`, which the board checks.
     httpboot.py --autoboot                          test mode off, from the next power-on
     httpboot.py --flash FLASH.BIN [IMAGE]           save FILE as it is as FERRITE/FLASH.BIN,
                                                     the application's data; then IMAGE if given
+    httpboot.py --system [NAME=]FILE ...            save FILE in SYSTEM/ (WiFi settings, chip
+                                                    firmware; repeatable): the brcmfmac files and
+                                                    a wifi.txt get their 8.3 names by themselves
+
+ferrite-ui-xl takes --system the same way (POST /system/<NAME>, saved at once).
 
 A request for uart_boot during the 5 s (a POST to /boot, /save, /flash, /stay or /autoboot)
 also holds the saved application for that power-on, and the autoboot waits for a connection
@@ -46,6 +51,9 @@ CONNECT_TIMEOUT_S = 2.0
 # Saving a large image to the eMMC comes before the answer.
 ANSWER_TIMEOUT_S = 60.0
 RETRY_S = 0.5
+
+
+TOOL = "httpboot"
 
 
 def log(text):
@@ -123,6 +131,32 @@ def send(host, path, data, wait_s):
     return response.status == 200
 
 
+def system_file(spec):
+    """`--system [NAME=]FILE`: (8.3 name for SYSTEM/, content). The brcmfmac firmware and NVRAM
+    and a wifi.txt / wifi.cfg get their names by themselves; any other file keeps its own."""
+    name, _, path = spec.rpartition("=") if "=" in os.path.basename(spec) else ("", "", spec)
+    if not name:
+        base = os.path.basename(path).lower()
+        if base.startswith("brcmfmac") and base.endswith(".bin"):
+            name = "WIFIFW.BIN"
+        elif base.startswith("brcmfmac") and base.endswith(".txt"):
+            name = "WIFINV.TXT"
+        elif base in ("wifi.txt", "wifi.cfg"):
+            name = "WIFI.TXT"
+        else:
+            name = os.path.basename(path)
+    name = name.upper()
+    stem, _, ext = name.partition(".")
+    ok = lambda part, most: len(part) <= most and all(c.isalnum() or c in "_-" for c in part)
+    if not stem or not ok(stem, 8) or not ok(ext, 3) or not name.isascii():
+        raise SystemExit("%s: %r is not an 8.3 name; give one: --system NAME=FILE" % (TOOL, name))
+    with open(path, "rb") as file:
+        data = file.read()
+    if not data:
+        raise SystemExit("%s: %s is empty" % (TOOL, path))
+    return name, data
+
+
 def main():
     parser = argparse.ArgumentParser(description="Send an image to uart_boot over HTTP.")
     parser.add_argument("image", nargs="?", help="a make bin output, <app>.bin, or a boot.img")
@@ -136,15 +170,23 @@ def main():
     mode.add_argument("--autoboot", action="store_true", help="test mode off, from the next power-on")
     parser.add_argument("--flash", metavar="FILE",
                         help="save FILE, as it is, as the application's data FERRITE/FLASH.BIN first")
+    parser.add_argument("--system", metavar="[NAME=]FILE", action="append", default=[],
+                        help="save FILE in SYSTEM/ on CACHE first (WiFi settings, chip firmware); repeatable")
     args = parser.parse_args()
-    if args.image is None and not (args.stay or args.autoboot or args.flash):
-        parser.error("give an IMAGE, --flash FILE, --stay or --autoboot")
+    if args.image is None and not (args.stay or args.autoboot or args.flash or args.system):
+        parser.error("give an IMAGE, --flash FILE, --system FILE, --stay or --autoboot")
+    systems = [system_file(spec) for spec in args.system]
     data = load(args.image) if args.image else None
     flash = load_flash(args.flash) if args.flash else None
     ok = True
     wait = args.wait
     if args.stay or args.autoboot:
         ok = post(args.host, "/stay" if args.stay else "/autoboot", wait)
+        wait = 0.0
+    for name, content in systems:
+        if not ok:
+            break
+        ok = send(args.host, "/system/" + name, content, wait)
         wait = 0.0
     if ok and flash is not None:
         ok = send(args.host, "/flash", flash, wait)

@@ -8,7 +8,7 @@
 //!
 //! | Bytes | Content |
 //! |---|---|
-//! | 8 | `EXYNBOOT` (run from RAM), `EXYNSAVE` (save to CACHE, then run) or `EXYNFLSH` (data) |
+//! | 8 | `EXYNBOOT` (run from RAM), `EXYNSAVE` (save to CACHE, then run), `EXYNFLSH` (data) or `EXYNSYSF` (a `SYSTEM/` file) |
 //! | 4 | length, little-endian |
 //! | 4 | CRC-32 (IEEE, as zlib's) of the image, little-endian |
 //! | length | the image |
@@ -23,23 +23,31 @@
 //! starts, and `uart_boot` waits for an image (`uart_boot: waiting again`), the autoboot of this
 //! power-on cancelled: the application can follow.
 //!
+//! `EXYNSYSF` carries one of the board's own files ([`settings`]: WiFi settings, the chip's
+//! firmware): the first 16 bytes are its 8.3 name, NUL-padded (`WIFI.TXT`, `WIFIFW.BIN`,
+//! `WIFINV.TXT`), the rest its content; the length and CRC cover both. After `CRC OK` it is saved
+//! as `SYSTEM/<name>` (`uart_boot: saved SYSTEM/<name>`) and this waits again, as after
+//! `EXYNFLSH`. The WiFi settings are read at power-on: restart (`r`) for new ones to count.
+//!
 //! # At power-on
 //!
 //! 1. For [`AUTOBOOT_MS`], the UART only, polled, with the MMU and caches off, as before WiFi.
-//! 2. Built with WiFi (`WIFI_SSID`, `WIFI_PASSWORD`, `WIFI_FIRMWARE_DIR`: see `build.rs`), the
-//!    chip joins the network and [`net`] serves HTTP and the UART together, for
-//!    [`net::HTTP_WINDOW`] after it has an address.
+//! 2. With WiFi settings and the chip's firmware on CACHE (`SYSTEM/WIFI.TXT`, `SYSTEM/WIFIFW.BIN`,
+//!    `SYSTEM/WIFINV.TXT`: see [`settings`]; or built in, see `build.rs`), the chip joins the
+//!    network and [`net`] serves HTTP and the UART together, for [`net::HTTP_WINDOW`] after it
+//!    has an address.
 //! 3. Then, if nothing has started arriving, the application saved on CACHE (p8, FAT32,
 //!    `FERRITE/FERRITE.BIN`, see [`cache`]) is loaded, checked against the CRC saved with it and
 //!    started. Without one, or with a bad one, this keeps waiting: a broken saved application
 //!    never locks the board out.
 //!
-//! Holding volume up at power-on skips the saved application altogether, and so does test mode:
+//! Holding volume down at power-on skips the saved application altogether, and so does test mode:
 //! with `FERRITE/STAY` on CACHE, every image sent is run and nothing boots by itself. Test mode
 //! is turned on with the key `s` or `POST /stay`, off with `a` or `POST /autoboot`; either
-//! lasts across restarts. A request for this loader over HTTP (a `POST` to `/boot`, `/save`,
-//! `/flash`, `/stay` or `/autoboot`), or `s`, also cancels the autoboot of this power-on only;
-//! other HTTP requests don't. Without WiFi in the build, or when joining fails, step 2 is left out and the UART waits
+//! lasts across restarts. (Volume up is the application's: ferrite-ui-xl opens its setup screen
+//! when it is held as it starts.) A request for this loader over HTTP (a `POST` to `/boot`, `/save`,
+//! `/flash`, `/system/…`, `/stay` or `/autoboot`), or `s`, also cancels the autoboot of this power-on only;
+//! other HTTP requests don't. Without WiFi settings, or when joining fails, step 2 is left out and the UART waits
 //! on its own, polled.
 //!
 //! # Starting an image
@@ -58,6 +66,7 @@
 mod cache;
 mod crc;
 mod net;
+mod settings;
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -81,6 +90,10 @@ const MAGIC_BOOT: &[u8; 8] = b"EXYNBOOT";
 const MAGIC_SAVE: &[u8; 8] = b"EXYNSAVE";
 /// Save the data to CACHE as the application's `FLASH.BIN`; run nothing.
 const MAGIC_FLASH: &[u8; 8] = b"EXYNFLSH";
+/// Save a file in `SYSTEM/` (its name in the first [`SYSTEM_NAME_BYTES`]); run nothing.
+const MAGIC_SYSTEM: &[u8; 8] = b"EXYNSYSF";
+/// The name field in front of an `EXYNSYSF` file.
+const SYSTEM_NAME_BYTES: usize = 16;
 /// Every image starts with a zImage header: `startup.s`, `_start`.
 const ZIMAGE_MAGIC_OFFSET: usize = 0x24;
 const ZIMAGE_MAGIC: u32 = 0x016f_2818;
@@ -88,8 +101,9 @@ const GAP_MS: u64 = 2000;
 /// How long the UART gets alone at power-on, before WiFi or the saved application.
 const AUTOBOOT_MS: u64 = 3000;
 /// Held at power-on (pressed = low): stay here, do not boot the saved application. Same pin as
-/// `power::PowerKeys` (`exynos4412-mehmet.dts`, volume up).
-const VOLUME_UP: Pin = gpio::GPX3.pin(4);
+/// `power::PowerKeys` (`exynos4412-mehmet.dts`, volume down). Volume up is left to the
+/// application (ferrite-ui-xl's setup screen).
+const VOLUME_DOWN: Pin = gpio::GPX3.pin(3);
 /// Time for the host's sender to exit and minicom to take the port back before the
 /// application speaks.
 const HANDOVER_MS: u64 = 300;
@@ -133,6 +147,15 @@ enum Request {
     Save,
     /// The application's data file: [`MAGIC_FLASH`].
     Flash,
+    /// A file in `SYSTEM/`: [`MAGIC_SYSTEM`].
+    System,
+}
+
+impl Request {
+    /// Data to keep, not an image to run.
+    fn is_data(self) -> bool {
+        matches!(self, Self::Flash | Self::System)
+    }
 }
 
 impl Request {
@@ -142,6 +165,7 @@ impl Request {
             MAGIC_BOOT => Some(Self::Boot),
             MAGIC_SAVE => Some(Self::Save),
             MAGIC_FLASH => Some(Self::Flash),
+            MAGIC_SYSTEM => Some(Self::System),
             _ => None,
         }
     }
@@ -213,7 +237,11 @@ fn wait_magic(mct: Mct, deadline_ms: Option<u64>) -> Option<Request> {
 
 /// Whether `len`, from a header for `request`, is a length this takes. Says why not.
 fn length_ok(request: Request, len: usize) -> bool {
-    let min = if request == Request::Flash { 1 } else { ZIMAGE_MAGIC_OFFSET + 4 };
+    let min = match request {
+        Request::Flash => 1,
+        Request::System => SYSTEM_NAME_BYTES + 1,
+        Request::Boot | Request::Save => ZIMAGE_MAGIC_OFFSET + 4,
+    };
     let ok = (min..=MAX_LEN).contains(&len);
     if !ok {
         println!("uart_boot: ERROR length {} out of range", len);
@@ -246,13 +274,13 @@ fn receive(mct: Mct, request: Request) -> Result<(usize, u32), &'static str> {
 }
 
 /// Checks the `len` bytes at [`STAGE`], whose CRC is `got`, against the `want` that came with
-/// them, and for the zImage magic unless they are [`Request::Flash`] data. Prints the verdict.
+/// them, and for the zImage magic unless they are data ([`Request::is_data`]). Prints the verdict.
 fn check(request: Request, len: usize, got: u32, want: u32) -> Result<(), &'static str> {
     if got != want {
         println!("uart_boot: ERROR CRC {:#010x}, sent {:#010x}", got, want);
         return Err("CRC");
     }
-    if request != Request::Flash && (len < ZIMAGE_MAGIC_OFFSET + 4 || !has_zimage_magic()) {
+    if !request.is_data() && (len < ZIMAGE_MAGIC_OFFSET + 4 || !has_zimage_magic()) {
         return Err("magic");
     }
     println!("uart_boot: CRC OK");
@@ -308,6 +336,32 @@ fn save_flash(len: usize) -> bool {
             false
         }
     }
+}
+
+/// Saves `data` as `SYSTEM/<name>` (an 8.3 name, checked). Prints the outcome.
+fn save_system_file(name: &str, data: &[u8]) -> bool {
+    console::flush();
+    match cache::save_system(name, data) {
+        Ok(()) => {
+            println!("uart_boot: saved {}/{}, {} bytes", cache::SYSTEM_DIR, name, data.len());
+            true
+        }
+        Err(error) => {
+            println!("uart_boot: save ERROR {:?}", error);
+            false
+        }
+    }
+}
+
+/// Saves the `len` bytes at [`STAGE`] of an `EXYNSYSF`: its name field, then the file.
+fn save_system(len: usize) -> bool {
+    let staged = staged(len);
+    let mut name = [0u8; 12];
+    let Some(name) = settings::system_name(&staged[..SYSTEM_NAME_BYTES], &mut name) else {
+        println!("uart_boot: save ERROR not an 8.3 name for SYSTEM/");
+        return false;
+    };
+    save_system_file(name, &staged[SYSTEM_NAME_BYTES..])
 }
 
 /// Loads the saved application to [`STAGE`]; its length, or `None` (reason printed).
@@ -434,14 +488,14 @@ fn leave_mmu(len: usize, args: &BootArgs) -> ! {
 fn main(args: BootArgs) -> ! {
     let mct = Mct::new();
     mct.start();
-    VOLUME_UP.set_input(Pull::Up);
+    VOLUME_DOWN.set_input(Pull::Up);
     wait_ms(mct, 5); // the pull-up settles
-    let held = !VOLUME_UP.read();
+    let held = !VOLUME_DOWN.read();
     let wifi = net::configured();
     println!("\nuart_boot: send a .bin (minicom Ctrl-A S, uartboot) to {:#x}; keys f r s a", STAGE);
     if held {
         hold();
-        println!("uart_boot: volume up held: not booting {}/{}", cache::DIR, cache::FILE);
+        println!("uart_boot: volume down held: not booting {}/{}", cache::DIR, cache::FILE);
     } else if matches!(cache::stay(), Ok(true)) {
         hold();
         println!("uart_boot: test mode ({}/{}): not booting {}; key a ends it", cache::DIR, cache::STAY_FILE, cache::FILE);
@@ -472,8 +526,12 @@ fn main(args: BootArgs) -> ! {
         // An image is coming: no WiFi or autoboot after it either, even if it fails.
         window = None;
         match receive(mct, request) {
-            Ok((len, _)) if request == Request::Flash => {
-                save_flash(len);
+            Ok((len, _)) if request.is_data() => {
+                if request == Request::Flash {
+                    save_flash(len);
+                } else {
+                    save_system(len);
+                }
                 hold();
                 println!("uart_boot: waiting again");
                 console::flush();

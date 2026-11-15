@@ -60,10 +60,14 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 export PATH=$HOME/.cargo/bin:$PATH
 cargo build --release   # ELF
 make bin                # hello_world.bin and its size
-make img                # boot.img (with ~/mkbootimg/mkbootimg)
+make img                # boot.img (tools/mkbootimg.py; MKBOOTIMG=... for another)
 make disasm             # entry code and vector table
 make img APP=irq_timer  # same targets for another application
 ```
+
+On Windows, `make.ps1` has the same targets: `.\make.ps1 bin`, `.\make.ps1 img -App irq_timer`
+(the boot.img comes from `tools/mkbootimg.py`; `-MkBootImg <path>` uses another), `.\make.ps1 send -BoardHost <address>`,
+`.\make.ps1 disasm`; `shaders` runs through WSL. `Get-Help .\make.ps1 -Detailed` lists the options.
 
 Outputs are under `target/armv7a-none-eabihf/release/`. The target is set in
 `.cargo/config.toml`, the toolchain in `rust-toolchain.toml`.
@@ -130,7 +134,8 @@ itself through pyserial; `--monitor` keeps printing the board's output afterward
   `FERRITE/FERRITE.BIN` from CACHE, checks it against the CRC saved with it and starts it.
 - Without that file, or with a bad one, it keeps waiting for the UART: a saved application that
   crashes costs one restart, never the board.
-- Holding **volume up** at power-on skips the saved application.
+- Holding **volume down** at power-on skips the saved application. (Volume up belongs to the
+  application: ferrite-ui-xl opens its setup screen when it is held.)
 - **Test mode** skips it at every power-on, until turned off: the key `s` while `uart_boot`
   waits (or `httpboot.py --stay`, `POST /stay`) creates the empty `FERRITE/STAY` on CACHE, and
   `a` (or `--autoboot`, `POST /autoboot`) deletes it. Every image sent then runs, however late
@@ -153,26 +158,54 @@ taken; once their CRC checks out they are written as they came, with no header, 
 runs: `uart_boot` waits for an image again, the autoboot of this power-on cancelled. An image can
 follow in the same call: `--flash FLASH.BIN --save <app>.bin`.
 
-#### Loading over WiFi
+#### The board's settings: `SYSTEM/` on CACHE
 
-Built with the WiFi firmware and a network, `uart_boot` also takes images by HTTP:
+The WiFi settings and the chip's firmware are files in `SYSTEM/` on CACHE, read by `uart_boot` at
+power-on and by the application (ferrite-ui-xl) alike, so neither has them built in
+(`uart_boot/src/settings.rs`):
+
+| File | Content |
+|---|---|
+| `SYSTEM/WIFI.TXT` | `ssid=<name>`, `password=<passphrase>`, optional `band=2.4` or `5`, `hostname=<name>` (default `exynos`); `#` comments |
+| `SYSTEM/WIFIFW.BIN` | `brcmfmac4334-sdio.samsung,mehmet-board.bin` |
+| `SYSTEM/WIFINV.TXT` | `brcmfmac4334-sdio.samsung,mehmet-board.txt` |
+
+Copy them with `uartboot.py --system FILE` (magic `EXYNSYSF`: a 16-byte name field, then the
+file) or `httpboot.py --system FILE` (`POST /system/<NAME>`); the brcmfmac files get their 8.3
+names by themselves, others keep theirs (`--system NAME=FILE` gives one). Like `--flash`, nothing runs after
+them and an image can follow. The first time, without WiFi, over the UART:
+
+```
+uartboot.py --port COM5 --wait 30 --system wifi.txt \
+    --system brcmfmac4334-sdio.samsung,mehmet-board.bin \
+    --system brcmfmac4334-sdio.samsung,mehmet-board.txt
+```
+
+then restart (`r`): the settings are read at power-on. ferrite-ui-xl's setup screen (volume up held
+as it starts) writes `SYSTEM/WIFI.TXT` too. Each file falls back to the copy ferrite-ui-xl used to
+keep in `FERRITE/` (`WIFI.CFG`, `WIFIFW.BIN`, `WIFINV.TXT`), then to what the build gave:
 
 ```
 WIFI_FIRMWARE_DIR=<dir> WIFI_SSID=<name> WIFI_PASSWORD=<passphrase> make img APP=uart_boot
 ```
 
-(flashed once, as above; the passphrase goes into the image, so do not publish it). At
+(the passphrase then goes into the image, so do not publish it).
+
+#### Loading over WiFi
+
+With WiFi settings and the chip's firmware (above), `uart_boot` also takes images by HTTP. At
 power-on:
 
 1. 3 s for the UART alone, as before, with the MMU and caches off.
-2. It joins the network, gets an address by DHCP (with the name `exynos`) and prints
+2. It joins the network, gets an address by DHCP (with the settings' hostname, `exynos` by
+   default) and prints
    `uart_boot: http://<address>/ (exynos): POST /boot or /save`. HTTP and the UART are served
    together from then on; whichever starts receiving first owns the image.
 3. 5 s after the address, the saved application boots if nothing has started arriving and no
-   request for `uart_boot` has come (a `POST` to `/boot`, `/save`, `/flash`, `/stay` or
+   request for `uart_boot` has come (a `POST` to `/boot`, `/save`, `/flash`, `/system/…`, `/stay` or
    `/autoboot`; a connection that has not sent its request line yet is waited for). Other
    requests, such as an application's status page polled while the board restarts, don't stop
-   it. Holding **volume up** at power-on, test mode (above), or having no
+   it. Holding **volume down** at power-on, test mode (above), or having no
    saved application keeps it waiting for good.
 
 Without the network, or if joining fails, step 2 is left out and the UART waits alone.

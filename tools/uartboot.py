@@ -21,7 +21,7 @@ the way on Windows, where there is no minicom and select() does not work on pipe
     uartboot.py --port /dev/ttyUSB3 IMAGE      the same on Linux
 
 uart_boot boots the application saved on CACHE (FERRITE/FERRITE.BIN) when no image arrives
-within 3 s of power-on (hold volume up to stay in uart_boot instead). To replace that one:
+within 3 s of power-on (hold volume down to stay in uart_boot instead). To replace that one:
 
     uartboot.py --port COM5 --save IMAGE       save it to CACHE after the CRC check, then run it
     uartboot.py --port COM5 --reset IMAGE      the ferrite application is running: restart it
@@ -34,6 +34,13 @@ CRC-checked); nothing runs after it, so an image can follow in the same call:
 
     uartboot.py --port COM5 --flash FLASH.BIN            the data alone; uart_boot waits again
     uartboot.py --port COM5 --flash FLASH.BIN --save IMAGE   the data, then the application
+
+The board's own files go to SYSTEM/ on CACHE the same way (WiFi settings and the chip's
+firmware, read by uart_boot at power-on and by ferrite-ui-xl; restart for new ones to count).
+The brcmfmac files and a wifi.txt get their 8.3 names by themselves; NAME=FILE gives one:
+
+    uartboot.py --port COM5 --system wifi.txt --system brcmfmac4334-sdio.samsung,mehmet-board.bin \
+        --system brcmfmac4334-sdio.samsung,mehmet-board.txt
 
 The header goes out when uart_boot prints its banner, not blindly: stray bytes in U-Boot's
 countdown would stop its autoboot. --debug prints every byte received.
@@ -49,6 +56,8 @@ import zlib
 MAGIC = b"EXYNBOOT"
 MAGIC_SAVE = b"EXYNSAVE"
 MAGIC_FLASH = b"EXYNFLSH"
+MAGIC_SYSTEM = b"EXYNSYSF"
+SYSTEM_NAME_BYTES = 16
 ANDROID_MAGIC = b"ANDROID!"
 ZIMAGE_MAGIC_OFFSET = 0x24
 ZIMAGE_MAGIC = 0x016F2818
@@ -66,6 +75,9 @@ FERRITE_RESTART = b""
 DEBUG = False
 # Writing the image to the eMMC, after the CRC check.
 SAVE_TIMEOUT_S = 30.0
+
+
+TOOL = "uartboot"
 
 
 def log(text):
@@ -185,7 +197,7 @@ def no_answer(link):
         hint = ("nothing at all came from the board. uart_boot listens only for 3 s after a "
                 "restart before it boots FERRITE/FERRITE.BIN, so it was probably running the "
                 "application already. Use --reset (restarts a running ferrite application) or "
-                "--wait 30 and then reset the board (hold volume up to stay in uart_boot)")
+                "--wait 30 and then reset the board (hold volume down to stay in uart_boot)")
     else:
         last = getattr(link, "pending", b"").decode("ascii", "replace").strip()
         hint = "the board sent %d bytes, but not uart_boot's answer%s" % (
@@ -201,12 +213,21 @@ def load_flash(path):
     return data
 
 
-def send(link, path, baud, save=False, wait=0.0, reset=False, flash=False):
-    data = load_flash(path) if flash else load(path)
+def send(link, path, baud, save=False, wait=0.0, reset=False, flash=False, system=None):
+    """Sends an image, or with `flash` the data file `path`, or with `system` = (name, data) a
+    file for SYSTEM/."""
+    if system:
+        name, content = system
+        data = name.encode("ascii").ljust(SYSTEM_NAME_BYTES, b"\0") + content
+        path = name
+    else:
+        data = load_flash(path) if flash else load(path)
     crc = zlib.crc32(data) & 0xFFFFFFFF
-    note = ", to be saved as FERRITE/FLASH.BIN" if flash else ", to be saved on CACHE" if save else ""
+    note = (", to be saved as SYSTEM/%s" % system[0] if system else ", to be saved as FERRITE/FLASH.BIN" if flash
+            else ", to be saved on CACHE" if save else "")
     log("uartboot: %s, %d bytes, CRC %08x%s" % (os.path.basename(path), len(data), crc, note))
-    magic = MAGIC_FLASH if flash else MAGIC_SAVE if save else MAGIC
+    magic = MAGIC_SYSTEM if system else MAGIC_FLASH if flash else MAGIC_SAVE if save else MAGIC
+    flash = flash or bool(system)
     header = magic + struct.pack("<II", len(data), crc)
     # uart_boot may be sitting there waiting already: it answers at once.
     link.write(header)
@@ -250,7 +271,7 @@ def send(link, path, baud, save=False, wait=0.0, reset=False, flash=False):
     if flash:
         result = answer(link, ["saved", "save ERROR"], SAVE_TIMEOUT_S)
         if result != "saved":
-            raise SystemExit("uartboot: FLASH.BIN was NOT saved on CACHE")
+            raise SystemExit("uartboot: %s was NOT saved on CACHE" % ("SYSTEM/" + system[0] if system else "FLASH.BIN"))
         # uart_boot listens again once it says so.
         answer(link, ["waiting again"], ANSWER_TIMEOUT_S)
         return
@@ -274,6 +295,32 @@ def monitor(link):
         pass
 
 
+def system_file(spec):
+    """`--system [NAME=]FILE`: (8.3 name for SYSTEM/, content). The brcmfmac firmware and NVRAM
+    and a wifi.txt / wifi.cfg get their names by themselves; any other file keeps its own."""
+    name, _, path = spec.rpartition("=") if "=" in os.path.basename(spec) else ("", "", spec)
+    if not name:
+        base = os.path.basename(path).lower()
+        if base.startswith("brcmfmac") and base.endswith(".bin"):
+            name = "WIFIFW.BIN"
+        elif base.startswith("brcmfmac") and base.endswith(".txt"):
+            name = "WIFINV.TXT"
+        elif base in ("wifi.txt", "wifi.cfg"):
+            name = "WIFI.TXT"
+        else:
+            name = os.path.basename(path)
+    name = name.upper()
+    stem, _, ext = name.partition(".")
+    ok = lambda part, most: len(part) <= most and all(c.isalnum() or c in "_-" for c in part)
+    if not stem or not ok(stem, 8) or not ok(ext, 3) or not name.isascii():
+        raise SystemExit("%s: %r is not an 8.3 name; give one: --system NAME=FILE" % (TOOL, name))
+    with open(path, "rb") as file:
+        data = file.read()
+    if not data:
+        raise SystemExit("%s: %s is empty" % (TOOL, path))
+    return name, data
+
+
 def main():
     parser = argparse.ArgumentParser(description="Send an application image to uart_boot.")
     parser.add_argument("--port", "-p", help="serial port (COM5, /dev/ttyUSB3); default: stdin/stdout, as under minicom")
@@ -287,12 +334,15 @@ def main():
                         help="if uart_boot does not answer, restart the running ferrite application first")
     parser.add_argument("--flash", "-F", metavar="FILE",
                         help="first save FILE, as it is, as the application's data FERRITE/FLASH.BIN")
+    parser.add_argument("--system", "-S", metavar="[NAME=]FILE", action="append", default=[],
+                        help="first save FILE in SYSTEM/ on CACHE (WiFi settings, chip firmware); repeatable")
     parser.add_argument("--debug", "-d", action="store_true", help="print every byte received")
     parser.add_argument("image", nargs="?", help="<app>.bin or boot.img")
     # minicom passes the file name last, possibly after options of its own.
     args, _ = parser.parse_known_args()
-    if args.image is None and args.flash is None:
-        parser.error("give an IMAGE, --flash FILE, or both")
+    if args.image is None and args.flash is None and not args.system:
+        parser.error("give an IMAGE, --flash FILE, --system FILE, or several")
+    systems = [system_file(spec) for spec in args.system]
     global DEBUG
     DEBUG = args.debug
 
@@ -303,11 +353,17 @@ def main():
     else:
         link = StdioLink()
     try:
+        first = True
+        for system in systems:
+            send(link, None, args.baud, wait=args.wait if first else 0.0, reset=args.reset and first,
+                 system=system)
+            first = False
         if args.flash:
-            send(link, args.flash, args.baud, wait=args.wait, reset=args.reset, flash=True)
+            send(link, args.flash, args.baud, wait=args.wait if first else 0.0, reset=args.reset and first,
+                 flash=True)
+            first = False
         if args.image:
-            # After FLASH.BIN, uart_boot is already listening: no waiting or restart.
-            first = args.flash is None
+            # After a data file, uart_boot is already listening: no waiting or restart.
             send(link, args.image, args.baud, save=args.save, wait=args.wait if first else 0.0,
                  reset=args.reset and first)
         if args.monitor and args.port:

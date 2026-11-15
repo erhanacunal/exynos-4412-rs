@@ -1,10 +1,11 @@
 //! Puts `memory.x` on the linker search path, and brings in the WiFi chip's firmware.
 //!
-//! WiFi is optional. Without `WIFI_FIRMWARE_DIR` (the directory that holds the firmware and NVRAM
-//! files, not in this repository), `WIFI_SSID` and `WIFI_PASSWORD`, the image is built with empty
-//! files and takes images over the UART only. The network's name and passphrase go into the
-//! image, so it must not be published. `WIFI_BAND`, `2.4` or `5`, limits joining to access points
-//! of that band.
+//! None of this is needed: the WiFi settings and the chip's firmware are read from CACHE at
+//! power-on (`SYSTEM/WIFI.TXT`, `SYSTEM/WIFIFW.BIN`, `SYSTEM/WIFINV.TXT`: `src/settings.rs`).
+//! What is given here is the fallback when those are missing. `WIFI_FIRMWARE_DIR` (the
+//! directory that holds the firmware and NVRAM files, not in this repository) builds them in;
+//! `WIFI_SSID` and `WIFI_PASSWORD` name a network, which then goes into the image, so it must not
+//! be published. `WIFI_BAND`, `2.4` or `5`, limits joining to access points of that band.
 
 use std::{env, fs, path::PathBuf};
 

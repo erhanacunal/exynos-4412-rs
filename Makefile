@@ -8,7 +8,7 @@ ELF        := $(OUT)/$(APP)
 BIN        := $(OUT)/$(APP).bin
 IMG        := $(OUT)/boot.img
 TOOLS       = $(shell rustc --print sysroot)/lib/rustlib/$(shell rustc -vV | sed -n 's/host: //p')/bin
-MKBOOTIMG  ?= $(HOME)/mkbootimg/mkbootimg
+MKBOOTIMG  ?= python3 tools/mkbootimg.py
 # bootcmd reads 0x4FC0 sectors of 512 bytes, one 4096-byte boot.img page may precede the image.
 MAX_SIZE   := $$(( 0x4FC0 * 512 - 4096 ))
 

@@ -9,6 +9,7 @@
 //! | `POST /boot` (or `PUT`) | runs the body from RAM, like `EXYNBOOT` |
 //! | `POST /save` (or `PUT`) | saves the body to CACHE, then runs it, like `EXYNSAVE` |
 //! | `POST /flash` (or `PUT`) | saves the body, any bytes, as `FERRITE/FLASH.BIN`; runs nothing, like `EXYNFLSH` |
+//! | `POST /system/<NAME>` (or `PUT`) | saves the body as `SYSTEM/<NAME>` (8.3): WiFi settings, chip firmware ([`crate::settings`]); like `EXYNSYSF` |
 //! | `POST /stay` | test mode on: the saved application no longer boots by itself (key `s`) |
 //! | `POST /autoboot` | test mode off, from the next power-on (key `a`) |
 //!
@@ -22,15 +23,16 @@
 //! curl --data-binary @target/armv7a-none-eabihf/release/hello_world.bin http://<address>/boot
 //! ```
 //!
-//! The address comes by DHCP, and is printed; the name [`HOSTNAME`] goes with the request, which
-//! many routers then resolve.
+//! The address comes by DHCP, and is printed; the settings' hostname (default
+//! [`DEFAULT_HOSTNAME`](crate::settings::DEFAULT_HOSTNAME)) goes with the request, which many
+//! routers then resolve.
 //!
 //! # One image at a time
 //!
 //! [`STAGE`](crate::STAGE) has one image. Whoever starts receiving first, HTTP or the UART, claims
 //! it ([`Claim`]); the other is turned away until that one fails. The saved application boots,
 //! [`HTTP_WINDOW`] after the address came, only if no one holds the claim, no request for this
-//! loader came (a `POST`/`PUT` to `/boot`, `/save`, `/flash`, `/stay` or `/autoboot`), and test
+//! loader came (a `POST`/`PUT` to `/boot`, `/save`, `/flash`, `/system/…`, `/stay` or `/autoboot`), and test
 //! mode is off (see [`crate`]). Other requests (`GET`s, such as an application's status page
 //! polled while the board restarts) are answered and leave the autoboot alone; while a
 //! connection has not sent its request line yet, the autoboot waits for it ([`PENDING`]).
@@ -62,22 +64,13 @@ use exynos_4412_rs::exceptions::ExceptionFrame;
 use exynos_4412_rs::wpa::{self, Supplicant};
 use exynos_4412_rs::{BootArgs, console, cpu, embassy, mmu, println, soc};
 
+use crate::settings::{self, Settings};
 use crate::{GAP_MS, MAX_LEN, Request, crc};
 
-static FIRMWARE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/firmware.bin"));
-static NVRAM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nvram.txt"));
-
-const SSID: Option<&str> = option_env!("WIFI_SSID");
-const PASSWORD: Option<&str> = option_env!("WIFI_PASSWORD");
-/// `2.4` or `5`: join only an access point of that band.
-const BAND: Option<&str> = option_env!("WIFI_BAND");
-const LAST_2G_CHANNEL: u8 = 14;
 const SCAN_TIMEOUT_MS: u64 = 20_000;
 const JOIN_TIMEOUT_MS: u64 = 30_000;
 const COUNTS_PER_MS: u64 = soc::MCT_CLOCK_HZ as u64 / 1000;
 
-/// The name given to DHCP.
-pub const HOSTNAME: &str = "exynos";
 /// How long HTTP gets, once there is an address, before the saved application boots.
 pub const HTTP_WINDOW: Duration = Duration::from_secs(5);
 /// How long DHCP gets before the saved application boots without an address.
@@ -158,9 +151,22 @@ impl Drop for Claim {
     }
 }
 
-/// Whether the build has what WiFi needs.
+/// The settings [`configured`] read: written once, before WiFi, only read after.
+static mut SETTINGS: Option<Settings> = None;
+
+fn settings() -> &'static Settings {
+    // SAFETY: see SETTINGS; `run` is only called after `configured` returned true.
+    unsafe { (*(&raw const SETTINGS)).as_ref().expect("read by configured") }
+}
+
+/// Reads the WiFi settings and the chip's firmware from CACHE (`SYSTEM/`, [`settings`]), or
+/// what the build gave. Whether WiFi can start. Runs with the MMU off, at power-on.
 pub fn configured() -> bool {
-    SSID.is_some() && PASSWORD.is_some() && !FIRMWARE.is_empty()
+    let loaded = settings::load();
+    let ok = loaded.is_some();
+    // SAFETY: one thread, before anything reads it.
+    unsafe { *(&raw mut SETTINGS) = loaded };
+    ok
 }
 
 #[unsafe(no_mangle)]
@@ -185,14 +191,6 @@ fn report(activity: Activity) {
     }
 }
 
-fn band_allows(channel: u8) -> bool {
-    match BAND {
-        Some("2.4") => channel <= LAST_2G_CHANNEL,
-        Some("5") => channel > LAST_2G_CHANNEL,
-        _ => true,
-    }
-}
-
 /// The access point to join, the strongest of the named network's.
 struct Target {
     bssid: [u8; 6],
@@ -212,9 +210,8 @@ struct Joined {
 /// Powers the chip up, starts its firmware and host wake line, and joins the named network, as
 /// `wifi_async_test` does. `Ok(None)` when the network is not there.
 fn join(mct: Mct) -> Result<Option<Joined>, Error> {
-    let (Some(ssid), Some(password)) = (SSID, PASSWORD) else {
-        return Ok(None);
-    };
+    let s = settings();
+    let (ssid, password) = (s.ssid(), s.password());
     let i2c = I2c::new(Bus::I2c0);
     if let Err(error) = i2c.init(400_000, 100) {
         println!("uart_boot: I2C ERROR {:?}", error);
@@ -224,7 +221,7 @@ fn join(mct: Mct) -> Result<Option<Joined>, Error> {
     bcm4334::power_on(Max77686::new(i2c), mct)?;
     let (mut chip, _rate) = Bcm4334::start(Sdhci::new()?, mct, bcm4334::HIGH_SPEED_MAX_HZ)?;
     chip.attach()?;
-    chip.load_firmware(FIRMWARE, NVRAM)?;
+    chip.load_firmware(s.firmware, s.nvram)?;
     chip.start_firmware()?;
     chip.enable_host_wake()?;
     chip.disable_glomming()?;
@@ -240,7 +237,7 @@ fn join(mct: Mct) -> Result<Option<Joined>, Error> {
         pool = Hmac::new(&pool).sign(&[&mct.count().to_le_bytes()[..], &bss.bssid, &bss.rssi.to_le_bytes()]);
         let named = ssid.as_bytes() == &bss.ssid[..usize::from(bss.ssid_length)];
         if named
-            && band_allows(bss.channel)
+            && s.band_allows(bss.channel)
             && wpa::rsn_supported(rsn)
             && rsn.len() <= wpa::RSN_MAX
             && target.as_ref().is_none_or(|known| bss.rssi > known.rssi)
@@ -251,11 +248,11 @@ fn join(mct: Mct) -> Result<Option<Joined>, Error> {
         }
     })?;
     let Some(target) = target else {
-        println!("uart_boot: network {} not found (or not in WIFI_BAND)", ssid);
+        println!("uart_boot: network {} not found (or not in its band)", ssid);
         return Ok(None);
     };
 
-    let key = crypto::wpa_key(password.as_bytes(), ssid.as_bytes());
+    let key = crypto::wpa_key(password, ssid.as_bytes());
     let mut nonce = [0; 32];
     crypto::prf(&pool, b"Init Counter", &mct.count().to_le_bytes(), &mut nonce);
     let mut seed = [0; 8];
@@ -296,7 +293,7 @@ pub fn run(mct: Mct, args: BootArgs) {
     };
 
     let mut dhcp = DhcpConfig::default();
-    dhcp.hostname = HOSTNAME.try_into().ok();
+    dhcp.hostname = settings().hostname().try_into().ok();
     // SAFETY: the only references to these, taken once, here, before any task runs.
     let (state, resources) = unsafe {
         ARGS = Some(args);
@@ -334,7 +331,7 @@ async fn boot_task(stack: Stack<'static>) {
     match stack.config_v4() {
         Some(config) if up => {
             let address = config.address.address();
-            println!("uart_boot: http://{}/ ({}): POST /boot or /save", address, HOSTNAME);
+            println!("uart_boot: http://{}/ ({}): POST /boot or /save", address, settings().hostname());
             println!("uart_boot: waiting for an image (HTTP or UART)");
         }
         _ => println!("uart_boot: no address by DHCP; waiting for an image (UART)"),
@@ -400,8 +397,12 @@ async fn uart_task() {
             continue;
         };
         match receive_uart(&rx, request).await {
-            Ok((len, _)) if request == Request::Flash => {
-                crate::save_flash(len);
+            Ok((len, _)) if request.is_data() => {
+                if request == Request::Flash {
+                    crate::save_flash(len);
+                } else {
+                    crate::save_system(len);
+                }
                 println!("uart_boot: waiting again");
             }
             Ok((len, crc)) => {
@@ -577,9 +578,13 @@ async fn answer(socket: &mut TcpSocket<'_>, status: &str, body: &[u8]) -> TcpRes
     socket.flush().await
 }
 
+/// `POST /system/<NAME>`.
+const SYSTEM_PATH: &[u8] = b"/system/";
+
 const USAGE: &[u8] = b"uart_boot on the Exynos 4412\n\
 POST (or PUT) a .bin to /boot to run it, to /save to save it to CACHE and run it.\n\
 POST (or PUT) data to /flash to save it as FERRITE/FLASH.BIN; nothing runs.\n\
+POST (or PUT) a file to /system/<NAME> to save it as SYSTEM/<NAME> (WIFI.TXT, WIFIFW.BIN, WIFINV.TXT).\n\
 POST /stay: test mode, nothing boots by itself; POST /autoboot ends it.\n\
 Optional header X-CRC32: <8 hex digits>, the CRC-32 of the body.\n\
 curl --data-binary @app.bin http://<this address>/boot\n";
@@ -612,6 +617,7 @@ async fn serve(socket: &mut TcpSocket<'_>, pending: &mut Pending) -> TcpResult<O
         b"/boot" => Some(Request::Boot),
         b"/save" => Some(Request::Save),
         b"/flash" => Some(Request::Flash),
+        _ if path.starts_with(SYSTEM_PATH) => Some(Request::System),
         _ => None,
     };
     // A request for this loader holds the saved application this power-on; anything else (a
@@ -638,7 +644,12 @@ async fn serve(socket: &mut TcpSocket<'_>, pending: &mut Pending) -> TcpResult<O
             let want = header(head, b"x-crc32").and_then(parse_hex);
             let expect = header(head, b"expect").is_some_and(|value| value.eq_ignore_ascii_case(b"100-continue"));
             let early = &request[head_end..filled];
-            upload(socket, kind, length, want, expect, early).await
+            let mut name = [0u8; 12];
+            if kind == Request::System && settings::system_name(&path[SYSTEM_PATH.len()..], &mut name).is_none() {
+                answer(socket, "400 Bad Request", b"POST /system/<NAME>: an 8.3 name (WIFI.TXT, WIFIFW.BIN, WIFINV.TXT)\n").await?;
+                return Ok(None);
+            }
+            upload(socket, kind, &name, length, want, expect, early).await
         }
         (b"GET", None) if path == b"/" => {
             answer(socket, "200 OK", USAGE).await?;
@@ -655,10 +666,12 @@ async fn serve(socket: &mut TcpSocket<'_>, pending: &mut Pending) -> TcpResult<O
     }
 }
 
-/// Takes the body of a `/boot`, `/save` or `/flash` into the stage. `early` is what came with the head.
+/// Takes the body of a `/boot`, `/save`, `/flash` or `/system/<name>` into the stage. `early` is
+/// what came with the head; `name` the `SYSTEM/` file's (checked), for [`Request::System`].
 async fn upload(
     socket: &mut TcpSocket<'_>,
     kind: Request,
+    name: &[u8; 12],
     length: Option<usize>,
     want: Option<u32>,
     expect: bool,
@@ -715,6 +728,16 @@ async fn upload(
         answer(socket, status, body).await?;
         return Ok(None);
     }
+    if kind == Request::System {
+        let name = core::str::from_utf8(name).unwrap_or("").trim_end_matches('\0');
+        let (status, body): (&str, &[u8]) = if crate::save_system_file(name, stage) {
+            ("200 OK", b"CRC OK, saved in SYSTEM/\n")
+        } else {
+            ("500 Internal Server Error", b"Save FAILED (see the console)\n")
+        };
+        answer(socket, status, body).await?;
+        return Ok(None);
+    }
 
     let (len, crc) = match kernel_of(stage) {
         Some(len) => (len, crc::crc32(&stage[..len])),
@@ -738,7 +761,7 @@ async fn upload(
                 (Request::Boot, _) => "",
                 (Request::Save, true) => ", saved",
                 (Request::Save, false) => ", save FAILED (see the console)",
-                (Request::Flash, _) => "",
+                (Request::Flash | Request::System, _) => "",
             }
         ),
     );
