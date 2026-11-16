@@ -221,6 +221,10 @@ pub struct Times {
     pub total_us: u64,
     /// The PPs' performance counters ([`Gpu::set_pp_counters`]), summed over the four.
     pub pp_counts: [u64; 2],
+    /// Writing the frame's memory and command lists out of the CPU's caches before the
+    /// hardware starts: time, and bytes (the frame arena's used part, the VS and PLBU lists).
+    pub clean_us: u64,
+    pub clean_bytes: u64,
 }
 
 /// Values for a uniform: an `f32`, an array of them, or a [`Mat4`].
@@ -321,6 +325,8 @@ pub struct Gpu {
     serial: u32,
     /// The PPs' performance counter sources ([`set_pp_counters`](Self::set_pp_counters)).
     pp_counters: [Option<u32>; 2],
+    /// The CPU writes the frame arena through its uncached alias ([`set_frame_uncached`](Self::set_frame_uncached)).
+    frame_nc: bool,
 }
 
 impl Gpu {
@@ -462,6 +468,38 @@ impl Gpu {
     /// screen, or memory given to [`map`](Self::map). As for the first target, the GPU writes it
     /// past the CPU's caches.
     ///
+    /// Whether the CPU writes each frame's memory (meshes, uniforms, descriptors, render
+    /// states) through the uncached alias of DRAM (`mmu::DRAM_UNCACHED`, Normal
+    /// non-cacheable: writes merge in the store buffers) rather than through the caches,
+    /// which [`Frame::show`] then cleans line by line (an L1 operation and an L2 register
+    /// write each, ~140 ns a 32-byte line on the board). With it `show` only drains the
+    /// buffers (`dsb`, L2 sync). Switching drops the arena from the caches, so no line the CPU
+    /// wrote or prefetched one way is seen the other. Call between frames. False if the alias
+    /// doesn't cover the arena (the MMU off).
+    pub fn set_frame_uncached(&mut self, on: bool) -> bool {
+        if on == self.frame_nc {
+            return true;
+        }
+        let (start, size) = self.frame.range();
+        let offset = match mmu::uncached(start) {
+            Some(alias) if on && mmu::is_enabled() => alias - start,
+            _ if on => return false,
+            _ => 0,
+        };
+        // Whole lines: the arena is a 4 KiB-aligned page of whole pages.
+        mmu::clean_dcache_range(start, size);
+        mmu::discard_dcache_range(start, size);
+        memory::set_frame_alias(start, size, offset);
+        self.frame_nc = on;
+        self.frame_unclean = false;
+        true
+    }
+
+    /// Whether [`set_frame_uncached`](Self::set_frame_uncached) is on.
+    pub fn frame_uncached(&self) -> bool {
+        self.frame_nc
+    }
+
     /// The events the PPs count during the frames from now on, two at a time (Mali-4xx FP
     /// events: `mali::Mali::set_pp_counters`); [`Times::pp_counts`] has them, summed over the
     /// PPs. None = counter off.
@@ -534,6 +572,7 @@ impl Gpu {
             mapped_count: 0,
             serial: 0,
             pp_counters: [None; 2],
+            frame_nc: false,
         })
     }
 
@@ -653,7 +692,7 @@ impl Gpu {
             mmu::clean_dcache_range(start, length);
         }
         self.frame.reset();
-        self.frame_unclean = true;
+        self.frame_unclean = !self.frame_nc;
         self.serial = self.serial.wrapping_add(1).max(1);
         let (across, down) = area.tiles();
         if error.is_none() && self.streams_for != Some((area.width, area.height)) {
@@ -911,10 +950,20 @@ impl<'g> Frame<'g> {
             heap_end: heap_start + size_of_val(&fixed.heap) as u32,
         };
         let (start, length) = gpu.frame.used();
-        mmu::clean_dcache_range(start, length);
+        let cleaning = mct.count();
+        if gpu.frame_nc {
+            // The CPU's writes to the arena's alias out of the store buffers, to DRAM.
+            // SAFETY: a barrier has no effect other than ordering.
+            unsafe { core::arch::asm!("dsb", options(nostack, preserves_flags)) };
+            crate::drivers::l2c::L2c::new().sync();
+        } else {
+            mmu::clean_dcache_range(start, length);
+        }
         gpu.frame_unclean = false;
         mmu::clean_dcache_range(vs_start as usize, self.vs_words * 4);
         mmu::clean_dcache_range(plbu_start as usize, plbu_bytes as usize);
+        let clean_us = (mct.count() - cleaning) / COUNTS_PER_US;
+        let clean_bytes = (if gpu.frame_nc { 0 } else { length } + self.vs_words * 4 + plbu_bytes as usize) as u64;
 
         let mali = gpu.mali;
         let begin = mct.count();
@@ -959,7 +1008,7 @@ impl<'g> Frame<'g> {
                 pp_counts[1] += n[1] as u64;
             }
         }
-        Ok(Times { gp_us, pps_us: (end - pps) / COUNTS_PER_US, total_us: (end - begin) / COUNTS_PER_US, pp_counts })
+        Ok(Times { gp_us, pps_us: (end - pps) / COUNTS_PER_US, total_us: (end - begin) / COUNTS_PER_US, pp_counts, clean_us, clean_bytes })
     }
 }
 
@@ -1024,7 +1073,7 @@ impl Draw<'_, '_> {
                 Stage::Fragment => {
                     let halves = self.mesh.program.fragment_uniform_halves;
                     // SAFETY: the draw's own half floats, `halves` of them.
-                    let memory = unsafe { core::slice::from_raw_parts_mut(place.pp_uniforms as *mut u16, halves) };
+                    let memory = unsafe { core::slice::from_raw_parts_mut(memory::cpu(place.pp_uniforms) as *mut u16, halves) };
                     for (slot, value) in memory[uniform.offset..].iter_mut().zip(values) {
                         *slot = half(*value);
                     }

@@ -193,6 +193,22 @@ impl L2c {
         wait_until_zero(&regs.cache_sync, 1);
     }
 
+    /// Waits until the controller's buffers have drained to DRAM (`CACHE_SYNC`, Linux's
+    /// `outer_sync`): after a `dsb`, writes the CPU made to non-cacheable memory are then where
+    /// a device reads them. Does nothing if the cache is off.
+    ///
+    /// # Panics
+    ///
+    /// If the controller does not finish.
+    pub fn sync(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        let regs = self.regs();
+        regs.cache_sync.set(0);
+        wait_until_zero(&regs.cache_sync, 1);
+    }
+
     /// The RTL release from `CACHE_ID`: `cache-l2x0.h:69-76` lists those of the L310, `0x08`
     /// being r3p2.
     pub fn revision(&self) -> u32 {

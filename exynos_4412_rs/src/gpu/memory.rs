@@ -5,7 +5,7 @@
 //! what the GPU writes, the CPU does not read, but for the screen, which is uncached.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::Error;
 use crate::drivers::mali;
@@ -97,6 +97,30 @@ pub(crate) fn take() -> Result<&'static mut Pool, Error> {
     Ok(unsafe { &mut *STORE.0.get() })
 }
 
+/// The frame arena's range and the offset from it to its uncached alias, 0 = written through
+/// the cache ([`Gpu::set_frame_uncached`](super::Gpu::set_frame_uncached)).
+static FRAME_START: AtomicUsize = AtomicUsize::new(0);
+static FRAME_END: AtomicUsize = AtomicUsize::new(0);
+static FRAME_CPU_OFFSET: AtomicUsize = AtomicUsize::new(0);
+
+/// From now on the CPU writes `start .. start + len` (the frame arena) at `address + offset`
+/// (its uncached alias); offset 0 = at `address`.
+pub(crate) fn set_frame_alias(start: usize, len: usize, offset: usize) {
+    FRAME_START.store(start, Ordering::Relaxed);
+    FRAME_END.store(start + len, Ordering::Relaxed);
+    FRAME_CPU_OFFSET.store(offset, Ordering::Release);
+}
+
+/// Where the CPU writes the arena memory at `address` (the GPU's address).
+pub(crate) fn cpu(address: usize) -> usize {
+    let offset = FRAME_CPU_OFFSET.load(Ordering::Acquire);
+    if offset != 0 && address >= FRAME_START.load(Ordering::Relaxed) && address < FRAME_END.load(Ordering::Relaxed) {
+        address + offset
+    } else {
+        address
+    }
+}
+
 /// A bump allocator over a byte array: addresses out, never freed but all at once. What the
 /// CPU writes grows from the start; what only the GPU writes ([`alloc_gpu`](Self::alloc_gpu))
 /// from the end, outside [`used`](Self::used), so it is neither zeroed nor cleaned.
@@ -127,8 +151,8 @@ impl Arena {
     /// `bytes`, zeroed, at a multiple of `align`, a power of two.
     pub fn alloc(&mut self, bytes: usize, align: usize) -> Result<usize, Error> {
         let address = self.alloc_raw(bytes, align)?;
-        // SAFETY: inside the arena's array, which only this arena hands out.
-        unsafe { core::ptr::write_bytes(address as *mut u8, 0, bytes) };
+        // SAFETY: inside the arena's array, which only this arena hands out (or its alias).
+        unsafe { core::ptr::write_bytes(cpu(address) as *mut u8, 0, bytes) };
         Ok(address)
     }
 
@@ -150,7 +174,7 @@ impl Arena {
     pub fn copy<T: Copy>(&mut self, values: &[T], align: usize) -> Result<usize, Error> {
         let address = self.alloc_raw(size_of_val(values), align.max(align_of::<T>()))?;
         // SAFETY: just allocated, of this size and alignment.
-        unsafe { core::ptr::copy_nonoverlapping(values.as_ptr(), address as *mut T, values.len()) };
+        unsafe { core::ptr::copy_nonoverlapping(values.as_ptr(), cpu(address) as *mut T, values.len()) };
         Ok(address)
     }
 
@@ -164,6 +188,11 @@ impl Arena {
     pub fn used(&self) -> (usize, usize) {
         (self.base, self.used)
     }
+
+    /// The start and length of the whole arena.
+    pub fn range(&self) -> (usize, usize) {
+        (self.base, self.size)
+    }
 }
 
 /// `count` words at `address`, which an arena handed out for them.
@@ -174,7 +203,7 @@ impl Arena {
 /// them meanwhile.
 pub(crate) unsafe fn words<'a>(address: usize, count: usize) -> &'a mut [u32] {
     // SAFETY: as the caller promises.
-    unsafe { core::slice::from_raw_parts_mut(address as *mut u32, count) }
+    unsafe { core::slice::from_raw_parts_mut(cpu(address) as *mut u32, count) }
 }
 
 /// The same for floats.
@@ -184,5 +213,5 @@ pub(crate) unsafe fn words<'a>(address: usize, count: usize) -> &'a mut [u32] {
 /// As for [`words`].
 pub(crate) unsafe fn floats<'a>(address: usize, count: usize) -> &'a mut [f32] {
     // SAFETY: as the caller promises.
-    unsafe { core::slice::from_raw_parts_mut(address as *mut f32, count) }
+    unsafe { core::slice::from_raw_parts_mut(cpu(address) as *mut f32, count) }
 }
