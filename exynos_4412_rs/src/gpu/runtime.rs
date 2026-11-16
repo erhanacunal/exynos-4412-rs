@@ -219,6 +219,8 @@ pub struct Times {
     pub pps_us: u64,
     /// From the resets to the last PP's end.
     pub total_us: u64,
+    /// The PPs' performance counters ([`Gpu::set_pp_counters`]), summed over the four.
+    pub pp_counts: [u64; 2],
 }
 
 /// Values for a uniform: an `f32`, an array of them, or a [`Mat4`].
@@ -317,6 +319,8 @@ pub struct Gpu {
     mapped_count: usize,
     /// The current frame's number, from 1: meshes and textures of a frame carry it.
     serial: u32,
+    /// The PPs' performance counter sources ([`set_pp_counters`](Self::set_pp_counters)).
+    pp_counters: [Option<u32>; 2],
 }
 
 impl Gpu {
@@ -458,6 +462,13 @@ impl Gpu {
     /// screen, or memory given to [`map`](Self::map). As for the first target, the GPU writes it
     /// past the CPU's caches.
     ///
+    /// The events the PPs count during the frames from now on, two at a time (Mali-4xx FP
+    /// events: `mali::Mali::set_pp_counters`); [`Times::pp_counts`] has them, summed over the
+    /// PPs. None = counter off.
+    pub fn set_pp_counters(&mut self, sources: [Option<u32>; 2]) {
+        self.pp_counters = sources;
+    }
+
     /// # Safety
     ///
     /// As [`start_offscreen`](Self::start_offscreen)'s: nothing else writes `target` while frames
@@ -522,6 +533,7 @@ impl Gpu {
             mapped: [(0, 0); MAX_MAPPED],
             mapped_count: 0,
             serial: 0,
+            pp_counters: [None; 2],
         })
     }
 
@@ -923,6 +935,7 @@ impl<'g> Frame<'g> {
             .blocking(mali::Blocking::of(across as u32, down as u32));
         let pps = mct.count();
         for index in 0..mali::PP_COUNT {
+            mali.set_pp_counters(index, gpu.pp_counters);
             mali.start_pp(index, &pp_frame, fixed.streams[index].0.as_ptr() as u32).map_err(Error::Pp)?;
         }
         for index in 0..mali::PP_COUNT {
@@ -932,7 +945,15 @@ impl<'g> Frame<'g> {
             })?;
         }
         let end = mct.count();
-        Ok(Times { gp_us, pps_us: (end - pps) / COUNTS_PER_US, total_us: (end - begin) / COUNTS_PER_US })
+        let mut pp_counts = [0u64; 2];
+        if gpu.pp_counters.iter().any(Option::is_some) {
+            for index in 0..mali::PP_COUNT {
+                let n = mali.pp_counters(index);
+                pp_counts[0] += n[0] as u64;
+                pp_counts[1] += n[1] as u64;
+            }
+        }
+        Ok(Times { gp_us, pps_us: (end - pps) / COUNTS_PER_US, total_us: (end - begin) / COUNTS_PER_US, pp_counts })
     }
 }
 

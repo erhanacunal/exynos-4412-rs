@@ -114,6 +114,11 @@ const PP_CTRL_SOFT_RESET: u32 = 1 << 7;
 const PP_CTRL_FORCE_RESET: u32 = 1 << 5;
 const PP_CTRL_START_RENDERING: u32 = 1 << 6;
 const PP_PERF_CNT_0_LIMIT: usize = 0x1088;
+/// Performance counters: enable, source, value of counter 0 and 1 (mali_200_regs.h, Mali
+/// r3p2 kernel driver; the sources are ARM's Mali-4xx FP events, `pp_counters`).
+const PP_PERF_CNT_ENABLE: [usize; 2] = [0x1080, 0x10A0];
+const PP_PERF_CNT_SRC: [usize; 2] = [0x1084, 0x10A4];
+const PP_PERF_CNT_VALUE: [usize; 2] = [0x108C, 0x10AC];
 const PP_BUS_ERROR_STATUS: usize = 0x1050;
 /// lima_regs.h:176-187.
 const PP_IRQ_END_OF_FRAME: u32 = 1 << 0;
@@ -736,6 +741,28 @@ impl Mali {
         }
         self.write(base + PP_CTRL, PP_CTRL_START_RENDERING);
         Ok(())
+    }
+
+    /// Counts event `sources[i]` (a Mali-4xx FP event: 0 active cycles, 2/3 bus reads/writes,
+    /// ...) in PP `index`'s counter i during its next frame; None = counter off. Set before
+    /// [`start_pp`](Self::start_pp), as the Linux driver does after each reset.
+    pub fn set_pp_counters(&self, index: usize, sources: [Option<u32>; 2]) {
+        let base = PP[index];
+        for (i, src) in sources.iter().enumerate() {
+            match src {
+                Some(src) => {
+                    self.write(base + PP_PERF_CNT_SRC[i], *src);
+                    self.write(base + PP_PERF_CNT_ENABLE[i], 1);
+                }
+                None => self.write(base + PP_PERF_CNT_ENABLE[i], 0),
+            }
+        }
+    }
+
+    /// PP `index`'s two performance counters (after its frame ended).
+    pub fn pp_counters(&self, index: usize) -> [u32; 2] {
+        let base = PP[index];
+        [self.read(base + PP_PERF_CNT_VALUE[0]), self.read(base + PP_PERF_CNT_VALUE[1])]
     }
 
     /// Waits until PP `index` ends its frame, and returns how many microseconds that took from
