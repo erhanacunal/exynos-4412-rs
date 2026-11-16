@@ -802,6 +802,8 @@ impl<'g> Frame<'g> {
     /// share texels): a picture whose first texel is not 64-byte aligned is read as a wider one
     /// from the aligned address before it, sampled only where the picture is.
     ///
+    /// `stride` [`mali::TILED`] = block-interleaved texels, whole 16×16 blocks.
+    ///
     /// # Safety
     ///
     /// The texels are memory the GPU maps ([`Gpu::map`]), written out of the CPU's caches, and
@@ -818,7 +820,11 @@ impl<'g> Frame<'g> {
         if width == 0 || height == 0 || width > 4096 || height > 4096 {
             return Err(Error::TextureSize);
         }
-        let bytes = stride * (height - 1) + width * format.bytes as usize;
+        let bytes = if stride == mali::TILED as usize {
+            width.next_multiple_of(16) * height.next_multiple_of(16) * format.bytes as usize
+        } else {
+            stride * (height - 1) + width * format.bytes as usize
+        };
         if !texels.is_multiple_of(64) || stride > 0xFFFF || !self.gpu.is_mapped(texels, bytes)
         {
             return Err(Error::BadTexels);

@@ -978,9 +978,30 @@ pub fn texture_rgba8888(texels: u32, width: u32, height: u32, filter: Filter) ->
     texture(texels, width, height, width * 4, TexelFormat::RGBA_BYTES, filter)
 }
 
+/// [`texture`]'s stride for block-interleaved texels (Mesa lima `LIMA_TEXTURE_LAYOUT_TILED`,
+/// panfrost's "u-interleaved"): 16×16 blocks, row after row of them (rows of
+/// `width.next_multiple_of(16)` texels); in a block, texel (x, y) is at
+/// [`tiled_index`]`(x % 16, y % 16)`.
+pub const TILED: u32 = 0;
+
+/// Where texel (x, y) of a 16×16 block is in it (x, y < 16): the bits of y, each beside
+/// itself XOR the same bit of x — `y3 (y3^x3) y2 (y2^x2) y1 (y1^x1) y0 (y0^x0)`
+/// (Mesa pan_tiling.c).
+pub const fn tiled_index(x: u32, y: u32) -> u32 {
+    let mut i = 0;
+    let mut bit = 0;
+    while bit < 4 {
+        let (xb, yb) = ((x >> bit) & 1, (y >> bit) & 1);
+        i |= ((yb ^ xb) << (2 * bit)) | (yb << (2 * bit + 1));
+        bit += 1;
+    }
+    i
+}
+
 /// The texture descriptor of a 2D texture of one level, `width` x `height` texels of `format`
 /// in lines `stride` bytes apart, at `texels`, sampled by `filter`, clamped to its edges: as
 /// [`texture_rgba8888`], for other layouts. Linear, so no size needs to be a power of two.
+/// `stride` 0 = block-interleaved ([`TILED`]): the PPs' own layout, read far more cheaply.
 ///
 /// # Panics
 ///
@@ -996,10 +1017,13 @@ pub fn texture(texels: u32, width: u32, height: u32, stride: u32, format: TexelF
     const MIN_NEAREST: u32 = 1 << 11;
     const MAG_NEAREST: u32 = 1 << 12;
     const CLAMP_TO_EDGE: u32 = 1;
+    // Layout from word 6 bit 13: 0 linear, 3 tiled (genxml "Texture Layout").
+    const LAYOUT_TILED: u32 = 3 << 13;
     let mip0 = texels >> 6;
     let mut descriptor = [0; 16];
     let swap = if format.swap_rb { SWAP_RB } else { 0 };
-    // The stride, in bytes, from bit 16 (`HAS_STRIDE` below).
+    let tiled = stride == TILED;
+    // The stride, in bytes, from bit 16 (`HAS_STRIDE` below); none when tiled.
     descriptor[0] = format.code | swap | (stride << 16);
     let (bias, nearest) = match filter {
         Filter::Nearest => (LOD_BIAS_HALF, MIN_NEAREST | MAG_NEAREST),
@@ -1007,10 +1031,11 @@ pub fn texture(texels: u32, width: u32, height: u32, stride: u32, format: TexelF
     };
     descriptor[1] = DIM_2D | bias;
     // Wrap S at bit 13, T at 16, R repeat; the width from bit 22, its high bits in word 3.
-    descriptor[2] = HAS_STRIDE | nearest | (CLAMP_TO_EDGE << 13) | (CLAMP_TO_EDGE << 16) | (width << 22);
+    let has_stride = if tiled { 0 } else { HAS_STRIDE };
+    descriptor[2] = has_stride | nearest | (CLAMP_TO_EDGE << 13) | (CLAMP_TO_EDGE << 16) | (width << 22);
     // Depth 1; layout linear, 0, in word 6.
     descriptor[3] = (width >> 10) | (height << 3) | (1 << 16);
-    descriptor[6] = mip0 << 30;
+    descriptor[6] = (mip0 << 30) | if tiled { LAYOUT_TILED } else { 0 };
     descriptor[7] = mip0 >> 2;
     descriptor
 }
