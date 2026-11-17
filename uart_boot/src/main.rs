@@ -63,10 +63,14 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod arena;
 mod cache;
 mod crc;
 mod net;
 mod settings;
+mod userdata;
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -368,12 +372,12 @@ fn save_system(len: usize) -> bool {
 fn load_saved() -> Option<usize> {
     match cache::load(staged(MAX_LEN)) {
         Ok(len) if has_zimage_magic() => {
-            println!("uart_boot: {}/{} CRC OK, {} bytes", cache::DIR, cache::FILE, len);
+            println!("uart_boot: {}/{} on {} CRC OK, {} bytes", cache::DIR, cache::FILE, cache::medium(), len);
             Some(len)
         }
         Ok(_) => None,
         Err(cache::Error::NotFound) => {
-            println!("uart_boot: no {}/{} on CACHE", cache::DIR, cache::FILE);
+            println!("uart_boot: no {}/{} on {}", cache::DIR, cache::FILE, cache::medium());
             None
         }
         Err(error) => {

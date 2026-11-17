@@ -1,4 +1,4 @@
-//! The saved application on CACHE (p8, FAT32): `FERRITE/FERRITE.BIN`; the application's
+//! The saved application: `FERRITE/FERRITE.BIN`; the application's
 //! data file next to it, `FERRITE/FLASH.BIN`, written as sent ([`save_flash`]); and the board's
 //! own settings in `SYSTEM/` ([`SYSTEM_DIR`]): `WIFI.TXT`, the WiFi chip's firmware and NVRAM
 //! (`net`), read by this loader and by the application alike, written by [`save_system`].
@@ -13,6 +13,10 @@
 //! | 4 | CRC-32 (IEEE, as zlib's) of the image, little-endian |
 //! | length | the image |
 //!
+//! Where: USERDATA (p10) when ferrite-ui-xl has formatted it as ext4 ([`crate::userdata`]),
+//! otherwise CACHE (p8, FAT32), as before the move: every function here tries USERDATA first and
+//! uses CACHE only when USERDATA holds no ext4. [`medium`] says which one it was.
+//!
 //! Runs with the MMU and caches off before WiFi, where memory is Strongly-ordered, and with them
 //! on after (`net`), where `fat::PartitionDevice` keeps the IDMAC's buffer coherent itself. CACHE
 //! is never formatted here: without a FAT32 on it, there is nothing to boot and nothing is saved.
@@ -24,6 +28,7 @@ use exynos_4412_rs::fat::embedded_sdmmc::{Mode, VolumeIdx, VolumeManager};
 use exynos_4412_rs::fat::{self, FixedTime, PartitionDevice};
 
 use crate::crc::crc32;
+use crate::userdata;
 
 /// CACHE.
 const PARTITION: u32 = 8;
@@ -69,6 +74,8 @@ pub enum Error {
     /// The image does not match the CRC saved with it.
     Crc { want: u32, got: u32 },
     Fs(FsError),
+    /// USERDATA's ext4 failed or refused.
+    Ext4(exynos_4412_rs::ext4::ext4_rs::Error),
 }
 
 impl From<FsError> for Error {
@@ -86,8 +93,38 @@ impl From<fat::Error> for Error {
     }
 }
 
-/// Opens CACHE and runs `f` on its volume manager, then writes the device's cache to the card.
-fn with_volumes<T>(f: impl FnOnce(&Volumes<'_>) -> Result<T, Error>) -> Result<T, Error> {
+/// Whether the last call found USERDATA's ext4 (else it used CACHE).
+static mut ON_USERDATA: bool = false;
+
+/// Where the files are, for the log: `"USERDATA"` or `"CACHE"`, as the last call found.
+pub fn medium() -> &'static str {
+    if unsafe { ON_USERDATA } { "USERDATA" } else { "CACHE" }
+}
+
+/// Runs `on_ext4` on USERDATA's ext4 if there is one, else `on_fat` on CACHE; `with` goes to
+/// whichever runs.
+fn with_storage<C, T>(
+    with: C,
+    on_ext4: impl FnOnce(&mut userdata::Fs, C) -> Result<T, Error>,
+    on_fat: impl FnOnce(&Volumes<'_>, C) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let (card, rca) = open_card()?;
+    match userdata::mount(card, rca) {
+        Some(mounted) => {
+            unsafe { ON_USERDATA = true };
+            let mut fs = mounted?;
+            let result = on_ext4(&mut fs, with);
+            userdata::finish(fs, result)
+        }
+        None => {
+            unsafe { ON_USERDATA = false };
+            with_volumes(|volumes| on_fat(volumes, with))
+        }
+    }
+}
+
+/// The eMMC, on its user area, and the card's address.
+fn open_card() -> Result<(Mmc, u16), Error> {
     let card = Mmc::new().map_err(|_| Error::Card("controller"))?;
     match card.read_ext_csd() {
         Ok(ext) if ext.reads_user_area() => {}
@@ -98,6 +135,12 @@ fn with_volumes<T>(f: impl FnOnce(&Volumes<'_>) -> Result<T, Error>) -> Result<T
         .into_iter()
         .find(|rca| card.read_status(*rca).is_ok_and(|s| mmc::card_state(s) == 4))
         .ok_or(Error::Card("no card in transfer state"))?;
+    Ok((card, rca))
+}
+
+/// Opens CACHE and runs `f` on its volume manager, then writes the device's cache to the card.
+fn with_volumes<T>(f: impl FnOnce(&Volumes<'_>) -> Result<T, Error>) -> Result<T, Error> {
+    let (card, rca) = open_card()?;
     // SAFETY: see `Buffer`: this is the only reference while `f` runs.
     let buffer: &mut [u8] = unsafe { &mut *DEVICE.0.get() };
     let device = PartitionDevice::new(card, rca, PARTITION, buffer)?;
@@ -113,17 +156,50 @@ fn with_volumes<T>(f: impl FnOnce(&Volumes<'_>) -> Result<T, Error>) -> Result<T
 /// Reads the saved application into `stage` (at most `stage.len()` bytes) and checks its CRC.
 /// Returns its length.
 pub fn load(stage: &mut [u8]) -> Result<usize, Error> {
-    with_volumes(|volumes| {
+    let len = with_storage(&mut *stage, |fs, stage| load_ext4(fs, stage), |volumes, stage| load_fat(volumes, stage))?;
+    let header = unsafe { HEADER };
+    let want = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+    let got = crc32(&stage[..len]);
+    if got != want {
+        return Err(Error::Crc { want, got });
+    }
+    Ok(len)
+}
+
+/// The header of the file `load` read last.
+static mut HEADER: [u8; HEADER_BYTES] = [0; HEADER_BYTES];
+
+/// The image's length from a header, if it is one.
+fn image_len(header: &[u8; HEADER_BYTES]) -> Result<usize, Error> {
+    if &header[..8] != HEADER_MAGIC {
+        return Err(Error::BadFile);
+    }
+    unsafe { HEADER = *header };
+    Ok(u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize)
+}
+
+fn load_ext4(fs: &mut userdata::Fs, stage: &mut [u8]) -> Result<usize, Error> {
+    let mut header = [0u8; HEADER_BYTES];
+    let size = userdata::read_exact_at(fs, DIR, FILE, 0, &mut header)?;
+    let len = image_len(&header)?;
+    if len > stage.len() || size != (HEADER_BYTES + len) as u64 {
+        return Err(Error::BadFile);
+    }
+    userdata::read_exact_at(fs, DIR, FILE, HEADER_BYTES as u64, &mut stage[..len])?;
+    Ok(len)
+}
+
+fn load_fat(volumes: &Volumes<'_>, stage: &mut [u8]) -> Result<usize, Error> {
+    {
         let volume = volumes.open_volume(VolumeIdx(0))?;
         let root = volume.open_root_dir()?;
         let dir = root.open_dir(DIR)?;
         let file = dir.open_file_in_dir(FILE, Mode::ReadOnly)?;
         let mut header = [0u8; HEADER_BYTES];
-        if file.read(&mut header)? != HEADER_BYTES || &header[..8] != HEADER_MAGIC {
+        if file.read(&mut header)? != HEADER_BYTES {
             return Err(Error::BadFile);
         }
-        let len = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
-        let want = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
+        let len = image_len(&header)?;
         if len > stage.len() || file.length() as usize != HEADER_BYTES + len {
             return Err(Error::BadFile);
         }
@@ -136,17 +212,13 @@ pub fn load(stage: &mut [u8]) -> Result<usize, Error> {
             done += n;
         }
         file.close()?;
-        let got = crc32(&stage[..len]);
-        if got != want {
-            return Err(Error::Crc { want, got });
-        }
         Ok(len)
-    })
+    }
 }
 
 /// Whether [`STAY_FILE`] is there. A CACHE without `FERRITE`, or without FAT32, says no.
 pub fn stay() -> Result<bool, Error> {
-    let found = with_volumes(|volumes| {
+    let found = with_storage((), |fs, ()| if userdata::exists(fs, DIR, STAY_FILE)? { Ok(()) } else { Err(Error::NotFound) }, |volumes, ()| {
         let volume = volumes.open_volume(VolumeIdx(0))?;
         let root = volume.open_root_dir()?;
         let dir = root.open_dir(DIR)?;
@@ -162,7 +234,7 @@ pub fn stay() -> Result<bool, Error> {
 
 /// Creates [`STAY_FILE`] (`on`), making `FERRITE` if needed, or deletes it.
 pub fn set_stay(on: bool) -> Result<(), Error> {
-    with_volumes(|volumes| {
+    with_storage((), |fs, ()| userdata::set_present(fs, DIR, STAY_FILE, on), |volumes, ()| {
         let volume = volumes.open_volume(VolumeIdx(0))?;
         let root = volume.open_root_dir()?;
         if on {
@@ -189,7 +261,7 @@ pub fn set_stay(on: bool) -> Result<(), Error> {
 /// Reads `<dir>/<name>` whole into the start of `buf`; its length. [`Error::BadFile`] when it is
 /// longer than `buf`.
 pub fn read_file(dir: &str, name: &str, buf: &mut [u8]) -> Result<usize, Error> {
-    with_volumes(|volumes| {
+    with_storage(buf, |fs, buf| userdata::read_file(fs, dir, name, buf), |volumes, buf| {
         let volume = volumes.open_volume(VolumeIdx(0))?;
         let root = volume.open_root_dir()?;
         let dir = root.open_dir(dir)?;
@@ -213,7 +285,7 @@ pub fn read_file(dir: &str, name: &str, buf: &mut [u8]) -> Result<usize, Error> 
 
 /// Writes `parts`, one after the other, as `<dir>/<name>`, making `dir` if needed.
 fn write_file(dir: &str, name: &str, parts: &[&[u8]]) -> Result<(), Error> {
-    with_volumes(|volumes| {
+    with_storage((), |fs, ()| userdata::write_file(fs, dir, name, parts), |volumes, ()| {
         let volume = volumes.open_volume(VolumeIdx(0))?;
         let root = volume.open_root_dir()?;
         match root.make_dir_in_dir(dir) {

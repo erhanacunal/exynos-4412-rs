@@ -427,6 +427,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext4_rs"
+version = "2.0.0"
+source = "git+https://github.com/erhanacunal/ext4_rs?branch=ferrite#3921274796f7e93fe0d13f453090ecc2669cf911"
+
+[[package]]
 name = "ext4_test"
 version = "0.1.0"
 dependencies = [
@@ -462,6 +467,7 @@ dependencies = [
  "embassy-time-driver",
  "embassy-time-queue-utils",
  "embedded-sdmmc",
+ "ext4_rs",
  "rlsf",
  "smoltcp 0.14.0",
  "tock-registers",
