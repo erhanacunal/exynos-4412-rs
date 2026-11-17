@@ -16,6 +16,8 @@ use exynos_4412_rs::drivers::mmc::Mmc;
 use exynos_4412_ext4::PartitionBlocks;
 use exynos_4412_ext4::ext4_rs::{self, BlockDevice, Ext4, MountOptions};
 
+use exynos_4412_rs::println;
+
 use crate::cache::Error;
 
 /// USERDATA.
@@ -61,7 +63,15 @@ pub fn mount(card: Mmc, rca: u16) -> Option<Result<Fs, Error>> {
         return None;
     }
     match Ext4::mount(device, OPTIONS) {
-        Ok(fs) => Some(Ok(fs)),
+        Ok(fs) => {
+            // Only the first mount after a power loss sees it: it leaves the file system clean.
+            match fs.mount_state() {
+                (_, true) => println!("uart_boot: USERDATA not unmounted cleanly: journal replayed (a commit was cut)"),
+                (true, false) => println!("uart_boot: USERDATA not unmounted cleanly: journal empty, nothing to replay"),
+                _ => {}
+            }
+            Some(Ok(fs))
+        }
         Err(ext4_rs::Error::Unsupported(_)) => None,
         Err(error) => Some(Err(Error::Ext4(error))),
     }
