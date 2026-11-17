@@ -7,4 +7,4 @@ license = "MIT"
 
 [dependencies]
 exynos_4412_rs = { path = "../exynos_4412_rs", default-features = false }
-ext4_rs = { git = "https://github.com/erhanacunal/ext4_rs", branch = "ferrite" }
+ext4_rs = { git = "https://github.com/erhanacunal/ext4_rs", branch = "main" }

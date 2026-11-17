@@ -429,7 +429,7 @@ dependencies = [
 [[package]]
 name = "ext4_rs"
 version = "2.0.0"
-source = "git+https://github.com/erhanacunal/ext4_rs?branch=ferrite#3921274796f7e93fe0d13f453090ecc2669cf911"
+source = "git+https://github.com/erhanacunal/ext4_rs?branch=main#52510ee9cedd2fba2a63a58bd73ad405ae4c47e4"
 
 [[package]]
 name = "ext4_test"
