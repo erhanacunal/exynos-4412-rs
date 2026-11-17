@@ -11,8 +11,6 @@ default = ["panic-handler"]
 panic-handler = []
 # FAT32 on an eMMC partition, through embedded-sdmmc: the `fat` module.
 fat = ["dep:embedded-sdmmc"]
-# Journaled ext4 on an eMMC partition, through ext4_rs: the `ext4` module. Needs an allocator.
-ext4 = ["dep:ext4_rs"]
 # Async tasks with Embassy, one executor per core: the `embassy` module.
 embassy = ["dep:embassy-executor", "dep:embassy-time-driver", "dep:embassy-time-queue-utils", "dep:embassy-sync", "dep:embassy-time", "dep:critical-section"]
 # The BCM4334 as an embassy-net device, run by an async task: the `embassy::wifi` module.
@@ -23,7 +21,6 @@ heap = ["dep:rlsf"]
 [dependencies]
 smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4", "proto-dhcpv4", "socket-dhcpv4", "socket-icmp", "auto-icmp-echo-reply"] }
 embedded-sdmmc = { version = "0.10", default-features = false, optional = true }
-ext4_rs = { git = "https://github.com/erhanacunal/ext4_rs", branch = "ferrite", optional = true }
 embassy-executor = { version = "0.10", optional = true }
 embassy-time-driver = { version = "0.2", features = ["tick-hz-1_000_000"], optional = true }
 embassy-time-queue-utils = { version = "0.3", optional = true }

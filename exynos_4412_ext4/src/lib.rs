@@ -1,5 +1,9 @@
 //! ext4 on one eMMC partition, through [`ext4_rs`] (journaled; it formats its own file systems).
 //!
+//! A crate of its own, not a feature of `exynos_4412_rs`: `ext4_rs` needs `alloc`, and a feature
+//! turned on by one application of the workspace would reach all of them, most without an
+//! allocator.
+//!
 //! [`PartitionBlocks`] is the [`BlockDevice`] that crate needs: 4 KiB blocks of one partition,
 //! counted from its start, written through an [`MmcWriter`], so nothing outside the partition
 //! can be reached. Every write returns once the card has programmed it (the card's own cache is
@@ -13,13 +17,16 @@
 //! let fs = Ext4::mount(device, MountOptions::default())?;
 //! ```
 
+#![no_std]
+#![warn(missing_docs)]
+
 pub use ext4_rs;
 use ext4_rs::{BlockDevice, IoError};
 
-use crate::drivers::mmc::{self, Mmc, MmcWriter, WriteError};
-use crate::mmu;
-use crate::partition::Partition;
-use crate::soc;
+use exynos_4412_rs::drivers::mmc::{self, Mmc, MmcWriter, WriteError};
+use exynos_4412_rs::mmu;
+use exynos_4412_rs::partition::Partition;
+use exynos_4412_rs::soc;
 
 /// Bytes of an ext4 block.
 pub const BLOCK_BYTES: usize = ext4_rs::BLOCK_SIZE;

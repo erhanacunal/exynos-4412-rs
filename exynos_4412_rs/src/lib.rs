@@ -40,8 +40,6 @@ pub mod drivers;
 #[cfg(feature = "embassy")]
 pub mod embassy;
 pub mod exceptions;
-#[cfg(feature = "ext4")]
-pub mod ext4;
 #[cfg(feature = "fat")]
 pub mod fat;
 pub mod firmware;

@@ -75,7 +75,7 @@ pub enum Error {
     Crc { want: u32, got: u32 },
     Fs(FsError),
     /// USERDATA's ext4 failed or refused.
-    Ext4(exynos_4412_rs::ext4::ext4_rs::Error),
+    Ext4(exynos_4412_ext4::ext4_rs::Error),
 }
 
 impl From<FsError> for Error {

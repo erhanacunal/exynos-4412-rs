@@ -1,4 +1,4 @@
-//! USERDATA (p10) as ferrite-ui-xl formats it: ext4 with a journal (`exynos_4412_rs::ext4`), the
+//! USERDATA (p10) as ferrite-ui-xl formats it: ext4 with a journal (`exynos_4412_ext4`), the
 //! same tree as on CACHE but in lower case (`ferrite/ferrite.bin`, `ferrite/flash.bin`,
 //! `ferrite/stay`, `system/…`; ferrite-ui-xl `storage/ext4.rs`, keep in sync): callers give the
 //! CACHE names, [`path`] lowers them. [`cache`](crate::cache) comes here first and falls back to CACHE's FAT32 only
@@ -13,8 +13,8 @@ use alloc::string::String;
 use core::cell::UnsafeCell;
 
 use exynos_4412_rs::drivers::mmc::Mmc;
-use exynos_4412_rs::ext4::PartitionBlocks;
-use exynos_4412_rs::ext4::ext4_rs::{self, BlockDevice, Ext4, MountOptions};
+use exynos_4412_ext4::PartitionBlocks;
+use exynos_4412_ext4::ext4_rs::{self, BlockDevice, Ext4, MountOptions};
 
 use crate::cache::Error;
 

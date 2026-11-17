@@ -1,0 +1,10 @@
+[package]
+name = "exynos_4412_ext4"
+version = "0.1.0"
+edition = "2024"
+description = "Journaled ext4 (ext4_rs) on an eMMC partition of the Exynos 4412; needs an allocator"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs", default-features = false }
+ext4_rs = { git = "https://github.com/erhanacunal/ext4_rs", branch = "ferrite" }

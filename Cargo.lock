@@ -441,6 +441,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "exynos_4412_ext4"
+version = "0.1.0"
+dependencies = [
+ "ext4_rs",
+ "exynos_4412_rs",
+]
+
+[[package]]
 name = "exynos_4412_jpeg"
 version = "0.1.0"
 dependencies = [
@@ -467,7 +475,6 @@ dependencies = [
  "embassy-time-driver",
  "embassy-time-queue-utils",
  "embedded-sdmmc",
- "ext4_rs",
  "rlsf",
  "smoltcp 0.14.0",
  "tock-registers",
@@ -1150,6 +1157,7 @@ dependencies = [
  "embassy-net",
  "embassy-sync",
  "embassy-time",
+ "exynos_4412_ext4",
  "exynos_4412_rs",
 ]
 

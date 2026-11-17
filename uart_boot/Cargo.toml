@@ -6,7 +6,8 @@ description = "Waits for an application image over UART2 or HTTP over WiFi, chec
 license = "MIT"
 
 [dependencies]
-exynos_4412_rs = { path = "../exynos_4412_rs", features = ["fat", "ext4", "wifi-net"] }
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["fat", "wifi-net"] }
+exynos_4412_ext4 = { path = "../exynos_4412_ext4" }
 embassy-executor = "0.10"
 embassy-time = "0.5"
 embassy-sync = "0.8"
