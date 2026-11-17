@@ -698,10 +698,11 @@ impl Gpu {
         if error.is_none() && self.streams_for != Some((area.width, area.height)) {
             let plb = self.fixed.plb.as_ptr() as u32;
             let blocking = mali::Blocking::of(across as u32, down as u32);
+            // Only the words written: the streams are sized for the largest frame.
             for (pp, stream) in self.fixed.streams.iter_mut().enumerate() {
-                mali::clear_stream(&mut stream.0, area.width, area.height, pp, mali::PP_COUNT, TileEnd::Shared(plb, blocking));
+                let words = mali::clear_stream(&mut stream.0, area.width, area.height, pp, mali::PP_COUNT, TileEnd::Shared(plb, blocking));
+                mmu::clean_dcache_range(stream.0.as_ptr() as usize, words * 4);
             }
-            mmu::clean_dcache_range(self.fixed.streams.as_ptr() as usize, size_of_val(&self.fixed.streams));
             self.streams_for = Some((area.width, area.height));
         }
         let mut plbu_words = 0;
