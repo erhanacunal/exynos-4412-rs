@@ -189,6 +189,12 @@ impl UartRx {
         .await
     }
 
+    /// Takes the bytes already received, up to `buffer`'s length, without waiting: for a
+    /// polling loop outside the executor. Returns how many.
+    pub fn try_read(&self, buffer: &mut [u8]) -> usize {
+        critical_section::with(|cs| RX[self.index].ring.borrow_ref_mut(cs).pop_into(buffer))
+    }
+
     /// Waits for one byte.
     pub async fn read_byte(&self) -> u8 {
         let mut byte = [0];
