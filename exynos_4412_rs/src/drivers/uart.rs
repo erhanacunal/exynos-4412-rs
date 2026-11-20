@@ -1,8 +1,10 @@
 //! Driver for the Samsung UART: polled, and the receive interrupt that the `embassy` feature's
 //! async reader uses.
 //!
-//! Clocks, pins, line settings and the baud rate are inherited from U-Boot. The
-//! FIFO may be on or off: each status check follows the current `UFCON` setting.
+//! The console's clocks, pins, line settings and baud rate are inherited from U-Boot. Another
+//! UART is set up with [`Cmu::set_uart_clock`](crate::drivers::cmu::Cmu::set_uart_clock), its
+//! pins, then [`Uart::configure`]. The FIFO may be on or off: each status check follows the
+//! current `UFCON` setting.
 //!
 //! Every offset below is verified against Linux 5.15.198
 //! `include/linux/serial_s3c.h`, cited as `serial_s3c.h:<line>`.
@@ -42,11 +44,11 @@ register_bitfields![u32,
 register_structs! {
     Registers {
         /// serial_s3c.h:21 `S3C2410_ULCON`.
-        (0x00 => ulcon: ReadOnly<u32>),
+        (0x00 => ulcon: ReadWrite<u32>),
         /// serial_s3c.h:22 `S3C2410_UCON`.
         (0x04 => ucon: ReadWrite<u32>),
         /// serial_s3c.h:23 `S3C2410_UFCON`.
-        (0x08 => ufcon: ReadOnly<u32, UFCON::Register>),
+        (0x08 => ufcon: ReadWrite<u32, UFCON::Register>),
         (0x0C => _reserved0),
         /// serial_s3c.h:26 `S3C2410_UTRSTAT`.
         (0x10 => utrstat: ReadOnly<u32, UTRSTAT::Register>),
@@ -90,6 +92,23 @@ const UCON_RX_MODE_IRQ: u32 = 0b01;
 /// serial_s3c.h:93 `S3C2410_UCON_RXFIFO_TOI`: an interrupt also when bytes wait in the FIFO
 /// below its trigger level and the line has gone quiet.
 const UCON_RX_TIMEOUT: u32 = 1 << 7;
+/// serial_s3c.h `S3C2410_UCON_TXIRQMODE`.
+const UCON_TX_MODE_IRQ: u32 = 1 << 2;
+/// serial_s3c.h `S3C2410_UCON_RXILEVEL`, `S3C2410_UCON_TXILEVEL`: level interrupts.
+const UCON_RX_LEVEL: u32 = 1 << 8;
+const UCON_TX_LEVEL: u32 = 1 << 9;
+/// serial_s3c.h `S3C2410_LCON_CS8`: 8 data bits; no parity and one stop bit are zeros.
+const ULCON_8N1: u32 = 3;
+/// serial_s3c.h `S3C2410_UFCON_FIFOMODE` (line 128), `_RESETTX`, `_RESETRX`.
+const UFCON_FIFO_ON: u32 = 1 << 0;
+const UFCON_RESET_RX: u32 = 1 << 1;
+const UFCON_RESET_TX: u32 = 1 << 2;
+/// serial_s3c.h `S5PV210_UFCON_RXTRIG4` and `S5PV210_UFCON_TXTRIG4`, what the vendor kernel's
+/// `MEHMET_UFCON_DEFAULT` uses on every port.
+const UFCON_RX_TRIGGER_4: u32 = 1 << 4;
+const UFCON_TX_TRIGGER_4: u32 = 1 << 8;
+/// The UART samples each bit 16 times: `UBRDIV` + 1 counts sixteenths of the divisor.
+const SAMPLES_PER_BIT: u32 = 16;
 
 /// One of the five UART blocks of the SoC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,7 +116,8 @@ const UCON_RX_TIMEOUT: u32 = 1 << 7;
 pub enum UartId {
     /// UART0. Wired to the Bluetooth chip on the Mehmet board.
     Uart0 = 0,
-    /// UART1.
+    /// UART1. Wired to the u-blox G6010 GPS receiver on the Mehmet board: see
+    /// [`g6010`](crate::drivers::g6010).
     Uart1 = 1,
     /// UART2, the board's debug console.
     Uart2 = 2,
@@ -324,14 +344,34 @@ impl Uart {
         }
     }
 
-    /// Programs the baud rate from the given UART source clock.
+    /// Sets the line to 8 data bits, no parity, one stop bit at `baud`, from `source_clock_hz`,
+    /// the rate of `sclk_uartN` ([`Cmu::sclk_uart_hz`](crate::drivers::cmu::Cmu::sclk_uart_hz)).
+    /// Both FIFOs are turned on and emptied, receiving and sending are on, and every interrupt
+    /// of the UART is masked. Returns the baud rate the divider gives.
+    ///
+    /// The divider is `source_clock_hz / baud` in sixteenths: its whole part goes to `UBRDIV`
+    /// less one, the rest of sixteen to `UFRACVAL`, as `samsung_tty.c` does on SoCs with
+    /// `has_fracval`. Not for the console UART while it sends.
     ///
     /// # Panics
     ///
-    /// Always: this is not implemented, U-Boot's settings are inherited instead.
-    pub fn init_baudrate(&self, _baud: u32, _source_clock_hz: u32) {
-        // TODO: derive UBRDIV and UFRACVAL once the CMU driver can report the source clock.
-        todo!("baud rate programming");
+    /// If `baud` is 0 or above a sixteenth of `source_clock_hz`.
+    pub fn configure(&self, baud: u32, source_clock_hz: u32) -> u32 {
+        assert!(baud > 0, "baud rate 0");
+        let divisor = (source_clock_hz + baud / 2) / baud;
+        assert!(divisor >= SAMPLES_PER_BIT, "baud rate {} above a sixteenth of {} Hz", baud, source_clock_hz);
+        let regs = self.regs();
+        regs.uintm.set(INT_ALL);
+        regs.ucon.set(0);
+        regs.ulcon.set(ULCON_8N1);
+        regs.ubrdiv.set(divisor / SAMPLES_PER_BIT - 1);
+        regs.ufracval.set(divisor % SAMPLES_PER_BIT);
+        regs.ufcon.set(UFCON_FIFO_ON | UFCON_RESET_RX | UFCON_RESET_TX | UFCON_RX_TRIGGER_4 | UFCON_TX_TRIGGER_4);
+        regs.ucon.set(UCON_RX_MODE_IRQ | UCON_TX_MODE_IRQ | UCON_RX_TIMEOUT | UCON_RX_LEVEL | UCON_TX_LEVEL);
+        regs.uintp.set(INT_ALL);
+        // Whatever the line held before the new settings.
+        let _ = regs.uerstat.get();
+        source_clock_hz / divisor
     }
 }
 

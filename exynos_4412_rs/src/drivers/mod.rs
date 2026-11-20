@@ -5,6 +5,7 @@ pub mod cmu;
 pub mod display;
 pub mod ehci;
 pub mod fimc;
+pub mod g6010;
 pub mod g2d;
 pub mod gic;
 pub mod gpio;

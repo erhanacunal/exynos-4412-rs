@@ -24,6 +24,7 @@ depends on this crate, supplies a `memory.x` and writes `main`.
 - `i2c_test/`: I2C bus test, performs only reads on the devices
 - `pmic_test/`: MAX77686 test, turns peripheral rails on and restores them
 - `rtc_test/`: MAX77686 RTC test: reads the time, and sets it from a UART command
+- `gps_test/`: u-blox G6010 GPS on UART1: its supplies, the UART's clock and baud rate, NMEA sentences and the fix
 - `mmc_test/`: eMMC read test, partition table, polled and DMA reads, no writes
 - `mmc_write_test/`: eMMC write test: writes the last 2 MiB of CACHE and restores them
 - `ext4_test/`: reads the ext4 file systems on the eMMC with the `ext4-view` crate, no writes
@@ -719,6 +720,39 @@ Observed:
 | `set 2100-11-03 09:44:00` | `BadTime`, nothing written |
 | `set 1980-02-26 09:44:00` | `BadTime`, nothing written |
 | `set 2026-02-30 09:44:00` | Not a valid date, refused before the driver |
+
+## GPS (u-blox G6010)
+
+`drivers::g6010`, `nmea`, `gps_test`. The receiver needs only power and a UART; it sends NMEA by
+itself. What the vendor kernel says (only these facts were taken from it, no GPL code):
+`drivers/misc/g6010.c` switches two supplies through an ioctl (on: `vdd_gps_1v8`, 10 ms,
+`vdd_gps_2v8`; off in the same order), and Android's GPS HAL read `/dev/ttySAC1` itself.
+`mach-mehmet.c` makes those MAX77686 LDO9 (1.8 V, I/O) and LDO18 (2.8 V, antenna LNA), both off at
+boot, and puts UART1 on GPA0(4) RXD (pull-up) and GPA0(5) TXD, function 2. No reset, EXTINT or
+time pulse line; the PMIC's 32 kHz output meant for it is commented out. The SoC's own GPS block
+(`pd::Domain::Gps`) is unrelated.
+
+- `g6010::power_on` / `power_off` (`Max77686::disable_ldo` is new), `g6010::setup_uart(baud)`:
+  `Cmu::set_uart_clock` (`sclk_uart1` from `mout_mpll_user_t` / 8 = 100 MHz, as U-Boot sets
+  the console's; mask and gate opened), the pins, then `Uart::configure`: 8N1, FIFOs on with
+  trigger level 4 (`MEHMET_UFCON_DEFAULT`), `UCON` 0x385, every interrupt masked. The divider
+  is `clock / baud` rounded, in sixteenths: `UBRDIV` = whole - 1, `UFRACVAL` = the rest. Read it
+  with `embassy::uart::UartRx` created after the setup (`configure` masks the interrupts again).
+- `nmea::LineBuffer` collects sentences (skips binary UBX bytes), `nmea::verify` checks the
+  checksum, `nmea::Fix::update` reads `RMC`, `GGA` and `GSV` of any talker in fixed point
+  (degrees times 10^7, no floats). Host tests: `rustc --edition 2024 --test src/nmea.rs`.
+
+Board, 2026-11-20 (`gps_test` over `uartboot.py --port COM8 --reset`): the console's divider
+read back gives 115207 baud from `sclk_uart2` = 100 MHz (`UBRDIV` 53, `UFRACVAL` 4, what
+`configure` computes for 115200). LDO9 and LDO18 were off (mode 0) and came on at 1800 and
+2800 mV. UART1 at 9600 (`UBRDIV` 0x28A, `UFRACVAL` 1, 9599 baud) had sentences at once: `GPTXT`
+`u-blox ag`, `HW UBX-G60xx 00040007`, `ROM CORE 7.03 (45969) Mar 17 2011`, `ANTSTATUS=OK`, then
+`RMC VTG GGA GSA GSV GLL` once a second, about 180 bytes; every checksum good, no line errors,
+nothing dropped. Indoors there was no fix: after about a minute `GSV` showed one, then two
+satellites (SNR 37 dB), and `RMC` carried the time and date (`14:24:50`, `201126`) with status
+`V`. `p` (supplies off) stopped the bytes at once and `is_powered` read false; `p` again brought
+the start-up `GPTXT` lines back, a cold start (no satellites, no time). After about 3 minutes:
+`RxStats { received: 13695, dropped: 0, interrupts: 2089, errors: 0 }`.
 
 ## Display
 

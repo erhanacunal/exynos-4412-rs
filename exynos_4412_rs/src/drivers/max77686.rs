@@ -212,6 +212,14 @@ impl Max77686 {
         self.restore_ldo(LdoState { number, raw: (OPMODE_NORMAL << OPMODE_SHIFT) | vsel })
     }
 
+    /// Turns off LDO `number`, keeping its voltage setting: mode 0, as
+    /// `regulator_disable_regmap` does (see [`LdoState::mode`]).
+    pub fn disable_ldo(&self, number: u8) -> Result<(), Error> {
+        let state = self.ldo(number)?;
+        let mode_mask = 0xFFu8 << OPMODE_SHIFT;
+        self.restore_ldo(LdoState { number, raw: state.raw & !mode_mask })
+    }
+
     /// Writes back a state from [`ldo`](Self::ldo), and checks that it took.
     pub fn restore_ldo(&self, state: LdoState) -> Result<(), Error> {
         let register = ldo_register(state.number)?;

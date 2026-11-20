@@ -1,0 +1,12 @@
+[package]
+name = "gps_test"
+version = "0.1.0"
+edition = "2024"
+description = "u-blox G6010 GPS test for exynos_4412_rs: supplies, UART1, NMEA sentences and the fix"
+license = "MIT"
+
+[dependencies]
+exynos_4412_rs = { path = "../exynos_4412_rs", features = ["embassy"] }
+embassy-executor = "0.10"
+embassy-time = "0.5"
+embassy-futures = "0.1"

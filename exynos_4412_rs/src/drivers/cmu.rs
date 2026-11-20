@@ -3,8 +3,9 @@
 //! It changes two PLLs. The EPLL, for audio: see [`Cmu::set_epll`]; nothing else here runs from
 //! the EPLL. And the APLL, with the CPU's mux and dividers, for the CPU clock: see
 //! [`Cmu::set_arm_clock`], which leaves the voltage to [`crate::cpufreq`]. The only muxes and dividers it changes are those of the FIMD, of
-//! `sclk_mmc3` and of `sclk_g3d`, which nothing else uses: see [`Cmu::set_fimd_clock`],
-//! [`Cmu::set_mmc3_clock`] and [`Cmu::set_g3d_clock`]. The rest stay as U-Boot set them.
+//! `sclk_mmc3`, of `sclk_g3d` and of a UART's `sclk_uartN`, which nothing else uses: see
+//! [`Cmu::set_fimd_clock`], [`Cmu::set_mmc3_clock`], [`Cmu::set_g3d_clock`] and
+//! [`Cmu::set_uart_clock`]. The rest stay as U-Boot set them.
 //!
 //! Register offsets and clock tree are verified against Linux 5.15.198
 //! `drivers/clk/samsung/clk-exynos4.c`, cited as `clk-exynos4.c:<line>`, relative to
@@ -14,8 +15,8 @@
 //!
 //! [`Cmu::enable_i2c`], [`Cmu::open_fimd_gates`], [`Cmu::set_fimd_clock`],
 //! [`Cmu::set_mmc3_clock`], [`Cmu::open_audio_gates`], [`Cmu::open_pdma0_gate`],
-//! [`Cmu::open_g3d_gate`], [`Cmu::set_g3d_clock`], [`Cmu::open_tmu_gate`] and
-//! [`Cmu::set_arm_clock`] are read-modify-writes of registers shared with other peripherals.
+//! [`Cmu::open_g3d_gate`], [`Cmu::set_g3d_clock`], [`Cmu::open_tmu_gate`],
+//! [`Cmu::set_uart_clock`] and [`Cmu::set_arm_clock`] are read-modify-writes of registers shared with other peripherals.
 //! They mask IRQs on the calling core. Use them from one core at a time.
 
 use core::ptr;
@@ -149,6 +150,21 @@ const DIV_MFC_MASK: u32 = 0xF;
 const GATE_MFC: u32 = 1 << 0;
 /// clk-exynos4.c:750: `CLK_PWM`, the PWM timers' gate.
 const GATE_PERIL_PWM: u32 = 1 << 24;
+/// `clk-exynos4.c` `SRC_PERIL0`, `SRC_MASK_PERIL0` and `DIV_PERIL0` (also
+/// `EXYNOS4_CLKSRC_PERIL0`, `_MASK_PERIL0`, `CLKDIV_PERIL0` in the vendor kernel's
+/// `regs-clock.h`): `mout_uartN` and `div_uartN` are the 4-bit field at 4 * N, `sclk_uartN` the
+/// bit at 4 * N, for UART0 to UART4.
+const SRC_PERIL0: usize = 0xC250;
+const SRC_MASK_PERIL0: usize = 0xC350;
+const DIV_PERIL0: usize = 0xC550;
+const PERIL0_UART_FIELD: u32 = 0xF;
+/// Index of `mout_mpll_user_t` in `group1_p4x12`, the parents of `mout_uartN`, as for the FIMCs.
+const SRC_PERIL0_UART_MPLL_USER: u32 = 6;
+/// Index of `xusbxti`, the 24 MHz crystal, in the same list.
+const SRC_PERIL0_UART_XUSBXTI: u32 = 1;
+/// `clk-exynos4.c` `CLK_UART0` to `CLK_UART4`: bits 0 to 4 of `GATE_IP_PERIL` (vendor kernel
+/// `clock-exynos4.c`, `s5pv210-uart.N` with `ctrlbit` 1 << N).
+const UARTS: usize = 5;
 /// clk-exynos4.c:1005: `CLK_TMU_APBIF`, the register clock of the TMU.
 const GATE_PERIR_TMU_APBIF: u32 = 1 << 17;
 /// clk-exynos4.c:42,56,66,88: the camera block's clocks, the FIMCs' among them.
@@ -866,7 +882,7 @@ impl Cmu {
         let was_masked = cpu::mask_irq();
         // SAFETY: as in `read`. Every caller changes only fields of the block it configures: the
         // FIMD, `sdhci_3`, `pdma0`, the audio subsystem, the GPU, the MFC, a FIMC, the G2D, the
-        // PWM timers, the TMU or the USB controllers.
+        // PWM timers, the TMU, a UART or the USB controllers.
         unsafe {
             ptr::write_volatile(address, (ptr::read_volatile(address) & !clear) | set);
         }
@@ -1073,6 +1089,41 @@ impl Cmu {
     /// Whether the TMU's clock gate is open.
     pub fn tmu_gate_open(&self) -> bool {
         self.read(GATE_IP_PERIR) & GATE_PERIR_TMU_APBIF != 0
+    }
+
+    /// Rate of `sclk_uartN`, the clock UART `index` divides into its baud rate. `None` if its
+    /// mux selects a parent other than `mout_mpll_user_t` or `xusbxti`, whose rates this module
+    /// does not read, or if `index` is above 4.
+    pub fn sclk_uart_hz(&self, index: usize) -> Option<u32> {
+        if index >= UARTS {
+            return None;
+        }
+        let shift = 4 * index as u32;
+        let input = match (self.read(SRC_PERIL0) >> shift) & PERIL0_UART_FIELD {
+            SRC_PERIL0_UART_MPLL_USER => self.mout_mpll_user_t_hz(),
+            SRC_PERIL0_UART_XUSBXTI => soc::FIN_PLL_HZ,
+            _ => return None,
+        };
+        Some(input / (((self.read(DIV_PERIL0) >> shift) & PERIL0_UART_FIELD) + 1))
+    }
+
+    /// Runs `sclk_uartN` of UART `index`, below 5, from `mout_mpll_user_t` at the highest rate
+    /// its divider reaches that is not above `hz`, lets it through and opens the UART's register
+    /// gate. Returns the rate. Not for the console UART while it sends: this can glitch it.
+    ///
+    /// # Panics
+    ///
+    /// If `index` is above 4.
+    pub fn set_uart_clock(&self, index: usize, hz: u32) -> u32 {
+        assert!(index < UARTS);
+        let input = self.mout_mpll_user_t_hz();
+        let div = input.div_ceil(hz.max(1)).clamp(1, PERIL0_UART_FIELD + 1);
+        let shift = 4 * index as u32;
+        self.modify(SRC_PERIL0, PERIL0_UART_FIELD << shift, SRC_PERIL0_UART_MPLL_USER << shift);
+        self.modify(DIV_PERIL0, PERIL0_UART_FIELD << shift, (div - 1) << shift);
+        self.modify(SRC_MASK_PERIL0, 0, 1 << shift);
+        self.modify(GATE_IP_PERIL, 0, 1 << index);
+        input / div
     }
 
     /// Opens the clock gate of the I2C controller `bus`, below 8.

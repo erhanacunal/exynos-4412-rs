@@ -47,6 +47,7 @@ pub mod gpu;
 #[cfg(feature = "heap")]
 pub mod heap;
 pub mod mmu;
+pub mod nmea;
 pub mod nvram;
 pub mod partition;
 #[cfg(feature = "panic-handler")]
